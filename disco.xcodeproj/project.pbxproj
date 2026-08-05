@@ -6,8 +6,23 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D15D00010000000000000001 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = D15D00010000000000000003 /* MarkdownView */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D15C00010000000000000007 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 048452FB302235F10062D366 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 04845302302235F10062D366;
+			remoteInfo = disco;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		04845303302235F10062D366 /* disco.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = disco.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D15C00010000000000000001 /* discoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = discoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +31,23 @@
 			path = disco;
 			sourceTree = "<group>";
 		};
+		D15C00010000000000000002 /* discoTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = discoTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		04845300302235F10062D366 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D15D00010000000000000001 /* MarkdownView in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D15C00010000000000000003 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +61,7 @@
 			isa = PBXGroup;
 			children = (
 				04845305302235F10062D366 /* disco */,
+				D15C00010000000000000002 /* discoTests */,
 				04845304302235F10062D366 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				04845303302235F10062D366 /* disco.app */,
+				D15C00010000000000000001 /* discoTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -65,10 +95,34 @@
 			);
 			name = disco;
 			packageProductDependencies = (
+				D15D00010000000000000003 /* MarkdownView */,
 			);
 			productName = disco;
 			productReference = 04845303302235F10062D366 /* disco.app */;
 			productType = "com.apple.product-type.application";
+		};
+		D15C00010000000000000006 /* discoTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D15C0001000000000000000B /* Build configuration list for PBXNativeTarget "discoTests" */;
+			buildPhases = (
+				D15C00010000000000000005 /* Sources */,
+				D15C00010000000000000003 /* Frameworks */,
+				D15C00010000000000000004 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D15C00010000000000000008 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D15C00010000000000000002 /* discoTests */,
+			);
+			name = discoTests;
+			packageProductDependencies = (
+			);
+			productName = discoTests;
+			productReference = D15C00010000000000000001 /* discoTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -83,6 +137,10 @@
 					04845302302235F10062D366 = {
 						CreatedOnToolsVersion = 26.6;
 					};
+					D15C00010000000000000006 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = 04845302302235F10062D366;
+					};
 				};
 			};
 			buildConfigurationList = 048452FE302235F10062D366 /* Build configuration list for PBXProject "disco" */;
@@ -94,18 +152,29 @@
 			);
 			mainGroup = 048452FA302235F10062D366;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				D15D00010000000000000002 /* XCRemoteSwiftPackageReference "MarkdownView" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 04845304302235F10062D366 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
 				04845302302235F10062D366 /* disco */,
+				D15C00010000000000000006 /* discoTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		04845301302235F10062D366 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D15C00010000000000000004 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +191,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D15C00010000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D15C00010000000000000008 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 04845302302235F10062D366 /* disco */;
+			targetProxy = D15C00010000000000000007 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		0484530C302235F30062D366 /* Debug */ = {
@@ -256,6 +340,7 @@
 				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -288,6 +373,7 @@
 				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -306,6 +392,38 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		D15C00010000000000000009 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.yankewei.discoTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/disco.app/Contents/MacOS/disco";
+			};
+			name = Debug;
+		};
+		D15C0001000000000000000A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = com.yankewei.discoTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/disco.app/Contents/MacOS/disco";
 			};
 			name = Release;
 		};
@@ -330,7 +448,35 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		D15C0001000000000000000B /* Build configuration list for PBXNativeTarget "discoTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D15C00010000000000000009 /* Debug */,
+				D15C0001000000000000000A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D15D00010000000000000002 /* XCRemoteSwiftPackageReference "MarkdownView" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Lakr233/MarkdownView.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 4.1.12;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D15D00010000000000000003 /* MarkdownView */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D15D00010000000000000002 /* XCRemoteSwiftPackageReference "MarkdownView" */;
+			productName = MarkdownView;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 048452FB302235F10062D366 /* Project object */;
 }
