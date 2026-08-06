@@ -8,11 +8,7 @@ final class AppStateTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let keychain = InMemoryKeychainStore()
-        let appState = AppState(
-            keychain: keychain,
-            defaults: defaults,
-            persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
-        )
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
 
         try appState.saveConfiguration(
             baseURL: "  https://example.com///  ",
@@ -43,11 +39,7 @@ final class AppStateTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let keychain = InMemoryKeychainStore()
-        let appState = AppState(
-            keychain: keychain,
-            defaults: defaults,
-            persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
-        )
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
         let originalBaseURL = appState.baseURL
         let originalModel = appState.model
 
@@ -73,11 +65,7 @@ final class AppStateTests: XCTestCase {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let appState = AppState(
-            keychain: InMemoryKeychainStore(),
-            defaults: defaults,
-            persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
-        )
+        let appState = try makeAppState(defaults: defaults)
 
         XCTAssertThrowsError(
             try appState.saveConfiguration(
@@ -92,11 +80,7 @@ final class AppStateTests: XCTestCase {
         }
 
         let keychain = InMemoryKeychainStore()
-        let stateWithKey = AppState(
-            keychain: keychain,
-            defaults: defaults,
-            persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
-        )
+        let stateWithKey = try makeAppState(keychain: keychain, defaults: defaults)
         try keychain.save("stored-key")
 
         XCTAssertThrowsError(
@@ -114,10 +98,9 @@ final class AppStateTests: XCTestCase {
 
     func testDeletingAPIKeyDisablesConfiguredProvider() throws {
         let keychain = InMemoryKeychainStore()
-        let appState = AppState(
+        let appState = try makeAppState(
             keychain: keychain,
-            defaults: UserDefaults(suiteName: #function)!,
-            persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
+            defaults: try XCTUnwrap(UserDefaults(suiteName: #function))
         )
         try appState.saveConfiguration(
             baseURL: "https://example.com",
@@ -132,4 +115,74 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(try keychain.load())
         XCTAssertTrue(appState.selectedConversation?.store.canSend == false)
     }
+
+    func testFirstProviderSaveAutoActivatesAndConfigsStayIndependent() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let keychain = InMemoryKeychainStore()
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
+
+        // 首次配置某服务商（当前 active 未配置）→ 自动设为当前使用
+        try appState.saveProviderConfig(
+            vendor: .openai,
+            baseURL: "https://api.openai.com/v1",
+            apiKey: "openai-key",
+            model: "gpt-5"
+        )
+        XCTAssertEqual(appState.activeVendor, .openai)
+        XCTAssertEqual(appState.baseURL, "https://api.openai.com/v1")
+        XCTAssertEqual(appState.model, "gpt-5")
+        XCTAssertTrue(appState.hasAPIKey)
+
+        // 再配置 DeepSeek，不改变当前使用
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "deepseek-key",
+            model: "deepseek-chat"
+        )
+        XCTAssertEqual(appState.activeVendor, .openai)
+        XCTAssertEqual(appState.baseURL, "https://api.openai.com/v1")
+
+        // 手动切换当前使用 → 聊天侧读到新配置
+        appState.setActiveVendor(.deepseek)
+        XCTAssertEqual(appState.activeVendor, .deepseek)
+        XCTAssertEqual(appState.baseURL, "https://api.deepseek.com/v1")
+        XCTAssertEqual(appState.model, "deepseek-chat")
+
+        // 两个服务商配置各自独立保留
+        XCTAssertEqual(appState.config(for: .openai)?.model, "gpt-5")
+        XCTAssertEqual(appState.config(for: .deepseek)?.model, "deepseek-chat")
+        XCTAssertTrue(appState.hasAPIKey)
+    }
+
+    func testThinkingEnabledDefaultsOnAndPersistsToggle() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let appState = try makeAppState(defaults: defaults)
+
+        XCTAssertTrue(appState.thinkingEnabled)
+
+        appState.setThinkingEnabled(false)
+
+        XCTAssertFalse(appState.thinkingEnabled)
+        XCTAssertFalse(defaults.bool(forKey: "thinkingEnabled"))
+
+        let restored = try makeAppState(defaults: defaults)
+        XCTAssertFalse(restored.thinkingEnabled)
+    }
+}
+
+@MainActor
+private func makeAppState(
+    keychain: APIKeyStoring = InMemoryKeychainStore(),
+    defaults: UserDefaults
+) throws -> AppState {
+    AppState(
+        keychain: keychain,
+        defaults: defaults,
+        persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
+    )
 }

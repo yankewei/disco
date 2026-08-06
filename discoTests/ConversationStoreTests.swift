@@ -12,9 +12,12 @@ final class ConversationStoreTests: XCTestCase {
                 Task { await persisted.record(messages) }
             }
         )
-        store.configure(provider: RecordingProvider(
-            recorder: recorder,
-            result: .success([.textDelta("回答")])
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: recorder,
+                result: .success([.textDelta("回答")])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
         ))
         store.draft = "  新的问题  "
 
@@ -45,9 +48,12 @@ final class ConversationStoreTests: XCTestCase {
 
     func testFailedSendRemovesEmptyAssistantAndCanRetry() async throws {
         let store = ConversationStore()
-        store.configure(provider: RecordingProvider(
-            recorder: StreamRecorder(),
-            result: .failure(TestProviderError.failed)
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .failure(TestProviderError.failed)
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
         ))
         store.draft = "请回答"
 
@@ -59,9 +65,12 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.errorMessage, "测试 provider 失败")
         XCTAssertTrue(store.canRetry)
 
-        store.configure(provider: RecordingProvider(
-            recorder: StreamRecorder(),
-            result: .success([.textDelta("重试成功")])
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([.textDelta("重试成功")])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
         ))
         store.retryLastMessage()
         try await waitUntilStreamingFinishes(store)
@@ -73,7 +82,10 @@ final class ConversationStoreTests: XCTestCase {
 
     func testStopRemovesOnlyTheEmptyAssistantPlaceholder() async throws {
         let store = ConversationStore()
-        store.configure(provider: NeverEndingProvider())
+        store.configure(runtime: GenericAgentRuntime(
+            provider: NeverEndingProvider(),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         store.draft = "暂不等待"
 
         store.send()
@@ -87,6 +99,51 @@ final class ConversationStoreTests: XCTestCase {
 
         XCTAssertFalse(store.isStreaming)
         XCTAssertEqual(store.messages.map(\.text), ["暂不等待"])
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testEmptyStreamShowsNoTextOutputErrorAndRemovesPlaceholder() async throws {
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
+        store.draft = "空响应"
+
+        store.send()
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.map(\.text), ["空响应"])
+        XCTAssertEqual(
+            store.errorMessage,
+            "模型没有返回文本内容。请确认所选模型支持 Responses API。"
+        )
+        XCTAssertTrue(store.canRetry)
+    }
+
+    func testReasoningDeltasAppendToAssistantMessage() async throws {
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([
+                    .reasoningDelta("先分析"),
+                    .reasoningDelta("再回答"),
+                    .textDelta("最终回答"),
+                ])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
+        store.draft = "一个问题"
+
+        store.send()
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.last?.reasoning, "先分析再回答")
+        XCTAssertEqual(store.messages.last?.text, "最终回答")
         XCTAssertNil(store.errorMessage)
     }
 
@@ -106,14 +163,18 @@ private actor StreamRecorder {
     }
 }
 
-private struct RecordingProvider: AIProvider {
+private struct RecordingProvider: ModelProvider {
     let recorder: StreamRecorder
-    let result: Result<[AIEvent], Error>
+    let result: Result<[ModelEvent], Error>
 
-    func stream(messages: [ChatMessage]) -> AsyncThrowingStream<AIEvent, Error> {
+    let descriptor = ProviderDescriptor(id: "recording", displayName: "Recording")
+
+    func models() async throws -> [String] { ["test-model"] }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
-                await recorder.record(messages)
+                await recorder.record(request.messages)
                 switch result {
                 case let .success(events):
                     for event in events {
@@ -128,8 +189,11 @@ private struct RecordingProvider: AIProvider {
     }
 }
 
-private struct NeverEndingProvider: AIProvider {
-    func stream(messages: [ChatMessage]) -> AsyncThrowingStream<AIEvent, Error> {
+private struct NeverEndingProvider: ModelProvider {
+    let descriptor = ProviderDescriptor(id: "never-ending", displayName: "NeverEnding")
+
+    func models() async throws -> [String] { ["test-model"] }
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { _ in }
     }
 }

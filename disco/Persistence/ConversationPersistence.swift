@@ -44,7 +44,12 @@ final class ConversationPersistence: ConversationPersisting {
                 .sorted { $0.position < $1.position }
                 .compactMap { message -> ChatMessage? in
                     guard let role = ChatMessage.Role(rawValue: message.role) else { return nil }
-                    return ChatMessage(id: message.id, role: role, text: message.text)
+                    return ChatMessage(
+                        id: message.id,
+                        role: role,
+                        text: message.text,
+                        reasoning: message.reasoning
+                    )
                 }
             if messages.last?.role == .assistant, messages.last?.text.isEmpty == true {
                 messages.removeLast()
@@ -90,12 +95,14 @@ final class ConversationPersistence: ConversationPersisting {
             if let persistedMessage = existingMessages[message.id] {
                 persistedMessage.role = message.role.rawValue
                 persistedMessage.text = message.text
+                persistedMessage.reasoning = message.reasoning
                 persistedMessage.position = position
             } else {
                 let persistedMessage = PersistedMessage(
                     id: message.id,
                     role: message.role.rawValue,
                     text: message.text,
+                    reasoning: message.reasoning,
                     position: position,
                     conversation: persistedConversation
                 )
@@ -155,6 +162,7 @@ private final class PersistedMessage {
     @Attribute(.unique) var id: UUID
     var role: String
     var text: String
+    var reasoning: String = ""
     var position: Int
     var conversation: PersistedConversation?
 
@@ -162,12 +170,14 @@ private final class PersistedMessage {
         id: UUID,
         role: String,
         text: String,
+        reasoning: String,
         position: Int,
         conversation: PersistedConversation
     ) {
         self.id = id
         self.role = role
         self.text = text
+        self.reasoning = reasoning
         self.position = position
         self.conversation = conversation
     }

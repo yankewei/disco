@@ -1,34 +1,31 @@
 import Foundation
 
-struct OpenAIResponsesProvider: AIProvider {
+/// OpenAI Responses API Provider（计划 §10.2，ADR-004 的 URLSession 版）。
+/// 只负责认证、请求构造、SSE 解析与错误转换；模型与推理配置来自 ModelRequest。
+struct OpenAIResponsesProvider: ModelProvider {
     static let defaultBaseURL = URL(string: "https://api.openai.com/v1")!
     static let defaultModel = "gpt-5.6"
 
+    let descriptor = ProviderDescriptor(
+        id: "openai-responses",
+        displayName: "OpenAI Responses"
+    )
+
     private let apiKey: String
     private let baseURL: URL
-    private let model: String
     private let session: URLSession
-
-    private var apiStyle: CompatibleAPIStyle {
-        let host = baseURL.host?.lowercased()
-        return host == "api.deepseek.com" || host?.hasSuffix(".deepseek.com") == true
-            ? .chatCompletions
-            : .responses
-    }
 
     init(
         apiKey: String,
         baseURL: URL = OpenAIResponsesProvider.defaultBaseURL,
-        model: String = OpenAIResponsesProvider.defaultModel,
         session: URLSession = .shared
     ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
-        self.model = model
         self.session = session
     }
 
-    func availableModels() async throws -> [String] {
+    func models() async throws -> [String] {
         var request = URLRequest(url: baseURL.appendingPathComponent("models"))
         request.httpMethod = "GET"
         request.timeoutInterval = 30
@@ -52,32 +49,32 @@ struct OpenAIResponsesProvider: AIProvider {
         return models
     }
 
-    func stream(messages: [ChatMessage]) -> AsyncThrowingStream<AIEvent, Error> {
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let endpoint = apiStyle == .chatCompletions ? "chat/completions" : "responses"
-                    var request = URLRequest(url: baseURL.appendingPathComponent(endpoint))
-                    request.httpMethod = "POST"
-                    request.timeoutInterval = 90
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                    let input = messages.map {
+                    var urlRequest = URLRequest(url: baseURL.appendingPathComponent("responses"))
+                    urlRequest.httpMethod = "POST"
+                    urlRequest.timeoutInterval = 90
+                    urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                    let input = request.messages.map {
                         InputMessage(role: $0.role.rawValue, content: $0.text)
                     }
-                    switch apiStyle {
-                    case .responses:
-                        request.httpBody = try JSONEncoder().encode(
-                            ResponsesRequestBody(model: model, input: input, stream: true, store: false)
+                    urlRequest.httpBody = try JSONEncoder().encode(
+                        ResponsesRequestBody(
+                            model: request.model,
+                            input: input,
+                            stream: true,
+                            store: false,
+                            reasoning: ReasoningConfig(
+                                effort: request.reasoningEnabled ? .high : .none
+                            )
                         )
-                    case .chatCompletions:
-                        request.httpBody = try JSONEncoder().encode(
-                            ChatCompletionsRequestBody(model: model, messages: input, stream: true)
-                        )
-                    }
+                    )
 
-                    let (bytes, response) = try await session.bytes(for: request)
+                    let (bytes, response) = try await session.bytes(for: urlRequest)
                     guard let httpResponse = response as? HTTPURLResponse else {
                         throw OpenAIProviderError.invalidResponse
                     }
@@ -103,16 +100,11 @@ struct OpenAIResponsesProvider: AIProvider {
                         }
 
                         let text: String
-                        switch apiStyle {
-                        case .responses:
-                            let response = try JSONDecoder().decode(APIResponse.self, from: body)
-                            if let message = response.error?.message, !message.isEmpty {
-                                throw OpenAIProviderError.responseFailed(message)
-                            }
-                            text = response.outputText
-                        case .chatCompletions:
-                            text = try JSONDecoder().decode(ChatCompletionResponse.self, from: body).text
+                        let response = try JSONDecoder().decode(APIResponse.self, from: body)
+                        if let message = response.error?.message, !message.isEmpty {
+                            throw OpenAIProviderError.responseFailed(message)
                         }
+                        text = response.outputText
                         guard !text.isEmpty else {
                             throw OpenAIProviderError.noTextOutput
                         }
@@ -122,7 +114,7 @@ struct OpenAIResponsesProvider: AIProvider {
                     }
 
                     var eventDecoder = ServerSentEventDecoder()
-                    var parser = OpenAICompatibleStreamParser(style: apiStyle)
+                    var parser = OpenAICompatibleStreamParser()
 
                     for try await byte in bytes {
                         try Task.checkCancellation()
@@ -131,6 +123,8 @@ struct OpenAIResponsesProvider: AIProvider {
                         switch try parser.parse(payload) {
                         case let .text(text):
                             continuation.yield(.textDelta(text))
+                        case let .reasoning(text):
+                            continuation.yield(.reasoningDelta(text))
                         case let .completed(text):
                             if let text {
                                 continuation.yield(.textDelta(text))
@@ -149,6 +143,8 @@ struct OpenAIResponsesProvider: AIProvider {
                         switch try parser.parse(payload) {
                         case let .text(text):
                             continuation.yield(.textDelta(text))
+                        case let .reasoning(text):
+                            continuation.yield(.reasoningDelta(text))
                         case let .completed(text):
                             if let text {
                                 continuation.yield(.textDelta(text))
@@ -196,22 +192,21 @@ private struct ResponsesRequestBody: Encodable {
     let input: [InputMessage]
     let stream: Bool
     let store: Bool
+    let reasoning: ReasoningConfig
 }
 
-private struct ChatCompletionsRequestBody: Encodable {
-    let model: String
-    let messages: [InputMessage]
-    let stream: Bool
+private struct ReasoningConfig: Encodable {
+    let effort: ReasoningEffort
+}
+
+private enum ReasoningEffort: String, Encodable {
+    case high
+    case none
 }
 
 private struct InputMessage: Encodable {
     let role: String
     let content: String
-}
-
-private enum CompatibleAPIStyle {
-    case responses
-    case chatCompletions
 }
 
 private struct ServerSentEventDecoder {
@@ -261,28 +256,25 @@ private struct ServerSentEventDecoder {
 private struct OpenAICompatibleStreamParser {
     enum Result: Equatable {
         case text(String)
+        case reasoning(String)
         case completed(String?)
         case ignored
     }
 
-    let style: CompatibleAPIStyle
     private(set) var hasText = false
 
     mutating func parse(_ payload: String) throws -> Result {
         guard payload != "[DONE]" else { return .completed(nil) }
         guard let data = payload.data(using: .utf8) else { return .ignored }
-
-        switch style {
-        case .responses:
-            return try parseResponseEvent(data)
-        case .chatCompletions:
-            return try parseChatCompletionChunk(data)
-        }
+        return try parseResponseEvent(data)
     }
 
     private mutating func parseResponseEvent(_ data: Data) throws -> Result {
         let event = try JSONDecoder().decode(StreamEvent.self, from: data)
         switch event.type {
+        case "response.reasoning_text.delta":
+            guard let delta = event.delta, !delta.isEmpty else { return .ignored }
+            return .reasoning(delta)
         case "response.output_text.delta", "response.refusal.delta":
             guard let delta = event.delta, !delta.isEmpty else { return .ignored }
             hasText = true
@@ -310,18 +302,6 @@ private struct OpenAICompatibleStreamParser {
         default:
             return .ignored
         }
-    }
-
-    private mutating func parseChatCompletionChunk(_ data: Data) throws -> Result {
-        let chunk = try JSONDecoder().decode(ChatCompletionChunk.self, from: data)
-        guard let choice = chunk.choices.first else { return .ignored }
-
-        let text = choice.delta.content ?? choice.delta.refusal
-        if let text, !text.isEmpty {
-            hasText = true
-            return choice.finishReason == nil ? .text(text) : .completed(text)
-        }
-        return choice.finishReason == nil ? .ignored : .completed(nil)
     }
 }
 
@@ -354,41 +334,6 @@ private struct ResponseOutputItem: Decodable {
 private struct ResponseContent: Decodable {
     let text: String?
     let refusal: String?
-}
-
-private struct ChatCompletionChunk: Decodable {
-    let choices: [ChatCompletionChoice]
-}
-
-private struct ChatCompletionChoice: Decodable {
-    let delta: ChatCompletionDelta
-    let finishReason: String?
-
-    private enum CodingKeys: String, CodingKey {
-        case delta
-        case finishReason = "finish_reason"
-    }
-}
-
-private struct ChatCompletionDelta: Decodable {
-    let content: String?
-    let refusal: String?
-}
-
-private struct ChatCompletionResponse: Decodable {
-    let choices: [ChatCompletionResponseChoice]
-
-    var text: String {
-        choices.compactMap(\.message.content).joined()
-    }
-}
-
-private struct ChatCompletionResponseChoice: Decodable {
-    let message: ChatCompletionMessage
-}
-
-private struct ChatCompletionMessage: Decodable {
-    let content: String?
 }
 
 private struct ErrorEnvelope: Decodable {

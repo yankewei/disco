@@ -2,9 +2,11 @@ import AppKit
 import SwiftUI
 
 enum DiscoTheme {
-    static let coral = Color(red: 0.941, green: 0.353, blue: 0.388)
-    static let amber = Color(red: 0.953, green: 0.604, blue: 0.345)
-    static let plum = Color(red: 0.553, green: 0.353, blue: 0.784)
+    /// 主强调色：柔和蓝灰（单一强调色，其余全部走系统中性色，保持简约）
+    static let accent = Color(red: 0.32, green: 0.44, blue: 0.58)
+    /// 强调色的同色系明/暗变体，仅用于 DiscoMark 的渐变，避免多色噪声
+    static let accentLight = Color(red: 0.55, green: 0.65, blue: 0.76)
+    static let accentDark = Color(red: 0.20, green: 0.29, blue: 0.42)
     static let canvas = Color(nsColor: .windowBackgroundColor)
     static let surface = Color(nsColor: .controlBackgroundColor)
     static let elevatedSurface = Color(nsColor: .textBackgroundColor)
@@ -14,6 +16,14 @@ enum DiscoRadius {
     static let small: CGFloat = 8
     static let medium: CGFloat = 14
     static let large: CGFloat = 22
+}
+
+/// 动效统一配置（Apple 流体界面：弹簧可打断、继承速度；临界阻尼无过冲）
+enum DiscoMotion {
+    /// 用户手势驱动的展开/收起
+    static let spring = Animation.spring(duration: 0.38, bounce: 0)
+    /// 按钮按下反馈
+    static let press = Animation.spring(duration: 0.28, bounce: 0)
 }
 
 struct DiscoMark: View {
@@ -31,10 +41,10 @@ struct DiscoMark: View {
                 .fill(
                     AngularGradient(
                         colors: [
-                            DiscoTheme.coral,
-                            DiscoTheme.amber,
-                            DiscoTheme.plum,
-                            DiscoTheme.coral,
+                            DiscoTheme.accentLight,
+                            DiscoTheme.accent,
+                            DiscoTheme.accentDark,
+                            DiscoTheme.accentLight,
                         ],
                         center: .center
                     )
@@ -44,7 +54,7 @@ struct DiscoMark: View {
                         .stroke(.white.opacity(0.42), lineWidth: max(1, size * 0.035))
                         .padding(max(1, size * 0.07))
                 }
-                .shadow(color: DiscoTheme.coral.opacity(isActive ? 0.34 : 0.18), radius: size * 0.22)
+                .shadow(color: DiscoTheme.accent.opacity(isActive ? 0.34 : 0.18), radius: size * 0.22)
                 .scaleEffect(pulse)
         }
         .frame(width: size, height: size)
@@ -57,6 +67,6 @@ struct DiscoPressButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .opacity(configuration.isPressed ? 0.9 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .animation(DiscoMotion.press, value: configuration.isPressed)
     }
 }

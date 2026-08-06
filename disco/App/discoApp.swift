@@ -28,7 +28,7 @@ struct DiscoApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(appState)
-                .tint(DiscoTheme.coral)
+                .tint(DiscoTheme.accent)
                 .frame(minWidth: 820, minHeight: 560)
         }
         .defaultSize(width: 1120, height: 760)
@@ -37,7 +37,7 @@ struct DiscoApp: App {
         Settings {
             SettingsView()
                 .environmentObject(appState)
-                .tint(DiscoTheme.coral)
+                .tint(DiscoTheme.accent)
         }
     }
 }

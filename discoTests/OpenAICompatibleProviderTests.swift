@@ -4,25 +4,33 @@ import XCTest
 
 @MainActor
 final class OpenAICompatibleProviderTests: XCTestCase {
-    func testDeepSeekUsesChatCompletionsAndDecodesItsStream() async throws {
+    func testDeepSeekUsesResponsesAndDecodesItsStream() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DeepSeekURLProtocol.self]
         let provider = OpenAIResponsesProvider(
             apiKey: "test-key",
             baseURL: URL(string: "https://api.deepseek.com")!,
-            model: "deepseek-v4-flash",
             session: URLSession(configuration: configuration)
         )
 
-        var text = ""
-        for try await event in provider.stream(
-            messages: [ChatMessage(role: .user, text: "Hi")]
-        ) {
-            if case let .textDelta(delta) = event {
-                text += delta
-            }
-        }
+        let text = try await streamText(provider, model: "deepseek-v4-flash")
+        XCTAssertEqual(text, "Hello!")
+    }
 
+    func testThinkingDisabledSendsReasoningEffortNone() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ThinkingDisabledURLProtocol.self]
+        let provider = OpenAIResponsesProvider(
+            apiKey: "test-key",
+            baseURL: URL(string: "https://api.deepseek.com")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        let text = try await streamText(
+            provider,
+            model: "deepseek-v4-flash",
+            reasoningEnabled: false
+        )
         XCTAssertEqual(text, "Hello!")
     }
 
@@ -32,20 +40,33 @@ final class OpenAICompatibleProviderTests: XCTestCase {
         let provider = OpenAIResponsesProvider(
             apiKey: "test-key",
             baseURL: URL(string: "https://api.openai.test/v1")!,
-            model: "test-model",
             session: URLSession(configuration: configuration)
         )
 
-        var text = ""
-        for try await event in provider.stream(
-            messages: [ChatMessage(role: .user, text: "Hi")]
-        ) {
-            if case let .textDelta(delta) = event {
-                text += delta
+        let text = try await streamText(provider, model: "test-model")
+        XCTAssertEqual(text, "Hello!")
+    }
+
+    func testReasoningDeltasAreForwarded() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OpenAIURLProtocol.self]
+        let provider = OpenAIResponsesProvider(
+            apiKey: "test-key",
+            baseURL: URL(string: "https://api.openai.test/v1")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        var reasoning = ""
+        for try await event in provider.stream(request: ModelRequest(
+            messages: [ChatMessage(role: .user, text: "Hi")],
+            model: "test-model",
+            reasoningEnabled: true
+        )) {
+            if case let .reasoningDelta(delta) = event {
+                reasoning += delta
             }
         }
-
-        XCTAssertEqual(text, "Hello!")
+        XCTAssertEqual(reasoning, "The user greets me.")
     }
 
     func testAvailableModelsSortsModelIDs() async throws {
@@ -57,7 +78,7 @@ final class OpenAICompatibleProviderTests: XCTestCase {
             session: URLSession(configuration: configuration)
         )
 
-        let models = try await provider.availableModels()
+        let models = try await provider.models()
         XCTAssertEqual(models, ["gpt-4", "gpt-5", "o1-mini"])
     }
 
@@ -71,7 +92,7 @@ final class OpenAICompatibleProviderTests: XCTestCase {
         )
 
         do {
-            _ = try await provider.availableModels()
+            _ = try await provider.models()
             XCTFail("expected noModels")
         } catch let error as OpenAIProviderError {
             guard case .noModels = error else {
@@ -86,17 +107,10 @@ final class OpenAICompatibleProviderTests: XCTestCase {
         let provider = OpenAIResponsesProvider(
             apiKey: "test-key",
             baseURL: URL(string: "https://api.openai.test/v1")!,
-            model: "test-model",
             session: URLSession(configuration: configuration)
         )
 
-        var text = ""
-        for try await event in provider.stream(messages: [ChatMessage(role: .user, text: "Hi")]) {
-            if case let .textDelta(delta) = event {
-                text += delta
-            }
-        }
-
+        let text = try await streamText(provider, model: "test-model")
         XCTAssertEqual(text, "Complete response")
     }
 
@@ -110,7 +124,11 @@ final class OpenAICompatibleProviderTests: XCTestCase {
         )
 
         do {
-            for try await _ in provider.stream(messages: [ChatMessage(role: .user, text: "Hi")]) {}
+            for try await _ in provider.stream(request: ModelRequest(
+                messages: [ChatMessage(role: .user, text: "Hi")],
+                model: "test-model",
+                reasoningEnabled: true
+            )) {}
             XCTFail("expected HTTP error")
         } catch let error as OpenAIProviderError {
             guard case let .http(statusCode, message) = error else {
@@ -128,37 +146,21 @@ private final class DeepSeekURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        XCTAssertEqual(request.url?.path, "/chat/completions")
+        assertResponsesRequest(request, expectedEffort: "high")
+        sendSSEStream(helloStreamSSE(includesReasoning: true))
+    }
 
-        let body = requestBodyData(request).flatMap {
-            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-        }
-        XCTAssertNotNil(body?["messages"])
-        XCTAssertNil(body?["input"])
+    override func stopLoading() {}
+}
 
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "text/event-stream"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(
-            self,
-            didLoad: Data(
-                """
-                data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+private final class ThinkingDisabledURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
 
-                data: {"choices":[{"delta":{"content":"!"},"finish_reason":null}]}
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
-                data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}
-
-                data: [DONE]
-
-                """.utf8
-            )
-        )
-        client?.urlProtocolDidFinishLoading(self)
+    override func startLoading() {
+        assertResponsesRequest(request, expectedEffort: "none")
+        sendSSEStream(helloStreamSSE())
     }
 
     override func stopLoading() {}
@@ -170,38 +172,8 @@ private final class OpenAIURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        XCTAssertEqual(request.url?.path, "/v1/responses")
-
-        let body = requestBodyData(request).flatMap {
-            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-        }
-        XCTAssertNotNil(body?["input"])
-        XCTAssertNil(body?["messages"])
-
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "text/event-stream"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(
-            self,
-            didLoad: Data(
-                """
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","delta":"Hello"}
-
-                event: response.output_text.delta
-                data: {"type":"response.output_text.delta","delta":"!"}
-
-                event: response.completed
-                data: {"type":"response.completed","response":{"output":[]}}
-
-                """.utf8
-            )
-        )
-        client?.urlProtocolDidFinishLoading(self)
+        assertResponsesRequest(request, expectedEffort: "high")
+        sendSSEStream(helloStreamSSE(includesReasoning: true))
     }
 
     override func stopLoading() {}
@@ -323,4 +295,70 @@ private func requestBodyData(_ request: URLRequest) -> Data? {
         data.append(buffer, count: count)
     }
     return data
+}
+
+private func assertResponsesRequest(_ request: URLRequest, expectedEffort: String) {
+    XCTAssertEqual(request.url?.lastPathComponent, "responses")
+
+    let body = requestBodyData(request).flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+    }
+    XCTAssertNotNil(body?["input"])
+    XCTAssertNil(body?["messages"])
+    let reasoning = body?["reasoning"] as? [String: Any]
+    XCTAssertEqual(reasoning?["effort"] as? String, expectedEffort)
+}
+
+private func helloStreamSSE(includesReasoning: Bool = false) -> Data {
+    let reasoningFrame = includesReasoning
+        ? "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"The user greets me.\"}\n\n"
+        : ""
+    return Data(
+        """
+        \(reasoningFrame)event: response.output_text.delta
+        data: {"type":"response.output_text.delta","delta":"Hello"}
+
+        event: response.output_text.delta
+        data: {"type":"response.output_text.delta","delta":"!"}
+
+        event: response.completed
+        data: {"type":"response.completed","response":{"output":[]}}
+
+        """.utf8
+    )
+}
+
+private extension URLProtocol {
+    func sendSSEStream(_ payload: Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/event-stream"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: payload)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
+@MainActor
+private extension OpenAICompatibleProviderTests {
+    func streamText(
+        _ provider: OpenAIResponsesProvider,
+        model: String = OpenAIResponsesProvider.defaultModel,
+        reasoningEnabled: Bool = true
+    ) async throws -> String {
+        var text = ""
+        for try await event in provider.stream(request: ModelRequest(
+            messages: [ChatMessage(role: .user, text: "Hi")],
+            model: model,
+            reasoningEnabled: reasoningEnabled
+        )) {
+            if case let .textDelta(delta) = event {
+                text += delta
+            }
+        }
+        return text
+    }
 }

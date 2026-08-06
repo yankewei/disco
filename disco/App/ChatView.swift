@@ -121,7 +121,7 @@ private struct ModelStatusPill: View {
     var body: some View {
         HStack(spacing: 7) {
             Circle()
-                .fill(isConfigured ? DiscoTheme.coral : Color.secondary.opacity(0.45))
+                .fill(isConfigured ? DiscoTheme.accent : Color.secondary.opacity(0.45))
                 .frame(width: 7, height: 7)
 
             Text(isConfigured ? model : "连接模型")
@@ -172,7 +172,7 @@ private struct EmptyConversationView: View {
                             .foregroundStyle(.white)
                             .padding(.horizontal, 15)
                             .padding(.vertical, 9)
-                            .background(DiscoTheme.coral, in: Capsule())
+                            .background(DiscoTheme.accent, in: Capsule())
                     }
                     .buttonStyle(DiscoPressButtonStyle())
                 }
@@ -202,7 +202,7 @@ private struct MessageRow: View {
                         .textSelection(.enabled)
                         .padding(.horizontal, 15)
                         .padding(.vertical, 11)
-                        .background(DiscoTheme.coral.opacity(0.11))
+                        .background(DiscoTheme.accent.opacity(0.11))
                         .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
                 }
             } else {
@@ -211,14 +211,27 @@ private struct MessageRow: View {
                         .padding(.top, 1)
 
                     VStack(alignment: .leading, spacing: 10) {
-                        if message.text.isEmpty && isStreaming {
-                            Text("正在生成")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .padding(.vertical, 2)
-                        } else {
-                            MarkdownView(message.text)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                        // 无思考内容的生成中（thinking 关闭时）用扫光占位；
+                        // 有 reasoning 时由思考块头部承担状态展示。
+                        if message.text.isEmpty && isStreaming && message.reasoning.isEmpty {
+                            ThinkingIndicator()
+                        }
+
+                        ForEach(Array(message.parts.enumerated()), id: \.offset) { _, part in
+                            switch part {
+                            case let .text(text):
+                                if !text.isEmpty {
+                                    MarkdownView(text)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            case let .reasoning(reasoning):
+                                ReasoningDisclosure(
+                                    reasoning: reasoning,
+                                    isThinking: isStreaming && message.text.isEmpty
+                                )
+                            case let .toolCall(call):
+                                ToolCallRow(call: call)
+                            }
                         }
 
                         if !message.text.isEmpty {
@@ -254,6 +267,181 @@ private struct MessageRow: View {
     private func copyMessage() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(message.text, forType: .string)
+    }
+}
+
+private struct ThinkingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Text("思考中")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .modifier(ShimmerModifier(reduceMotion: reduceMotion))
+    }
+}
+
+/// 从左到右扫光：一个高光条在文字形状内循环掠过。
+private struct ShimmerModifier: ViewModifier {
+    let reduceMotion: Bool
+    var duration: Double = 2.0
+
+    func body(content: Content) -> some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
+            let progress = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: duration) / duration
+            let position = -0.4 + progress * 1.8
+
+            content
+                .overlay {
+                    LinearGradient(
+                        colors: [.clear, Color.primary.opacity(0.85), .clear],
+                        startPoint: UnitPoint(x: position - 0.25, y: 0.5),
+                        endPoint: UnitPoint(x: position + 0.25, y: 0.5)
+                    )
+                }
+                .mask(content)
+        }
+    }
+}
+
+private struct ReasoningDisclosure: View {
+    let reasoning: String
+    /// 思考阶段（流式中且正文未出）：头部显示「思考中」+ 扫光，内容限高滚动；
+    /// 思考结束：头部变「思考过程」，自动收起，展开时完整显示。
+    let isThinking: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain")
+                        .font(.system(size: 11, weight: .medium))
+
+                    if isThinking {
+                        Text("思考中")
+                            .font(.caption.weight(.medium))
+                            .modifier(ShimmerModifier(reduceMotion: reduceMotion))
+                    } else {
+                        Text("思考过程")
+                            .font(.caption.weight(.medium))
+                    }
+
+                    Spacer(minLength: 12)
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isThinking ? "思考中" : (isExpanded ? "收起思考过程" : "展开思考过程"))
+
+            if isExpanded {
+                Group {
+                    if isThinking {
+                        // 思考内容实时增长：限高内部滚动，自动跟随底部
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                Text(reasoning)
+                                    .id("bottom")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineSpacing(3)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(10)
+                            }
+                            .frame(maxHeight: 240)
+                            .onChange(of: reasoning.count) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    } else {
+                        Text(reasoning)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineSpacing(3)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                }
+                .background(
+                    Color.primary.opacity(0.05),
+                    in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+                )
+            }
+        }
+        .padding(.leading, 8)
+        .onAppear {
+            if isThinking {
+                isExpanded = true
+            }
+        }
+        .onChange(of: isThinking) { _, thinking in
+            withAnimation(.easeOut(duration: 0.18)) {
+                isExpanded = thinking
+            }
+        }
+    }
+}
+
+/// 工具调用块（预留：解析与执行尚未接入，wrench 图标）。
+private struct ToolCallRow: View {
+    let call: ChatMessage.ToolCallSnapshot
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .font(.system(size: 11, weight: .medium))
+                    Text(call.name)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 12)
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "收起工具调用" : "展开工具调用")
+
+            if isExpanded {
+                Text(call.arguments)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(
+                        Color.primary.opacity(0.05),
+                        in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+                    )
+            }
+        }
+        .padding(.leading, 8)
     }
 }
 
@@ -349,7 +537,7 @@ private struct ComposerView: View {
                     SettingsLink {
                         Text("连接")
                             .font(.callout.weight(.semibold))
-                            .foregroundStyle(DiscoTheme.coral)
+                            .foregroundStyle(DiscoTheme.accent)
                     }
                     .buttonStyle(.plain)
                 }
@@ -366,7 +554,7 @@ private struct ComposerView: View {
                         .foregroundStyle(.white)
                         .frame(width: 40, height: 40)
                         .background(
-                            store.isStreaming ? Color.primary.opacity(0.72) : DiscoTheme.coral,
+                            store.isStreaming ? Color.primary.opacity(0.72) : DiscoTheme.accent,
                             in: Circle()
                         )
                 }

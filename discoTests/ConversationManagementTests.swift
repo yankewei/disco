@@ -13,7 +13,10 @@ final class ConversationManagementTests: XCTestCase {
         )
 
         let firstConversation = try XCTUnwrap(appState.selectedConversation)
-        firstConversation.store.configure(provider: ImmediateProvider(text: "Hello"))
+        firstConversation.store.configure(runtime: GenericAgentRuntime(
+            provider: ImmediateProvider(text: "Hello"),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         firstConversation.store.draft = "Hi"
         firstConversation.store.send()
 
@@ -43,7 +46,10 @@ final class ConversationManagementTests: XCTestCase {
             persistence: persistence
         )
         let conversation = try XCTUnwrap(firstAppState.selectedConversation)
-        conversation.store.configure(provider: ImmediateProvider(text: "持久化回复"))
+        conversation.store.configure(runtime: GenericAgentRuntime(
+            provider: ImmediateProvider(text: "持久化回复"),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         conversation.store.draft = "保存这段对话"
         conversation.store.send()
 
@@ -82,7 +88,10 @@ final class ConversationManagementTests: XCTestCase {
         )
 
         let firstConversation = try XCTUnwrap(appState.selectedConversation)
-        firstConversation.store.configure(provider: ImmediateProvider(text: "第一条回复"))
+        firstConversation.store.configure(runtime: GenericAgentRuntime(
+            provider: ImmediateProvider(text: "第一条回复"),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         firstConversation.store.draft = "第一段对话"
         firstConversation.store.send()
         for _ in 0..<100 where firstConversation.store.isStreaming {
@@ -91,7 +100,10 @@ final class ConversationManagementTests: XCTestCase {
 
         let secondID = appState.createConversation()
         let secondConversation = try XCTUnwrap(appState.selectedConversation)
-        secondConversation.store.configure(provider: ImmediateProvider(text: "第二条回复"))
+        secondConversation.store.configure(runtime: GenericAgentRuntime(
+            provider: ImmediateProvider(text: "第二条回复"),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         secondConversation.store.draft = "第二段对话"
         secondConversation.store.send()
         for _ in 0..<100 where secondConversation.store.isStreaming {
@@ -108,10 +120,14 @@ final class ConversationManagementTests: XCTestCase {
     }
 }
 
-private struct ImmediateProvider: AIProvider {
+private struct ImmediateProvider: ModelProvider {
     let text: String
 
-    func stream(messages: [ChatMessage]) -> AsyncThrowingStream<AIEvent, Error> {
+    let descriptor = ProviderDescriptor(id: "immediate", displayName: "Immediate")
+
+    func models() async throws -> [String] { ["test-model"] }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in
             continuation.yield(.textDelta(text))
             continuation.finish()

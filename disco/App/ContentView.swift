@@ -84,7 +84,7 @@ private struct ConversationSidebar: View {
                     Spacer(minLength: 4)
 
                     Circle()
-                        .fill(appState.hasAPIKey ? DiscoTheme.coral : Color.secondary.opacity(0.35))
+                        .fill(appState.hasAPIKey ? DiscoTheme.accent : Color.secondary.opacity(0.35))
                         .frame(width: 7, height: 7)
                 }
                 .contentShape(Rectangle())

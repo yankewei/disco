@@ -5,11 +5,26 @@ protocol APIKeyStoring {
     func load() throws -> String?
     func save(_ apiKey: String) throws
     func delete() throws
+    /// 返回绑定到指定 account 的存储实例（用于按服务商隔离）。
+    /// 测试替身（如 InMemoryKeychainStore）可直接返回自身。
+    func forAccount(_ account: String) -> APIKeyStoring
 }
 
 struct KeychainStore: APIKeyStoring {
-    private let service = Bundle.main.bundleIdentifier ?? "com.yankewei.disco"
-    private let account = "openai-platform-api-key"
+    private let service: String
+    private let account: String
+
+    init(
+        service: String = Bundle.main.bundleIdentifier ?? "com.yankewei.disco",
+        account: String = "api-key"
+    ) {
+        self.service = service
+        self.account = account
+    }
+
+    func forAccount(_ account: String) -> APIKeyStoring {
+        KeychainStore(service: service, account: account)
+    }
 
     func load() throws -> String? {
         let query: [String: Any] = [
@@ -89,5 +104,9 @@ final class InMemoryKeychainStore: APIKeyStoring {
 
     func delete() throws {
         apiKey = nil
+    }
+
+    func forAccount(_ account: String) -> APIKeyStoring {
+        self
     }
 }

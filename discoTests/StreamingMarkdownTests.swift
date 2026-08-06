@@ -15,10 +15,13 @@ final class StreamingMarkdownTests: XCTestCase {
         ```
         """
         let store = ConversationStore()
-        store.configure(provider: ChunkedMarkdownProvider(chunks: [
-            "# 标题", "\n\n", "- 第一项", "\n", "- 第二项", "\n\n",
-            "```swift\n", "let value = 1\n", "```",
-        ]))
+        store.configure(runtime: GenericAgentRuntime(
+            provider: ChunkedMarkdownProvider(chunks: [
+                "# 标题", "\n\n", "- 第一项", "\n", "- 第二项", "\n\n",
+                "```swift\n", "let value = 1\n", "```",
+            ]),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
         store.draft = "请使用 Markdown 回复"
         store.send()
 
@@ -30,10 +33,14 @@ final class StreamingMarkdownTests: XCTestCase {
     }
 }
 
-private struct ChunkedMarkdownProvider: AIProvider {
+private struct ChunkedMarkdownProvider: ModelProvider {
     let chunks: [String]
 
-    func stream(messages: [ChatMessage]) -> AsyncThrowingStream<AIEvent, Error> {
+    let descriptor = ProviderDescriptor(id: "chunked", displayName: "Chunked")
+
+    func models() async throws -> [String] { ["test-model"] }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in
             for chunk in chunks {
                 continuation.yield(.textDelta(chunk))

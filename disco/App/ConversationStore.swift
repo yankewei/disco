@@ -8,10 +8,10 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var isStreaming = false
     @Published private(set) var errorMessage: String?
 
-    private var provider: AIProvider?
+    private var runtime: (any AgentRuntime)?
     private var requestTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
-    private var activeRequestID: UUID?
+    private var activeRunID: RunID?
     private let onMessagesChanged: ([ChatMessage]) -> Void
 
     init(
@@ -23,68 +23,84 @@ final class ConversationStore: ObservableObject {
     }
 
     var canSend: Bool {
-        provider != nil && !isStreaming && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        runtime != nil && !isStreaming && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var canRetry: Bool {
         !isStreaming && errorMessage != nil && messages.last?.role == .user
     }
 
-    func configure(provider: AIProvider?) {
-        self.provider = provider
+    func configure(runtime: (any AgentRuntime)?) {
+        self.runtime = runtime
     }
 
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let provider, !text.isEmpty, !isStreaming else { return }
+        guard let runtime, !text.isEmpty, !isStreaming else { return }
 
         draft = ""
         errorMessage = nil
         messages.append(ChatMessage(role: .user, text: text))
 
         let assistantID = UUID()
-        messages.append(ChatMessage(id: assistantID, role: .assistant, text: ""))
+        messages.append(ChatMessage(id: assistantID, role: .assistant))
         schedulePersistence()
 
         let requestMessages = Array(messages.dropLast())
-        let requestID = UUID()
-        activeRequestID = requestID
+        let runID = RunID()
+        activeRunID = runID
         isStreaming = true
 
         requestTask = Task { [weak self] in
             guard let self else { return }
 
             do {
-                for try await event in provider.stream(messages: requestMessages) {
-                    guard !Task.isCancelled, activeRequestID == requestID else { return }
-                    if case let .textDelta(delta) = event,
-                       let index = messages.firstIndex(where: { $0.id == assistantID }) {
-                        messages[index].text += delta
-                        schedulePersistence()
-                    }
-                }
-
-                guard let index = messages.firstIndex(where: { $0.id == assistantID }),
-                      !messages[index].text.isEmpty else {
-                    throw OpenAIProviderError.noTextOutput
+                for try await event in runtime.start(
+                    request: AgentRunRequest(runID: runID, messages: requestMessages)
+                ) {
+                    guard !Task.isCancelled, activeRunID == runID else { return }
+                    handle(event, assistantID: assistantID)
                 }
             } catch {
-                guard !Task.isCancelled, activeRequestID == requestID else { return }
-                errorMessage = error.localizedDescription
-                if let index = messages.firstIndex(where: { $0.id == assistantID }),
-                   messages[index].text.isEmpty {
-                    messages.remove(at: index)
-                }
+                guard !Task.isCancelled, activeRunID == runID else { return }
+                errorMessage = "对话中断：\(error.localizedDescription)"
+                removeEmptyPlaceholder(assistantID)
             }
 
-            persistImmediately()
-
-            if activeRequestID == requestID {
-                activeRequestID = nil
-                isStreaming = false
-                requestTask = nil
-            }
+            finishRun(runID)
         }
+    }
+
+    private func handle(_ event: AgentEvent, assistantID: UUID) {
+        switch event {
+        case let .messageDelta(delta):
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].appendText(delta)
+            schedulePersistence()
+        case let .reasoningDelta(delta):
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].appendReasoning(delta)
+            schedulePersistence()
+        case let .runFailed(_, failure):
+            errorMessage = failure.message
+            removeEmptyPlaceholder(assistantID)
+        case .reasoningDelta, .runCompleted, .runCancelled:
+            break
+        }
+    }
+
+    private func removeEmptyPlaceholder(_ assistantID: UUID) {
+        guard let index = messages.firstIndex(where: { $0.id == assistantID }),
+              messages[index].text.isEmpty else { return }
+        messages.remove(at: index)
+    }
+
+    private func finishRun(_ runID: RunID) {
+        guard activeRunID == runID else { return }
+        persistImmediately()
+        activeRunID = nil
+        isStreaming = false
+        requestTask = nil
     }
 
     func stop() {
@@ -122,7 +138,11 @@ final class ConversationStore: ObservableObject {
     private func cancelRequest() {
         requestTask?.cancel()
         requestTask = nil
-        activeRequestID = nil
+        if let runID = activeRunID {
+            activeRunID = nil
+            let runtime = runtime
+            Task { await runtime?.cancel(runID: runID) }
+        }
         isStreaming = false
     }
 
