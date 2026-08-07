@@ -2,3 +2,6 @@
 xcuserdata/
 DerivedData/
 .reasonix/
+
+# 测试覆盖率产物
+*.profraw
