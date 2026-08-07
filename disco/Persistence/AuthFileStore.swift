@@ -9,7 +9,8 @@ protocol APIKeyStoring {
     func forAccount(_ account: String) -> APIKeyStoring
 }
 
-/// API Key 明文存储在 ~/.disco/config/auth.json（0600 权限、原子写入）。
+/// API Key 明文存储在沙盒容器的 Application Support 目录
+/// （~/Library/Containers/<bundle-id>/Data/Library/Application Support/disco/config/auth.json，0600 权限、原子写入）。
 ///
 /// 与 gh / aws 等 CLI 的做法一致：文件可读、可备份、可迁移；
 /// 代价是没有系统级加密，同一用户下的其他进程可读取。
@@ -23,9 +24,12 @@ struct AuthFileStore: APIKeyStoring {
         if let fileURL {
             self.fileURL = fileURL
         } else {
-            let home = FileManager.default.homeDirectoryForCurrentUser
-            self.fileURL = home
-                .appendingPathComponent(".disco", isDirectory: true)
+            // Apple 推荐：数据放在沙盒容器的 Application Support 目录，
+            // 而非容器根下的隐藏目录（旧版本的位置）。
+            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+            self.fileURL = support
+                .appendingPathComponent("disco", isDirectory: true)
                 .appendingPathComponent("config", isDirectory: true)
                 .appendingPathComponent("auth.json")
         }
@@ -53,9 +57,41 @@ struct AuthFileStore: APIKeyStoring {
 
     // MARK: - 文件读写
 
+    /// 旧版本把 auth.json 写在家目录（沙盒内即容器根）的 ~/.disco/config 下
+    private var legacyFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".disco", isDirectory: true)
+            .appendingPathComponent("config", isDirectory: true)
+            .appendingPathComponent("auth.json")
+    }
+
+    /// 实际使用的文件：优先 Application Support 新位置；
+    /// 新位置缺失且旧位置存在时，把旧文件迁移过去（迁移失败则回退读旧位置，不阻塞已有 Key）。
+    private func resolvedFileURL() -> URL {
+        let hasNew = FileManager.default.fileExists(atPath: fileURL.path)
+        let hasLegacy = FileManager.default.fileExists(atPath: legacyFileURL.path)
+        guard !hasNew, hasLegacy else { return fileURL }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.moveItem(at: legacyFileURL, to: fileURL)
+        } catch {
+            // 迁移失败（如权限问题）：继续读旧位置，不阻塞使用
+        }
+        return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : legacyFileURL
+    }
+
     private func readAll() throws -> [String: String] {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [:] }
-        let data = try Data(contentsOf: fileURL)
+        let url = resolvedFileURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        return try decodeFile(at: url)
+    }
+
+    private func decodeFile(at url: URL) throws -> [String: String] {
+        let data = try Data(contentsOf: url)
         do {
             return try JSONDecoder().decode([String: String].self, from: data)
         } catch {
@@ -83,7 +119,7 @@ enum AuthFileError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidFile:
-            "无法读取 ~/.disco/config/auth.json：文件损坏或格式不正确。"
+            "无法读取 API Key 文件（Application Support/disco/config/auth.json）：文件损坏或格式不正确。"
         }
     }
 }

@@ -90,7 +90,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
 
 // MARK: - 服务商配置
 
-/// 单个服务商的持久化配置。API Key 本身不进内存，存放在 ~/.disco/config/auth.json（按服务商隔离）。
+/// 单个服务商的持久化配置。API Key 本身不进内存，存放在 Application Support 目录下的 auth.json（按服务商隔离）。
 struct ProviderConfig: Equatable {
     var baseURL: String
     var model: String
