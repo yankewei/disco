@@ -275,6 +275,38 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(json?["openai-api-key"], "sk-openai")
     }
 
+    func testSaveProviderConfigRecordsAndClearsVerificationTime() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let keychain = InMemoryAuthStore()
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
+
+        XCTAssertNil(appState.config(for: .deepseek)?.lastVerifiedAt)
+
+        // 保存配置即视为验证通过，记录时间
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "deepseek-key",
+            model: "deepseek-chat"
+        )
+        let verifiedAt = try XCTUnwrap(appState.config(for: .deepseek)?.lastVerifiedAt)
+        XCTAssertEqual(verifiedAt.timeIntervalSinceNow, 0, accuracy: 5)
+        XCTAssertNotNil(defaults.object(forKey: "provider.deepseek.verifiedAt"))
+
+        // 重启后恢复；删除配置后清除
+        let restored = try makeAppState(keychain: keychain, defaults: defaults)
+        XCTAssertEqual(
+            restored.config(for: .deepseek)?.lastVerifiedAt?.timeIntervalSince1970 ?? 0,
+            verifiedAt.timeIntervalSince1970,
+            accuracy: 1
+        )
+        try restored.deleteProviderAPIKey(vendor: .deepseek)
+        XCTAssertNil(restored.config(for: .deepseek)?.lastVerifiedAt)
+        XCTAssertNil(defaults.object(forKey: "provider.deepseek.verifiedAt"))
+    }
+
     func testAuthFileStoreRecoversWhenFileMissing() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

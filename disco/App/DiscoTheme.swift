@@ -70,3 +70,84 @@ struct DiscoPressButtonStyle: ButtonStyle {
             .animation(DiscoMotion.press, value: configuration.isPressed)
     }
 }
+
+/// 列表行的选中/悬停高亮（统一各列表行的视觉反馈）
+struct DiscoRowStyle: ViewModifier {
+    let isSelected: Bool
+    let isHovered: Bool
+
+    private var rowBackground: Color {
+        if isSelected { return DiscoTheme.accent.opacity(0.12) }
+        if isHovered { return Color.primary.opacity(0.04) }
+        return .clear
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .background(rowBackground, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+}
+
+extension View {
+    /// 套用列表行选中/悬停高亮
+    func discoRowStyle(isSelected: Bool, isHovered: Bool) -> some View {
+        modifier(DiscoRowStyle(isSelected: isSelected, isHovered: isHovered))
+    }
+}
+
+/// 服务商品牌图标：优先用品牌 logo 资源（Assets/BrandIcons），缺失时回退到 SF Symbol
+struct VendorBrandIcon: View {
+    let vendor: ProviderVendor
+    /// 磁贴边长；为 nil 时不画磁贴（菜单 Label 等紧凑场景）
+    var tileSize: CGFloat?
+    /// 未选中/未开放时降透明显示
+    var isActive = true
+
+    /// 品牌 logo 尺寸：磁贴内约占 62%，无磁贴时按 14pt 基准
+    private var brandSize: CGFloat { tileSize.map { $0 * 0.62 } ?? 14 }
+    /// SF Symbol 尺寸：磁贴内约占 50%，无磁贴时按 13pt 基准
+    private var symbolSize: CGFloat { tileSize.map { $0 * 0.5 } ?? 13 }
+
+    var body: some View {
+        if let brandIcon = vendor.brandIcon {
+            Image(brandIcon)
+                .resizable()
+                .scaledToFit()
+                .frame(width: brandSize, height: brandSize)
+                .ifLet(tileSize) { content, size in
+                    content
+                        .frame(width: size, height: size)
+                        .background(
+                            Color.primary.opacity(0.055),
+                            in: RoundedRectangle(cornerRadius: size * 0.28)
+                        )
+                }
+                .opacity(isActive ? 1 : 0.45)
+        } else {
+            Image(systemName: vendor.icon)
+                .font(.system(size: symbolSize, weight: .semibold))
+                .foregroundStyle(isActive ? DiscoTheme.accent : Color.secondary)
+                .ifLet(tileSize) { content, size in
+                    content
+                        .frame(width: size, height: size)
+                        .background(
+                            (isActive ? DiscoTheme.accent : Color.secondary).opacity(0.1),
+                            in: RoundedRectangle(cornerRadius: size * 0.28)
+                        )
+                }
+        }
+    }
+}
+
+extension View {
+    /// 可选值存在时应用变换，否则原样返回
+    @ViewBuilder
+    func ifLet<T, Content: View>(_ value: T?, @ViewBuilder transform: (Self, T) -> Content) -> some View {
+        if let value {
+            transform(self, value)
+        } else {
+            self
+        }
+    }
+}

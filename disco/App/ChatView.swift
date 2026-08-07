@@ -109,6 +109,10 @@ struct ChatView: View {
         } message: {
             Text("这只会清空当前窗口中的消息。")
         }
+        .onReceive(NotificationCenter.default.publisher(for: .discoRequestClearConversation)) { _ in
+            guard !store.messages.isEmpty else { return }
+            isConfirmingClear = true
+        }
     }
 }
 
@@ -205,9 +209,6 @@ private struct MessageRow: View {
                 }
             } else {
                 HStack(alignment: .top, spacing: 13) {
-                    DiscoMark(size: 23, isActive: isStreaming)
-                        .padding(.top, 1)
-
                     VStack(alignment: .leading, spacing: 10) {
                         // 无思考内容的生成中（thinking 关闭时）用扫光占位；
                         // 有 reasoning 时由思考块头部承担状态展示。
@@ -486,18 +487,13 @@ private struct ComposerView: View {
     let isConfigured: Bool
 
     @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    @State private var isModelDrawerPresented = false
     @FocusState private var isFocused: Bool
 
     private var activeVendor: ProviderVendor {
         appState.activeVendor
-    }
-
-    /// 已配置 API Key 的服务商，供聊天页直接切换
-    private var configuredVendors: [ProviderVendor] {
-        ProviderVendor.allCases.filter {
-            $0.isAvailable && appState.config(for: $0)?.hasAPIKey == true
-        }
     }
 
     var body: some View {
@@ -520,8 +516,7 @@ private struct ComposerView: View {
 
             HStack(spacing: 8) {
                 if isConfigured {
-                    providerMenu
-                    modelMenu
+                    modelDrawerTrigger
                     thinkingToggle
                 } else {
                     Image(systemName: "lock.fill")
@@ -585,80 +580,309 @@ private struct ComposerView: View {
 
     // MARK: - 配置行控件
 
-    private var providerMenu: some View {
-        Menu {
-            Picker("服务商", selection: Binding(
-                get: { activeVendor },
-                set: { appState.setActiveVendor($0) }
-            )) {
-                ForEach(configuredVendors) { vendor in
-                    Label(vendor.title, systemImage: vendor.icon)
-                        .tag(vendor)
-                }
-            }
-
-            Divider()
-
-            SettingsLink {
-                Label("管理连接…", systemImage: "slider.horizontal.3")
-            }
+    /// 打开模型抽屉的入口胶囊：显示当前服务商与模型，宽度随文字自适应
+    private var modelDrawerTrigger: some View {
+        Button {
+            isModelDrawerPresented = true
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: activeVendor.icon)
-                Text(activeVendor.title)
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-            }
+            segmentLabel(modelLabel)
+                .contentTransition(.opacity)
+                .padding(.horizontal, 10)
+                .frame(minHeight: 28)
+                .background(.quaternary, in: Capsule())
         }
-        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
         .disabled(store.isStreaming)
+        .help("选择服务商与模型")
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: modelLabel)
+        .popover(isPresented: $isModelDrawerPresented, arrowEdge: .bottom) {
+            ModelDrawer(dismiss: { isModelDrawerPresented = false })
+        }
     }
 
-    private var modelMenu: some View {
-        let models = appState.config(for: activeVendor)?.models ?? []
+    /// 当前选择文案：服务商 · 模型（未选模型时只显示服务商）
+    private var modelLabel: String {
+        appState.model.isEmpty ? appState.activeVendor.title : "\(appState.activeVendor.title) · \(appState.model)"
+    }
 
-        return Menu {
-            if models.isEmpty {
-                Text("尚未加载模型列表")
-            } else {
-                Picker("模型", selection: Binding(
-                    get: { appState.model },
-                    set: { appState.setActiveModel($0, for: activeVendor) }
-                )) {
-                    ForEach(models, id: \.self) { name in
-                        Text(name).tag(name)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 5) {
-                Text(appState.model)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 170, alignment: .leading)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-            }
+    /// 抽屉入口的标签：文字（不截断）+ 下箭头，宽度随内容自适应
+    private func segmentLabel(_ text: String) -> some View {
+        HStack(spacing: 5) {
+            Text(text)
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
         }
-        .menuStyle(.borderlessButton)
-        .disabled(store.isStreaming)
     }
 
     private var thinkingToggle: some View {
-        HStack(spacing: 5) {
-            Text("思考")
-            Toggle(
-                "思考模式",
-                isOn: Binding(
-                    get: { appState.config(for: activeVendor)?.thinkingEnabled ?? true },
-                    set: { appState.setThinkingEnabled($0, for: activeVendor) }
-                )
+        let isOn = appState.config(for: activeVendor)?.thinkingEnabled ?? true
+
+        return Button {
+            appState.setThinkingEnabled(!isOn, for: activeVendor)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "brain")
+                Text("思考")
+            }
+            .foregroundStyle(isOn ? DiscoTheme.accent : Color.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                isOn ? DiscoTheme.accent.opacity(0.14) : Color.clear,
+                in: Capsule()
             )
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .labelsHidden()
         }
+        .buttonStyle(DiscoPressButtonStyle())
         .disabled(store.isStreaming)
+        .help(isOn ? "思考模式已开启，点击关闭" : "思考模式已关闭，点击开启")
     }
+}
+
+/// 模型抽屉：左列选服务商、右列展示该服务商全部模型；选中模型后切换并关闭
+private struct ModelDrawer: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openSettings) private var openSettings
+
+    /// 关闭抽屉（选中模型或打开设置后调用）
+    let dismiss: () -> Void
+
+    /// 抽屉内当前高亮的服务商；打开时默认跟随当前服务商
+    @State private var selectedVendor: ProviderVendor?
+
+    /// 已配置 API Key 的服务商
+    private var vendors: [ProviderVendor] {
+        ProviderVendor.allCases.filter {
+            $0.isAvailable && appState.config(for: $0)?.hasAPIKey == true
+        }
+    }
+
+    private var highlightedVendor: ProviderVendor {
+        selectedVendor ?? appState.activeVendor
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                vendorPane
+
+                Divider()
+
+                modelPane
+                    .id(highlightedVendor)
+            }
+            .frame(maxHeight: .infinity)
+
+            Divider()
+
+            Button {
+                dismiss()
+                openSettings()
+            } label: {
+                Label("管理连接…", systemImage: "slider.horizontal.3")
+                    .font(.callout)
+                    .foregroundStyle(DiscoTheme.accent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(width: 460, height: 300)
+        .onAppear { selectedVendor = appState.activeVendor }
+    }
+
+    // MARK: 左列：服务商
+
+    private var vendorPane: some View {
+        VStack(spacing: 0) {
+            Text("服务商")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(vendors) { vendor in
+                        vendorRow(vendor)
+                    }
+                }
+                .padding(6)
+            }
+        }
+        .frame(width: 168)
+    }
+
+    private func vendorRow(_ vendor: ProviderVendor) -> some View {
+        Button {
+            // 切换服务商后，右侧模型栏随之更新
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                selectedVendor = vendor
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(vendor.title)
+                    .font(.callout.weight(highlightedVendor == vendor ? .semibold : .regular))
+                    .foregroundStyle(highlightedVendor == vendor ? .primary : .secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .background(
+                highlightedVendor == vendor ? DiscoTheme.accent.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: DiscoRadius.small)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: 右列：模型
+
+    @ViewBuilder
+    private var modelPane: some View {
+        let vendor = highlightedVendor
+        let models = appState.config(for: vendor)?.models ?? []
+
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text(vendor.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if models.isEmpty {
+                    Text("尚未加载模型列表")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider()
+
+            if models.isEmpty {
+                Spacer()
+                Text("请先在设置中验证连接，加载模型列表")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(14)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(models, id: \.self) { name in
+                            modelRow(name, vendor: vendor)
+
+                            if name != models.last {
+                                Divider()
+                                    .padding(.leading, 14)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .transition(.asymmetric(
+            insertion: .move(edge: .trailing).combined(with: .opacity),
+            removal: .opacity
+        ))
+    }
+
+    private func modelRow(_ name: String, vendor: ProviderVendor) -> some View {
+        Button {
+            selectModel(vendor, name)
+        } label: {
+            HStack(spacing: 10) {
+                Text(name)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                if vendor == appState.activeVendor && name == appState.model {
+                    Image(systemName: "checkmark")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(DiscoTheme.accent)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 选中模型：跨服务商时先切换服务商，再设置模型并关闭抽屉
+    private func selectModel(_ vendor: ProviderVendor, _ name: String) {
+        if vendor != appState.activeVendor {
+            appState.setActiveVendor(vendor)
+        }
+        appState.setActiveModel(name, for: vendor)
+        dismiss()
+    }
+}
+
+// MARK: - 预览
+
+/// 预览用 AppState：内存替身 + 独立 UserDefaults，绝不读写真实凭据/数据库
+@MainActor
+private func makePreviewAppState() -> AppState {
+    let appState = AppState(
+        keychain: InMemoryAuthStore(),
+        defaults: UserDefaults(suiteName: "disco.preview.\(UUID().uuidString)")!,
+        persistence: VolatileConversationPersistence()
+    )
+    try? appState.saveProviderConfig(
+        vendor: .deepseek,
+        baseURL: "https://api.deepseek.com/v1",
+        apiKey: "sk-preview-deepseek",
+        model: "deepseek-chat",
+        models: ["deepseek-chat", "deepseek-reasoner"]
+    )
+    try? appState.saveProviderConfig(
+        vendor: .openai,
+        baseURL: "https://api.openai.com/v1",
+        apiKey: "sk-preview-openai",
+        model: "gpt-4o-mini",
+        models: ["gpt-4o-mini", "gpt-4o"]
+    )
+    return appState
+}
+
+/// 预览用示例对话（含思考过程与正文）
+@MainActor
+private func makePreviewConversation() -> ConversationSession {
+    ConversationSession(
+        messages: [
+            ChatMessage(role: .user, text: "用 Swift 写一个冒泡排序"),
+            ChatMessage(
+                role: .assistant,
+                text: "```swift\nfunc bubbleSort(_ arr: inout [Int]) {\n    for i in 0..<arr.count {\n        for j in 0..<(arr.count - i - 1) {\n            if arr[j] > arr[j + 1] {\n                arr.swapAt(j, j + 1)\n            }\n        }\n    }\n}\n```\n\n这是冒泡排序的实现，最坏时间复杂度 O(n²)。",
+                reasoning: "用户要求用 Swift 实现冒泡排序。直接给出可运行的实现，并补充复杂度说明。"
+            ),
+        ]
+    )
+}
+
+#Preview("聊天窗") {
+    ChatView(store: makePreviewConversation().store)
+        .environmentObject(makePreviewAppState())
+        .frame(width: 820, height: 600)
+}
+
+#Preview("模型抽屉") {
+    ModelDrawer(dismiss: {})
+        .environmentObject(makePreviewAppState())
+        .frame(width: 460, height: 300)
 }

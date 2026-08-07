@@ -1,17 +1,15 @@
 import SwiftUI
 
-// MARK: - 设置分区（侧边栏导航）
+// MARK: - 设置分区（侧边栏导航，后续新增 tools / skills 等）
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
     case providers
-    // 后续新增：case tools
-    // 后续新增：case skills
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .providers: "Providers"
+        case .providers: "服务商"
         }
     }
 
@@ -22,54 +20,81 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - 设置主视图
+// MARK: - 设置主视图（左设置分类，右侧为分类内容）
 
 struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var selectedSection: SettingsSection = .providers
-    @State private var expandedVendor: ProviderVendor? = .deepseek
+    @State private var selectedVendor: ProviderVendor?
+    /// 各服务商未保存的输入草稿，切换服务商时不丢失
+    @State private var drafts: [ProviderVendor: VendorDraft] = [:]
+    @State private var isAddingVendor = false
 
-    var body: some View {
-        ZStack {
-            DiscoTheme.canvas
-                .ignoresSafeArea()
-
-            HStack(spacing: 0) {
-                sidebar
-
-                Divider()
-                    .opacity(0.65)
-
-                content
-            }
+    /// 服务商页列出的服务商：已配置过，或本次会话中手动添加待配置的
+    private var listedVendors: [ProviderVendor] {
+        ProviderVendor.allCases.filter { vendor in
+            vendor.isAvailable && (appState.config(for: vendor) != nil || appState.pendingVendors.contains(vendor))
         }
-        .frame(width: 880, height: 680)
     }
 
-    // MARK: 侧边栏
+    private var addableVendors: [ProviderVendor] {
+        ProviderVendor.allCases.filter { $0.isAvailable && !listedVendors.contains($0) }
+    }
 
-    private var sidebar: some View {
+    /// 尚未开放的服务商（“添加服务商”面板中置灰展示“即将推出”，保留规划可见性）
+    private var upcomingVendors: [ProviderVendor] {
+        ProviderVendor.allCases.filter { !$0.isAvailable && !listedVendors.contains($0) }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            sectionSidebar
+
+            Divider()
+                .opacity(0.65)
+
+            sectionContent
+        }
+        .background(DiscoTheme.canvas.ignoresSafeArea())
+        .frame(width: 940, height: 600)
+        .onAppear {
+            if selectedVendor == nil {
+                selectedVendor = listedVendors.contains(appState.activeVendor)
+                    ? appState.activeVendor
+                    : listedVendors.first
+            }
+        }
+        .onChange(of: appState.providerConfigs) { _, _ in
+            // 验证保存完成后，从“待配置”中移除
+            appState.pendingVendors = appState.pendingVendors.filter {
+                appState.config(for: $0)?.isConfigured != true
+            }
+        }
+    }
+
+    // MARK: 左栏：设置分类
+
+    private var sectionSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 11) {
-                DiscoMark(size: 30)
+                DiscoMark(size: 28)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("disco")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
                     Text("偏好设置")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 22)
-            .padding(.bottom, 22)
+            .padding(.horizontal, 16)
+            .padding(.top, 20)
+            .padding(.bottom, 18)
 
             VStack(spacing: 2) {
                 ForEach(SettingsSection.allCases) { section in
-                    SidebarItemView(
+                    SettingsSectionRow(
                         section: section,
                         isSelected: selectedSection == section
                     ) {
@@ -77,552 +102,242 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 8)
 
             Spacer()
-
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(appState.hasAPIKey ? DiscoTheme.accent : Color.secondary.opacity(0.45))
-                    .frame(width: 7, height: 7)
-                Text(appState.hasAPIKey ? "已保存配置" : "尚未配置")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 16)
         }
-        .frame(width: 210)
+        .frame(width: 168)
         .background(.ultraThinMaterial)
     }
 
-    // MARK: 右侧内容
+    // MARK: 右侧：分类内容
 
-    private var content: some View {
-        VStack(spacing: 0) {
-            contentHeader
+    @ViewBuilder
+    private var sectionContent: some View {
+        switch selectedSection {
+        case .providers:
+            HStack(spacing: 0) {
+                vendorListColumn
 
-            Divider()
-                .opacity(0.65)
+                Divider()
+                    .opacity(0.65)
 
-            ScrollView {
-                VStack(spacing: 26) {
-                    providerSection
-                }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 24)
+                vendorDetailColumn
             }
         }
     }
 
-    private var contentHeader: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(selectedSection.title)
-                    .font(.system(size: 20, weight: .semibold, design: .rounded))
-                Text("配置服务商连接，选择当前使用的模型")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+    // MARK: 服务商页：服务商列表
+
+    private var vendorListColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if listedVendors.isEmpty {
+                Text("还没有连接任何服务商")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 14)
+            } else {
+                VStack(spacing: 2) {
+                    ForEach(listedVendors) { vendor in
+                        VendorListRow(
+                            vendor: vendor,
+                            status: connectionStatus(for: vendor),
+                            model: appState.config(for: vendor)?.model ?? "",
+                            isSelected: selectedVendor == vendor
+                        ) {
+                            selectedVendor = vendor
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, 12)
             }
+
             Spacer()
-        }
-        .padding(.horizontal, 28)
-        .padding(.vertical, 18)
-    }
 
-    private var providerSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SettingsSectionHeader(
-                title: "模型服务商",
-                caption: "展开并配置服务商，可配置多个；标记“使用中”的会驱动对话。"
-            )
-
-            VStack(spacing: 10) {
-                ForEach(ProviderVendor.allCases) { vendor in
-                    VendorCard(
-                        vendor: vendor,
-                        isActive: appState.activeVendor == vendor,
-                        isExpanded: expandedVendor == vendor,
-                        isConfigured: appState.config(for: vendor)?.hasAPIKey == true
-                    ) {
-                        guard vendor.isAvailable else { return }
-                        withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
-                            expandedVendor = expandedVendor == vendor ? nil : vendor
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - 服务商卡片（手风琴）
-
-private struct VendorCard: View {
-    let vendor: ProviderVendor
-    let isActive: Bool
-    let isExpanded: Bool
-    let isConfigured: Bool
-    let onToggle: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 14) {
-                    Image(systemName: vendor.icon)
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(vendor.isAvailable ? DiscoTheme.accent : Color.secondary)
-                        .frame(width: 34, height: 34)
-                        .background(
-                            (vendor.isAvailable ? DiscoTheme.accent : Color.secondary).opacity(0.1),
-                            in: RoundedRectangle(cornerRadius: 10)
-                        )
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 8) {
-                            Text(vendor.title)
-                                .font(.callout.weight(.semibold))
-                                .foregroundStyle(.primary)
-                            if isConfigured {
-                                Image(systemName: "checkmark.seal.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(DiscoTheme.accent)
-                            }
-                        }
-                        Text(vendor.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-
-                    Spacer()
-
-                    if isActive {
-                        Text("使用中")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(DiscoTheme.accent)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(DiscoTheme.accent.opacity(0.12), in: Capsule())
-                    } else if !vendor.isAvailable {
-                        Text("即将推出")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(.quaternary, in: Capsule())
-                    }
-
-                    if vendor.isAvailable {
-                        Image(systemName: "chevron.down")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .rotationEffect(.degrees(isExpanded ? 180 : 0))
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 13)
-                .contentShape(Rectangle())
-                .background(
-                    isHovered && vendor.isAvailable ? Color.primary.opacity(0.03) : Color.clear
-                )
+            Button {
+                isAddingVendor = true
+            } label: {
+                Label("添加服务商", systemImage: "plus")
+                    .font(.callout.weight(.medium))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .onHover { isHovered = $0 }
-
-            if isExpanded {
-                Divider()
-                    .padding(.leading, 62)
-
-                VendorConfigPanel(vendor: vendor)
-                    .padding(16)
+            .foregroundStyle(addableVendors.isEmpty ? Color.secondary.opacity(0.5) : DiscoTheme.accent)
+            .disabled(addableVendors.isEmpty)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 12)
+            .popover(isPresented: $isAddingVendor, arrowEdge: .trailing) {
+                AddVendorPanel(vendors: addableVendors, upcoming: upcomingVendors) { vendor in
+                    appState.pendingVendors = appState.pendingVendors.union([vendor])
+                    selectedVendor = vendor
+                    isAddingVendor = false
+                }
             }
         }
-        .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.medium))
-        .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium))
-        .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
-    }
-}
-
-// MARK: - 单个服务商配置面板
-
-private struct VendorConfigPanel: View {
-    let vendor: ProviderVendor
-
-    @EnvironmentObject private var appState: AppState
-
-    @State private var baseURL = ""
-    @State private var apiKey = ""
-    @State private var models: [String] = []
-    @State private var selectedModel = ""
-    @State private var modelSearch = ""
-    @State private var loadRequestID: UUID?
-    @State private var status = ConfigurationStatus.idle
-    @State private var isConfirmingKeyDeletion = false
-    @FocusState private var focusedField: ConfigurationField?
-
-    private var config: ProviderConfig? { appState.config(for: vendor) }
-
-    private var filteredModels: [String] {
-        let query = modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return models }
-        return models.filter { $0.localizedCaseInsensitiveContains(query) }
+        .frame(width: 208)
     }
 
-    private var canLoadModels: Bool {
-        !status.isLoading
-            && !trimmedBaseURL.isEmpty
-            && (!trimmedAPIKey.isEmpty || config?.hasAPIKey == true)
+    // MARK: 服务商页：连接详情
+
+    @ViewBuilder
+    private var vendorDetailColumn: some View {
+        if let vendor = selectedVendor, listedVendors.contains(vendor) {
+            VendorDetailPanel(
+                vendor: vendor,
+                draft: draftBinding(for: vendor)
+            )
+            .id(vendor)
+        } else {
+            emptyState
+        }
     }
 
-    private var canSave: Bool {
-        !selectedModel.isEmpty
-            && !trimmedBaseURL.isEmpty
-            && (!trimmedAPIKey.isEmpty || config?.hasAPIKey == true)
-    }
-
-    private var trimmedBaseURL: String {
-        baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var trimmedAPIKey: String {
-        apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    var body: some View {
+    private var emptyState: some View {
         VStack(spacing: 16) {
-            VStack(spacing: 0) {
-                SettingInputRow(icon: "network", title: "Base URL") {
-                    TextField(vendor.defaultBaseURL.isEmpty ? "https://api.example.com/v1" : vendor.defaultBaseURL, text: $baseURL)
-                        .textFieldStyle(.plain)
-                        .focused($focusedField, equals: .baseURL)
-                        .accessibilityLabel("Base URL")
-                }
+            DiscoMark(size: 46)
 
-                Divider()
-                    .padding(.leading, 54)
-
-                SettingInputRow(icon: "key.fill", title: "API Key") {
-                    SecureField(
-                        (config?.hasAPIKey ?? false) ? "已保存，留空继续使用" : "输入 API Key",
-                        text: $apiKey
-                    )
-                    .textFieldStyle(.plain)
-                    .focused($focusedField, equals: .apiKey)
-                    .accessibilityLabel("API Key")
-                }
+            VStack(spacing: 6) {
+                Text("连接一个模型服务商")
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                Text("选择一个服务商，粘贴 API Key，验证通过后即可开始对话。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
 
-            HStack(spacing: 14) {
-                configurationStatus
-
-                Spacer(minLength: 12)
-
-                Button {
-                    loadRequestID = UUID()
-                } label: {
-                    HStack(spacing: 8) {
-                        if status.isLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                        }
-                        Text(status.isLoading ? "正在连接" : "连接并加载模型")
-                    }
+            Button {
+                isAddingVendor = true
+            } label: {
+                Text("添加服务商")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.white)
-                    .frame(minWidth: 150)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, 20)
                     .padding(.vertical, 9)
                     .background(DiscoTheme.accent, in: Capsule())
-                }
-                .buttonStyle(DiscoPressButtonStyle())
-                .disabled(!canLoadModels)
-                .opacity(canLoadModels || status.isLoading ? 1 : 0.4)
             }
-            .frame(minHeight: 38)
-
-            modelList
-                .frame(height: 180)
-
-            SettingInputRow(icon: "brain", title: "思考模式", caption: "开启后该服务商的请求会先进行推理") {
-                Toggle(
-                    "思考模式",
-                    isOn: Binding(
-                        get: { appState.config(for: vendor)?.thinkingEnabled ?? true },
-                        set: { appState.setThinkingEnabled($0, for: vendor) }
-                    )
-                )
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .accessibilityLabel("思考模式")
-            }
-
-            Divider()
-                .opacity(0.65)
-
-            HStack(spacing: 12) {
-                if config?.hasAPIKey == true {
-                    Button("删除 Key", role: .destructive) {
-                        isConfirmingKeyDeletion = true
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.red)
-                }
-
-                Spacer()
-
-                if appState.activeVendor != vendor {
-                    Button {
-                        appState.setActiveVendor(vendor)
-                    } label: {
-                        Text(config?.isConfigured == true ? "设为当前服务商" : "当前未配置")
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(DiscoTheme.accent)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(config?.isConfigured != true)
-                }
-
-                Button {
-                    save()
-                } label: {
-                    Text("保存配置")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 9)
-                        .background(DiscoTheme.accent, in: Capsule())
-                }
-                .buttonStyle(DiscoPressButtonStyle())
-                .disabled(!canSave)
-                .opacity(canSave ? 1 : 0.4)
-            }
+            .buttonStyle(DiscoPressButtonStyle())
+            .disabled(addableVendors.isEmpty)
         }
-        .onAppear {
-            baseURL = config?.baseURL ?? vendor.defaultBaseURL
-            selectedModel = config?.model ?? ""
-            models = selectedModel.isEmpty ? [] : [selectedModel]
-            status = (config?.hasAPIKey ?? false) ? .current : .idle
-        }
-        .onChange(of: baseURL) { oldValue, _ in
-            guard !oldValue.isEmpty else { return }
-            models = []
-            selectedModel = ""
-            modelSearch = ""
-            status = .idle
-        }
-        .task(id: loadRequestID) {
-            guard loadRequestID != nil else { return }
-            status = .loading
-            defer { loadRequestID = nil }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-            do {
-                let loadedModels = try await appState.availableModels(
-                    vendor: vendor,
-                    baseURL: baseURL,
-                    apiKey: apiKey
-                )
-                guard !Task.isCancelled else { return }
-                models = loadedModels
-                modelSearch = ""
-                if !loadedModels.contains(selectedModel) {
-                    selectedModel = ""
-                }
-                status = .loaded(loadedModels.count)
-            } catch is CancellationError {
-                return
-            } catch {
-                models = []
-                selectedModel = ""
-                status = .failed(error.localizedDescription)
-            }
+    private func draftBinding(for vendor: ProviderVendor) -> Binding<VendorDraft> {
+        Binding(
+            get: { drafts[vendor] ?? VendorDraft() },
+            set: { drafts[vendor] = $0 }
+        )
+    }
+
+    // MARK: 状态归纳
+
+    private func connectionStatus(for vendor: ProviderVendor) -> ConnectionStatus {
+        ConnectionStatus(config: appState.config(for: vendor))
+    }
+}
+
+// MARK: - 连接状态
+
+private enum ConnectionStatus {
+    case verified
+    case unverified
+    case unconfigured
+
+    init(config: ProviderConfig?) {
+        guard let config, config.hasAPIKey else {
+            self = .unconfigured
+            return
         }
-        .confirmationDialog(
-            "删除 \(vendor.title) 已保存的 API Key？",
-            isPresented: $isConfirmingKeyDeletion,
-            titleVisibility: .visible
-        ) {
-            Button("删除已保存的 Key", role: .destructive) {
-                deleteKey()
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("删除后需要重新输入 API Key 才能继续对话。")
+        self = config.lastVerifiedAt != nil ? .verified : .unverified
+    }
+
+    var color: Color {
+        switch self {
+        case .verified: .green
+        case .unverified: .orange
+        case .unconfigured: Color.secondary.opacity(0.45)
         }
     }
 
-    @ViewBuilder
-    private var configurationStatus: some View {
-        switch status {
-        case .idle:
-            StatusLabel(icon: "circle.dotted", text: "填写信息后连接服务", color: .secondary)
-        case .current:
-            StatusLabel(icon: "checkmark.circle", text: "当前配置可用，连接可刷新模型", color: .secondary)
-        case .loading:
-            StatusLabel(icon: "ellipsis", text: "正在读取服务模型", color: .secondary)
-        case let .loaded(count):
-            StatusLabel(icon: "checkmark.circle.fill", text: "已读取 \(count) 个模型", color: .green)
-        case let .failed(message):
-            StatusLabel(icon: "exclamationmark.circle.fill", text: message, color: .red)
-                .help(message)
-        case .saved:
-            StatusLabel(icon: "checkmark.circle.fill", text: "配置已保存", color: .green)
-        case .keyDeleted:
-            StatusLabel(icon: "trash", text: "API Key 已删除", color: .secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var modelList: some View {
-        if status.isLoading {
-            HStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.small)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("正在加载模型")
-                        .font(.callout.weight(.medium))
-                    Text("这通常只需要几秒钟")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        } else if models.isEmpty {
-            HStack(spacing: 13) {
-                Image(systemName: "square.stack.3d.up")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("还没有模型列表")
-                        .font(.callout.weight(.medium))
-                    Text("先完成上面的服务连接")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        } else if filteredModels.isEmpty {
-            HStack(spacing: 12) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                Text("没有匹配“\(modelSearch)”的模型")
-                    .font(.callout)
-                Spacer()
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        } else {
-            VStack(spacing: 0) {
-                HStack(alignment: .center) {
-                    Text("选择模型")
-                        .font(.headline)
-                    Spacer()
-                    if models.count > 7 {
-                        HStack(spacing: 7) {
-                            Image(systemName: "magnifyingglass")
-                                .foregroundStyle(.secondary)
-                            TextField("筛选模型", text: $modelSearch)
-                                .textFieldStyle(.plain)
-                                .frame(width: 150)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(.quaternary, in: Capsule())
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(filteredModels, id: \.self) { model in
-                            ModelSelectionRow(
-                                model: model,
-                                isSelected: selectedModel == model
-                            ) {
-                                selectedModel = model
-                                if status == .saved {
-                                    status = .loaded(models.count)
-                                }
-                            }
-
-                            if model != filteredModels.last {
-                                Divider()
-                                    .padding(.leading, 46)
-                            }
-                        }
-                    }
-                }
-            }
-            .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
-            .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.small))
-        }
-    }
-
-    private func save() {
-        do {
-            try appState.saveProviderConfig(
-                vendor: vendor,
-                baseURL: baseURL,
-                apiKey: apiKey,
-                model: selectedModel,
-                models: models
-            )
-            apiKey = ""
-            status = .saved
-        } catch {
-            status = .failed(error.localizedDescription)
-        }
-    }
-
-    private func deleteKey() {
-        do {
-            try appState.deleteProviderAPIKey(vendor: vendor)
-            apiKey = ""
-            models = []
-            selectedModel = ""
-            modelSearch = ""
-            status = .keyDeleted
-        } catch {
-            status = .failed(error.localizedDescription)
+    var title: String {
+        switch self {
+        case .verified: "已连接"
+        case .unverified: "未验证"
+        case .unconfigured: "未配置"
         }
     }
 }
 
-// MARK: - 辅助控件
+// MARK: - 服务商草稿（未验证保存的输入）
 
-private enum ConfigurationField: Hashable {
-    case baseURL
-    case apiKey
+private struct VendorDraft: Equatable {
+    var baseURL = ""
+    var apiKey = ""
+    var isKeyVisible = false
+    var models: [String] = []
+    var selectedModel = ""
+    var modelSearch = ""
 }
 
-private enum ConfigurationStatus: Equatable {
-    case idle
-    case current
-    case loading
-    case loaded(Int)
-    case failed(String)
-    case saved
-    case keyDeleted
+// MARK: - 凭据指纹与校验门（纯值逻辑，便于单元测试）
 
-    var isLoading: Bool {
-        self == .loading
+/// 凭据指纹：归一化 Base URL + API Key，用于判定“当前输入是否已通过验证”
+struct CredentialFingerprint: Equatable {
+    var baseURL: String
+    var apiKey: String
+}
+
+/// 服务商编辑面板的校验门：决定模型选择是否可用（纯逻辑，无 UI 依赖）
+struct VendorEditGate {
+    /// 已保存配置的 baseURL（nil 表示从未配置）
+    var savedBaseURL: String?
+    /// 当前草稿输入
+    var draftBaseURL: String
+    var draftAPIKey: String
+    /// 是否已加载模型列表
+    var hasLoadedModels: Bool
+    /// 最近一次验证通过的凭据指纹
+    var verifiedFingerprint: CredentialFingerprint?
+
+    private var trimmedAPIKey: String {
+        draftAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 与保存配置时一致的 baseURL 归一化（去尾部斜杠）
+    private var normalizedBaseURL: String {
+        var value = draftBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("/") { value.removeLast() }
+        return value
+    }
+
+    /// 当前输入对应的凭据指纹
+    var currentFingerprint: CredentialFingerprint {
+        CredentialFingerprint(baseURL: normalizedBaseURL, apiKey: trimmedAPIKey)
+    }
+
+    /// 草稿输入与已保存配置不一致（改了 URL 或输入了新 Key）
+    private var inputDiffersFromSaved: Bool {
+        if trimmedAPIKey.isEmpty, let savedBaseURL {
+            return normalizedBaseURL != savedBaseURL
+        }
+        return true
+    }
+
+    /// 模型列表是否可选择（选择即保存）
+    var canSelectModel: Bool {
+        guard hasLoadedModels else { return false }
+        if inputDiffersFromSaved { return verifiedFingerprint == currentFingerprint }
+        return true
     }
 }
 
-private struct SidebarItemView: View {
+// MARK: - 设置分类行
+
+private struct SettingsSectionRow: View {
     let section: SettingsSection
     let isSelected: Bool
     let select: () -> Void
@@ -633,7 +348,7 @@ private struct SidebarItemView: View {
         Button(action: select) {
             HStack(spacing: 10) {
                 Image(systemName: section.icon)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .frame(width: 22)
                 Text(section.title)
                     .font(.callout.weight(isSelected ? .semibold : .regular))
@@ -642,43 +357,689 @@ private struct SidebarItemView: View {
             .foregroundStyle(isSelected ? Color.primary : Color.secondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .contentShape(Rectangle())
-            .background(
-                isSelected
-                    ? DiscoTheme.accent.opacity(0.12)
-                    : (isHovered ? Color.primary.opacity(0.04) : Color.clear),
-                in: RoundedRectangle(cornerRadius: DiscoRadius.small)
-            )
+            .discoRowStyle(isSelected: isSelected, isHovered: isHovered)
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
     }
 }
 
-private struct SettingsSectionHeader: View {
-    let title: String
-    let caption: String
+// MARK: - 左栏服务商行
+
+private struct VendorListRow: View {
+    let vendor: ProviderVendor
+    let status: ConnectionStatus
+    let model: String
+    let isSelected: Bool
+    let select: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: select) {
+            HStack(spacing: 10) {
+                VendorBrandIcon(vendor: vendor, tileSize: 26, isActive: isSelected)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(vendor.title)
+                        .font(.callout.weight(isSelected ? .semibold : .regular))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(model.isEmpty ? status.title : model)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer(minLength: 4)
+
+                Circle()
+                    .fill(status.color)
+                    .frame(width: 7, height: 7)
+                    .help(status.title)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .discoRowStyle(isSelected: isSelected, isHovered: isHovered)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+    }
+}
+
+// MARK: - 添加服务商面板
+
+private struct AddVendorPanel: View {
+    let vendors: [ProviderVendor]
+    /// 尚未开放的服务商（置灰展示“即将推出”）
+    let upcoming: [ProviderVendor]
+    let pick: (ProviderVendor) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.headline)
-            Text(caption)
+            Text("选择服务商")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+
+            ForEach(vendors) { vendor in
+                Button {
+                    pick(vendor)
+                } label: {
+                    vendorRow(vendor, caption: vendor.subtitle, emphasized: true)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if !upcoming.isEmpty {
+                Divider()
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+
+                ForEach(upcoming) { vendor in
+                    vendorRow(vendor, caption: "即将推出", emphasized: false)
+                        .opacity(0.55)
+                }
+            }
+        }
+        .padding(.bottom, 10)
+        .frame(width: 300)
+    }
+
+    private func vendorRow(_ vendor: ProviderVendor, caption: String, emphasized: Bool) -> some View {
+        HStack(spacing: 10) {
+            VendorBrandIcon(vendor: vendor, tileSize: 24, isActive: emphasized)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(vendor.title)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                Text(caption)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - 单个服务商详情面板
+
+private struct VendorDetailPanel: View {
+    /// 验证时间的中文相对格式（系统 locale 可能是英文，UI 文案统一中文）
+    private static let relativeVerificationFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "zh-Hans")
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
+    let vendor: ProviderVendor
+    @Binding var draft: VendorDraft
+
+    @EnvironmentObject private var appState: AppState
+
+    @State private var verifyRequestID: UUID?
+    @State private var isVerifying = false
+    @State private var verifyError: String?
+    @State private var showSavedFeedback = false
+    /// 最近一次验证通过的凭据指纹；输入改动后按指纹比对自动失效，需重新验证
+    @State private var verifiedFingerprint: CredentialFingerprint?
+    @State private var isConfirmingRemoval = false
+    /// 用户点击"查看"后加载的 Key 明文；nil 表示掩码状态
+    @State private var revealedKey: String?
+    /// 是否处于"更换 Key"的输入状态
+    @State private var isEditingKey = false
+    @FocusState private var focusedField: CredentialField?
+
+    private enum CredentialField: Hashable {
+        case baseURL
+        case apiKey
+    }
+
+    /// 验证状态（单一来源，避免散落的条件分支产生矛盾文案）
+    private enum VerifyState: Equatable {
+        case verifying
+        case failed(String)
+        case needsVerification
+        /// 全新服务商验证通过、模型已就绪，选择模型即完成配置
+        case verifiedNewVendor
+        case saved
+        /// 已保存配置与当前输入一致，可直接切换模型
+        case verified
+        /// 已保存凭据但从未验证过连接
+        case unverifiedSaved
+    }
+
+    private var config: ProviderConfig? { appState.config(for: vendor) }
+
+    private var trimmedBaseURL: String {
+        draft.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedAPIKey: String {
+        draft.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 校验门：汇总草稿输入与验证指纹，决定模型列表是否可操作（纯逻辑，可单测）
+    private var gate: VendorEditGate {
+        VendorEditGate(
+            savedBaseURL: config?.baseURL,
+            draftBaseURL: draft.baseURL,
+            draftAPIKey: draft.apiKey,
+            hasLoadedModels: !draft.models.isEmpty,
+            verifiedFingerprint: verifiedFingerprint
+        )
+    }
+
+    /// 模型列表被锁定（需先验证）时显示的橙色提示；nil 表示可直接选择
+    private var modelsLockedHint: String? {
+        guard !gate.canSelectModel else { return nil }
+        return config == nil ? "先验证并加载模型" : "凭据已修改，重新验证后可切换"
+    }
+
+    private var verifyState: VerifyState {
+        if isVerifying { return .verifying }
+        if let verifyError { return .failed(verifyError) }
+        if showSavedFeedback { return .saved }
+        if config == nil {
+            // 全新服务商：验证通过且模型已就绪，即可选择模型
+            return gate.canSelectModel ? .verifiedNewVendor : .needsVerification
+        }
+        if gate.canSelectModel { return status == .verified ? .verified : .unverifiedSaved }
+        return .needsVerification
+    }
+
+    private var canVerify: Bool {
+        !isVerifying
+            && !trimmedBaseURL.isEmpty
+            && (!trimmedAPIKey.isEmpty || config?.hasAPIKey == true)
+    }
+
+    private var filteredModels: [String] {
+        let query = draft.modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return draft.models }
+        return draft.models.filter { $0.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var status: ConnectionStatus {
+        ConnectionStatus(config: config)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Divider()
+                .opacity(0.65)
+
+            VStack(alignment: .leading, spacing: 18) {
+                credentialsCard
+                verifyRow
+                modelSection
+                thinkingRow
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+            Divider()
+                .opacity(0.65)
+
+            footer
+        }
+        .onAppear(perform: syncDraftFromConfigIfNeeded)
+        .onChange(of: config) { _, _ in syncDraftFromConfigIfNeeded() }
+        .task(id: verifyRequestID) {
+            guard verifyRequestID != nil else { return }
+            isVerifying = true
+            verifyError = nil
+            defer {
+                verifyRequestID = nil
+                isVerifying = false
+            }
+
+            do {
+                let loadedModels = try await appState.availableModels(
+                    vendor: vendor,
+                    baseURL: draft.baseURL,
+                    apiKey: draft.apiKey
+                )
+                guard !Task.isCancelled else { return }
+                draft.models = loadedModels
+                draft.modelSearch = ""
+                if !loadedModels.contains(draft.selectedModel) {
+                    draft.selectedModel = ""
+                }
+                // 记录本次验证通过的凭据指纹；输入改动后自动失效，需重新验证
+                verifiedFingerprint = gate.currentFingerprint
+            } catch is CancellationError {
+                return
+            } catch {
+                draft.models = []
+                draft.selectedModel = ""
+                verifiedFingerprint = nil
+                verifyError = error.localizedDescription
+            }
+        }
+        .confirmationDialog(
+            "移除 \(vendor.title) 的配置？",
+            isPresented: $isConfirmingRemoval,
+            titleVisibility: .visible
+        ) {
+            Button("移除配置", role: .destructive) {
+                removeConfiguration()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除已保存的 API Key 与模型选择，对话会立即停用该服务商。")
+        }
+    }
+
+    // MARK: 头部
+
+    private var header: some View {
+        HStack(spacing: 13) {
+            VendorBrandIcon(vendor: vendor, tileSize: 36)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(vendor.title)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                Text(vendor.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(status.color)
+                    .frame(width: 7, height: 7)
+                Text(status.title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(.quaternary, in: Capsule())
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+    }
+
+    // MARK: 凭据
+
+    private var credentialsCard: some View {
+        VStack(spacing: 0) {
+            SettingInputRow(icon: "network", title: "Base URL") {
+                TextField(
+                    vendor.defaultBaseURL.isEmpty ? "https://api.example.com/v1" : vendor.defaultBaseURL,
+                    text: $draft.baseURL
+                )
+                .textFieldStyle(.plain)
+                .focused($focusedField, equals: .baseURL)
+                .accessibilityLabel("Base URL")
+            }
+
+            Divider()
+                .padding(.leading, 54)
+
+            SettingInputRow(icon: "key.fill", title: "API Key") {
+                apiKeyRow
+            }
+        }
+        .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+
+    /// Key 行三态：已保存（掩码，可查看/更换）、查看明文、输入新 Key
+    @ViewBuilder
+    private var apiKeyRow: some View {
+        if let revealedKey {
+            HStack(spacing: 8) {
+                Text(revealedKey)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer(minLength: 4)
+
+                keyRowButton(icon: "eye.slash", help: "隐藏 Key") {
+                    self.revealedKey = nil
+                }
+                keyRowButton(icon: "pencil", help: "更换 Key") {
+                    self.revealedKey = nil
+                    isEditingKey = true
+                }
+            }
+        } else if config?.hasAPIKey == true && !isEditingKey {
+            HStack(spacing: 8) {
+                // 固定长度掩码，不泄露 Key 的真实长度
+                Text("••••••••••••••••")
+                    .foregroundStyle(.secondary)
+
+                Spacer(minLength: 4)
+
+                keyRowButton(icon: "eye", help: "查看 Key") {
+                    revealedKey = appState.revealAPIKey(for: vendor)
+                }
+                keyRowButton(icon: "pencil", help: "更换 Key") {
+                    isEditingKey = true
+                }
+            }
+        } else {
+            HStack(spacing: 8) {
+                keyInputField
+
+                if !draft.apiKey.isEmpty {
+                    keyRowButton(icon: draft.isKeyVisible ? "eye.slash" : "eye",
+                                 help: draft.isKeyVisible ? "隐藏 Key" : "显示 Key") {
+                        draft.isKeyVisible.toggle()
+                    }
+                }
+
+                if config?.hasAPIKey == true {
+                    Button("取消") {
+                        isEditingKey = false
+                        draft.apiKey = ""
+                        draft.isKeyVisible = false
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func keyRowButton(icon: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    @ViewBuilder
+    private var keyInputField: some View {
+        let placeholder = (config?.hasAPIKey ?? false) ? "输入新的 API Key" : "输入 API Key"
+        if draft.isKeyVisible {
+            TextField(placeholder, text: $draft.apiKey)
+                .textFieldStyle(.plain)
+                .focused($focusedField, equals: .apiKey)
+                .accessibilityLabel("API Key")
+        } else {
+            SecureField(placeholder, text: $draft.apiKey)
+                .textFieldStyle(.plain)
+                .focused($focusedField, equals: .apiKey)
+                .accessibilityLabel("API Key")
+        }
+    }
+
+    // MARK: 验证（验证通过即具备保存条件，选模型时自动保存）
+
+    private var verifyRow: some View {
+        HStack(spacing: 14) {
+            verifyStatusLabel
+
+            Spacer(minLength: 12)
+
+            Button {
+                verifyRequestID = UUID()
+            } label: {
+                HStack(spacing: 8) {
+                    if isVerifying {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(.white)
+                    } else {
+                        Image(systemName: "checkmark.shield")
+                    }
+                    Text(isVerifying ? "正在验证" : "验证并加载模型")
+                }
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(minWidth: 140)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(DiscoTheme.accent, in: Capsule())
+            }
+            .buttonStyle(DiscoPressButtonStyle())
+            .disabled(!canVerify)
+            .opacity(canVerify || isVerifying ? 1 : 0.4)
+        }
+        .frame(minHeight: 34)
+    }
+
+    @ViewBuilder
+    private var verifyStatusLabel: some View {
+        switch verifyState {
+        case .verifying:
+            StatusLabel(icon: "ellipsis", text: "正在连接服务并读取模型", color: .secondary)
+        case let .failed(message):
+            StatusLabel(icon: "exclamationmark.circle.fill", text: message, color: .red)
+                .help(message)
+        case .needsVerification:
+            StatusLabel(
+                icon: "circle.dotted",
+                text: config == nil ? "填写凭据后验证，选模型即完成配置" : "凭据已修改，重新验证后可切换",
+                color: .secondary
+            )
+        case .verifiedNewVendor:
+            StatusLabel(icon: "checkmark.circle", text: "验证通过，选择模型完成配置", color: .green)
+        case .saved:
+            StatusLabel(icon: "checkmark.circle.fill", text: "配置已保存", color: .green)
+        case .verified:
+            StatusLabel(icon: "checkmark.circle", text: "配置有效，可直接切换模型", color: .secondary)
+        case .unverifiedSaved:
+            StatusLabel(icon: "exclamationmark.circle", text: "已保存凭据，尚未验证连接", color: .orange)
+        }
+    }
+
+    // MARK: 模型
+
+    @ViewBuilder
+    private var modelSection: some View {
+        if draft.models.isEmpty {
+            HStack(spacing: 13) {
+                Image(systemName: "square.stack.3d.up")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("还没有模型列表")
+                        .font(.callout.weight(.medium))
+                    Text("验证成功后在这里选择模型，选择即保存")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+        } else {
+            VStack(spacing: 0) {
+                HStack(alignment: .center) {
+                    Text("选择模型")
+                        .font(.headline)
+                    if let hint = modelsLockedHint {
+                        Text(hint)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    if draft.models.count > 7 {
+                        HStack(spacing: 7) {
+                            Image(systemName: "magnifyingglass")
+                                .foregroundStyle(.secondary)
+                            TextField("筛选模型", text: $draft.modelSearch)
+                                .textFieldStyle(.plain)
+                                .frame(width: 140)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.quaternary, in: Capsule())
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+                .padding(.bottom, 6)
+
+                if filteredModels.isEmpty {
+                    HStack(spacing: 12) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        Text("没有匹配“\(draft.modelSearch)”的模型")
+                            .font(.callout)
+                        Spacer()
+                    }
+                    .padding(16)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(filteredModels, id: \.self) { model in
+                                ModelSelectionRow(
+                                    model: model,
+                                    isSelected: draft.selectedModel == model
+                                ) {
+                                    selectModel(model)
+                                }
+                                .disabled(!gate.canSelectModel)
+                                .opacity(gate.canSelectModel ? 1 : 0.45)
+
+                                if model != filteredModels.last {
+                                    Divider()
+                                        .padding(.leading, 46)
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: .infinity)
+                }
+            }
+            .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+            .frame(maxHeight: .infinity)
+        }
+    }
+
+    // MARK: 选项
+
+    private var thinkingRow: some View {
+        SettingInputRow(
+            icon: "brain",
+            title: "思考模式",
+            caption: config == nil ? "完成配置后可调整" : "开启后该服务商的请求会先进行推理"
+        ) {
+            Toggle(
+                "思考模式",
+                isOn: Binding(
+                    get: { config?.thinkingEnabled ?? true },
+                    set: { appState.setThinkingEnabled($0, for: vendor) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(config == nil)
+            .accessibilityLabel("思考模式")
+        }
+        .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+
+    // MARK: 底部
+
+    private var footer: some View {
+        HStack(spacing: 12) {
+            if config != nil {
+                Button("移除配置…", role: .destructive) {
+                    isConfirmingRemoval = true
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.red)
+            }
+
+            Spacer()
+
+            if let verifiedAt = config?.lastVerifiedAt {
+                Text("上次验证 \(Self.relativeVerificationFormatter.localizedString(for: verifiedAt, relativeTo: .now))")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    // MARK: 动作
+
+    /// 选择模型即保存配置（此时凭据已验证通过）
+    private func selectModel(_ model: String) {
+        draft.selectedModel = model
+        do {
+            try appState.saveProviderConfig(
+                vendor: vendor,
+                baseURL: draft.baseURL,
+                apiKey: draft.apiKey,
+                model: model,
+                models: draft.models
+            )
+            draft.apiKey = ""
+            draft.isKeyVisible = false
+            isEditingKey = false
+            revealedKey = nil
+            verifyError = nil
+            verifiedFingerprint = nil
+            showSavedFeedback = true
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                showSavedFeedback = false
+            }
+        } catch {
+            verifyError = error.localizedDescription
+        }
+    }
+
+    private func removeConfiguration() {
+        do {
+            try appState.deleteProviderAPIKey(vendor: vendor)
+            draft = VendorDraft(baseURL: vendor.defaultBaseURL)
+            isEditingKey = false
+            revealedKey = nil
+            verifyError = nil
+            verifiedFingerprint = nil
+        } catch {
+            verifyError = error.localizedDescription
+        }
+    }
+
+    /// 首次进入或配置外部变化时，用已保存配置填充草稿；用户已输入新 Key 时不覆盖
+    private func syncDraftFromConfigIfNeeded() {
+        guard draft.apiKey.isEmpty else { return }
+        if draft.baseURL.isEmpty {
+            draft.baseURL = config?.baseURL ?? vendor.defaultBaseURL
+        }
+        draft.models = config?.models ?? draft.models
+        if let savedModel = config?.model, !savedModel.isEmpty {
+            draft.selectedModel = savedModel
         }
     }
 }
 
-private struct SettingsCard<Content: View>: View {
-    @ViewBuilder let content: Content
-
-    var body: some View {
-        content
-            .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.medium))
-            .shadow(color: .black.opacity(0.07), radius: 8, y: 2)
-    }
-}
+// MARK: - 辅助控件
 
 private struct SettingInputRow<Content: View>: View {
     let icon: String
@@ -722,7 +1083,7 @@ private struct StatusLabel: View {
             .font(.callout)
             .foregroundStyle(color)
             .lineLimit(2)
-            .transition(.opacity.combined(with: .move(edge: .bottom)))
+            .transition(.opacity)
     }
 }
 
@@ -748,23 +1109,18 @@ private struct ModelSelectionRow: View {
                 Spacer()
 
                 if isSelected {
-                    Text("已选择")
+                    Text("使用中")
                         .font(.caption)
                         .foregroundStyle(DiscoTheme.accent)
                 }
             }
             .padding(.horizontal, 14)
-            .frame(minHeight: 43)
-            .contentShape(Rectangle())
-            .background(
-                isSelected
-                    ? DiscoTheme.accent.opacity(0.1)
-                    : (isHovered ? Color.primary.opacity(0.035) : .clear)
-            )
+            .frame(minHeight: 40)
+            .discoRowStyle(isSelected: isSelected, isHovered: isHovered)
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .help(model)
-        .accessibilityValue(isSelected ? "已选择" : "未选择")
+        .accessibilityValue(isSelected ? "使用中" : "未选择")
     }
 }

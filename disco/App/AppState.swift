@@ -1,6 +1,11 @@
 import Combine
 import Foundation
 
+extension Notification.Name {
+    /// 菜单栏“对话 > 清空当前对话”发出的请求，由 ChatView 弹出确认
+    static let discoRequestClearConversation = Notification.Name("discoRequestClearConversation")
+}
+
 @MainActor
 final class AppState: ObservableObject {
     @Published private(set) var activeVendor: ProviderVendor
@@ -17,6 +22,9 @@ final class AppState: ObservableObject {
             }
         }
     }
+
+    /// 设置页中已添加但尚未完成配置的服务商（仅内存态，不持久化；保存配置后由设置页移出）
+    @Published var pendingVendors: Set<ProviderVendor> = []
 
     /// 当前使用（active）服务商的配置，供聊天界面读取
     var baseURL: String { providerConfigs[activeVendor]?.baseURL ?? "" }
@@ -77,7 +85,9 @@ final class AppState: ObservableObject {
                 model: defaults.string(forKey: vendor.modelDefaultsKey) ?? "",
                 hasAPIKey: storedKey.map { !$0.isEmpty } ?? false,
                 models: defaults.stringArray(forKey: vendor.modelsDefaultsKey) ?? [],
-                thinkingEnabled: defaults.object(forKey: vendor.thinkingEnabledDefaultsKey) as? Bool ?? legacyThinking ?? true
+                thinkingEnabled: defaults.object(forKey: vendor.thinkingEnabledDefaultsKey) as? Bool ?? legacyThinking ?? true,
+                lastVerifiedAt: (defaults.object(forKey: vendor.verifiedAtDefaultsKey) as? TimeInterval)
+                    .map(Date.init(timeIntervalSince1970:))
             )
         }
         providerConfigs = loaded
@@ -163,18 +173,21 @@ final class AppState: ObservableObject {
 
         var updated = providerConfigs
         let thinkingEnabled = providerConfigs[vendor]?.thinkingEnabled ?? true
+        let verifiedAt = Date.now
         updated[vendor] = ProviderConfig(
             baseURL: providerBaseURL.absoluteString,
             model: trimmedModel,
             hasAPIKey: true,
             models: models,
-            thinkingEnabled: thinkingEnabled
+            thinkingEnabled: thinkingEnabled,
+            lastVerifiedAt: verifiedAt
         )
         providerConfigs = updated
         defaults.set(providerBaseURL.absoluteString, forKey: vendor.baseURLDefaultsKey)
         defaults.set(trimmedModel, forKey: vendor.modelDefaultsKey)
         defaults.set(models, forKey: vendor.modelsDefaultsKey)
         defaults.set(thinkingEnabled, forKey: vendor.thinkingEnabledDefaultsKey)
+        defaults.set(verifiedAt.timeIntervalSince1970, forKey: vendor.verifiedAtDefaultsKey)
         authError = nil
 
         if vendor == activeVendor {
@@ -195,12 +208,16 @@ final class AppState: ObservableObject {
         var updated = providerConfigs
         if var config = updated[vendor] {
             config.hasAPIKey = false
+            config.model = ""
+            config.models = []
+            config.lastVerifiedAt = nil
             updated[vendor] = config
         }
         providerConfigs = updated
         defaults.removeObject(forKey: vendor.baseURLDefaultsKey)
         defaults.removeObject(forKey: vendor.modelDefaultsKey)
         defaults.removeObject(forKey: vendor.modelsDefaultsKey)
+        defaults.removeObject(forKey: vendor.verifiedAtDefaultsKey)
         if vendor == activeVendor {
             installProvider(nil, stopActiveStreams: true)
             syncLegacyKeys()
@@ -216,6 +233,12 @@ final class AppState: ObservableObject {
             apiKey: resolvedKey,
             baseURL: providerBaseURL
         ).models()
+    }
+
+    /// 读取已保存的 API Key 明文，仅供设置页用户主动点击"查看"时使用
+    func revealAPIKey(for vendor: ProviderVendor) -> String? {
+        guard let key = try? keyStores[vendor]?.load(), !key.isEmpty else { return nil }
+        return key
     }
 
     /// 解析实际使用的 API Key：优先用输入值，否则读取该服务商已保存的 Key

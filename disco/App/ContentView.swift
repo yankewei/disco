@@ -33,6 +33,12 @@ struct ContentView: View {
 private struct ConversationSidebar: View {
     @EnvironmentObject private var appState: AppState
 
+    /// 当前服务商已保存 Key 但从未验证过连接时，提示用户去设置页验证
+    private var needsVerificationAttention: Bool {
+        guard let config = appState.config(for: appState.activeVendor) else { return false }
+        return config.hasAPIKey && config.lastVerifiedAt == nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sidebarHeader
@@ -83,9 +89,13 @@ private struct ConversationSidebar: View {
 
                     Spacer(minLength: 4)
 
-                    Circle()
-                        .fill(appState.hasAPIKey ? DiscoTheme.accent : Color.secondary.opacity(0.35))
-                        .frame(width: 7, height: 7)
+                    // 正常（已验证）时不显示圆点；仅未验证这种状态需要引起注意
+                    if needsVerificationAttention {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 7, height: 7)
+                            .help("连接已保存，尚未验证")
+                    }
                 }
                 .contentShape(Rectangle())
                 .padding(.horizontal, 14)
@@ -119,7 +129,6 @@ private struct ConversationSidebar: View {
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
             }
             .buttonStyle(DiscoPressButtonStyle())
-            .keyboardShortcut("n", modifiers: .command)
             .help("新建对话（⌘N）")
         }
         .padding(.horizontal, 14)

@@ -46,6 +46,14 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 品牌 logo 资源名（Assets.xcassets/BrandIcons）；为 nil 时 UI 回退到 SF Symbol
+    var brandIcon: String? {
+        switch self {
+        case .deepseek: "brand.deepseek"
+        default: nil
+        }
+    }
+
     /// 选择该服务商时自动填入的默认 Base URL
     var defaultBaseURL: String {
         switch self {
@@ -76,6 +84,8 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     var modelDefaultsKey: String { "provider.\(rawValue).model" }
     var modelsDefaultsKey: String { "provider.\(rawValue).models" }
     var thinkingEnabledDefaultsKey: String { "provider.\(rawValue).thinkingEnabled" }
+    /// 最近一次验证通过的时间（timeIntervalSince1970）
+    var verifiedAtDefaultsKey: String { "provider.\(rawValue).verifiedAt" }
 }
 
 // MARK: - 服务商配置
@@ -89,6 +99,8 @@ struct ProviderConfig: Equatable {
     var models: [String]
     /// 该服务商是否开启思考模式（reasoning）
     var thinkingEnabled: Bool
+    /// 最近一次连接验证通过的时间；nil 表示从未验证（保存配置即视为验证通过）
+    var lastVerifiedAt: Date? = nil
 
     var isConfigured: Bool {
         hasAPIKey && !model.isEmpty && !baseURL.isEmpty
