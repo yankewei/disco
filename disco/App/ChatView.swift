@@ -66,9 +66,7 @@ struct ChatView: View {
 
                 ComposerView(
                     store: store,
-                    isConfigured: appState.hasAPIKey,
-                    model: appState.model,
-                    providerHost: providerHost
+                    isConfigured: appState.hasAPIKey
                 )
             }
             .frame(maxWidth: 760)
@@ -486,10 +484,21 @@ private struct ChatErrorBanner: View {
 private struct ComposerView: View {
     @ObservedObject var store: ConversationStore
     let isConfigured: Bool
-    let model: String
-    let providerHost: String
+
+    @EnvironmentObject private var appState: AppState
 
     @FocusState private var isFocused: Bool
+
+    private var activeVendor: ProviderVendor {
+        appState.activeVendor
+    }
+
+    /// 已配置 API Key 的服务商，供聊天页直接切换
+    private var configuredVendors: [ProviderVendor] {
+        ProviderVendor.allCases.filter {
+            $0.isAvailable && appState.config(for: $0)?.hasAPIKey == true
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -511,20 +520,12 @@ private struct ComposerView: View {
 
             HStack(spacing: 8) {
                 if isConfigured {
-                    DiscoMark(size: 10, isActive: store.isStreaming)
-
-                    Text(model)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(model)
-
-                    Text(providerHost)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(providerHost)
+                    providerMenu
+                    modelMenu
+                    thinkingToggle
                 } else {
                     Image(systemName: "lock.fill")
-                    Text("API Key 保存在 Keychain")
+                    Text("API Key 仅保存在本机")
                 }
 
                 Spacer(minLength: 12)
@@ -580,5 +581,84 @@ private struct ComposerView: View {
                 isFocused = true
             }
         }
+    }
+
+    // MARK: - 配置行控件
+
+    private var providerMenu: some View {
+        Menu {
+            Picker("服务商", selection: Binding(
+                get: { activeVendor },
+                set: { appState.setActiveVendor($0) }
+            )) {
+                ForEach(configuredVendors) { vendor in
+                    Label(vendor.title, systemImage: vendor.icon)
+                        .tag(vendor)
+                }
+            }
+
+            Divider()
+
+            SettingsLink {
+                Label("管理连接…", systemImage: "slider.horizontal.3")
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: activeVendor.icon)
+                Text(activeVendor.title)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(store.isStreaming)
+    }
+
+    private var modelMenu: some View {
+        let models = appState.config(for: activeVendor)?.models ?? []
+
+        return Menu {
+            if models.isEmpty {
+                Text("尚未加载模型列表")
+            } else {
+                Picker("模型", selection: Binding(
+                    get: { appState.model },
+                    set: { appState.setActiveModel($0, for: activeVendor) }
+                )) {
+                    ForEach(models, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(appState.model)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 170, alignment: .leading)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(store.isStreaming)
+    }
+
+    private var thinkingToggle: some View {
+        HStack(spacing: 5) {
+            Text("思考")
+            Toggle(
+                "思考模式",
+                isOn: Binding(
+                    get: { appState.config(for: activeVendor)?.thinkingEnabled ?? true },
+                    set: { appState.setThinkingEnabled($0, for: activeVendor) }
+                )
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .labelsHidden()
+        }
+        .disabled(store.isStreaming)
     }
 }

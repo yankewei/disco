@@ -5,9 +5,8 @@ import Foundation
 final class AppState: ObservableObject {
     @Published private(set) var activeVendor: ProviderVendor
     @Published private(set) var providerConfigs: [ProviderVendor: ProviderConfig]
-    @Published private(set) var keychainError: String?
+    @Published private(set) var authError: String?
     @Published private(set) var storageError: String?
-    @Published private(set) var thinkingEnabled: Bool
     @Published private(set) var conversations: [ConversationSession]
     @Published var selectedConversationID: ConversationSession.ID? {
         didSet {
@@ -24,7 +23,7 @@ final class AppState: ObservableObject {
     var model: String { providerConfigs[activeVendor]?.model ?? "" }
     var hasAPIKey: Bool { providerConfigs[activeVendor]?.hasAPIKey ?? false }
 
-    private let keychains: [ProviderVendor: APIKeyStoring]
+    private let keyStores: [ProviderVendor: APIKeyStoring]
     private let defaults: UserDefaults
     private let persistence: ConversationPersisting
     private var provider: ModelProvider?
@@ -39,7 +38,7 @@ final class AppState: ObservableObject {
         defaults: UserDefaults? = nil,
         persistence: ConversationPersisting? = nil
     ) {
-        let baseKeychain = keychain ?? KeychainStore()
+        let baseKeyStore = keychain ?? AuthFileStore()
         let defaults = defaults ?? .standard
         let resolvedPersistence: ConversationPersisting
         var startupStorageError: String?
@@ -55,30 +54,40 @@ final class AppState: ObservableObject {
         }
         self.defaults = defaults
         self.persistence = resolvedPersistence
-        self.keychains = Dictionary(
+        self.keyStores = Dictionary(
             uniqueKeysWithValues: ProviderVendor.allCases.map {
-                ($0, baseKeychain.forAccount($0.keychainAccount))
+                ($0, baseKeyStore.forAccount($0.keychainAccount))
             }
         )
-        thinkingEnabled = defaults.object(forKey: "thinkingEnabled") as? Bool ?? true
+        // 旧版全局思考模式开关：升级后迁移为各服务商的默认值，并移除旧键
+        let legacyThinking = defaults.object(forKey: LegacyProviderKeys.thinkingEnabled) as? Bool
         storageError = startupStorageError
         conversations = []
         selectedConversationID = nil
 
-        // 迁移旧版单服务商配置（apiBaseURL/apiModel + 旧 Keychain account）
-        Self.migrateLegacyConfiguration(defaults: defaults, keychains: self.keychains)
+        // 迁移旧版单服务商配置（apiBaseURL/apiModel + 旧 account）
+        Self.migrateLegacyConfiguration(defaults: defaults, keyStores: self.keyStores)
 
         var loaded: [ProviderVendor: ProviderConfig] = [:]
         for vendor in ProviderVendor.allCases {
             guard let baseURL = defaults.string(forKey: vendor.baseURLDefaultsKey) else { continue }
-            let storedKey = (try? self.keychains[vendor]?.load()).flatMap { $0 }
+            let storedKey = (try? self.keyStores[vendor]?.load()).flatMap { $0 }
             loaded[vendor] = ProviderConfig(
                 baseURL: baseURL,
                 model: defaults.string(forKey: vendor.modelDefaultsKey) ?? "",
-                hasAPIKey: storedKey.map { !$0.isEmpty } ?? false
+                hasAPIKey: storedKey.map { !$0.isEmpty } ?? false,
+                models: defaults.stringArray(forKey: vendor.modelsDefaultsKey) ?? [],
+                thinkingEnabled: defaults.object(forKey: vendor.thinkingEnabledDefaultsKey) as? Bool ?? legacyThinking ?? true
             )
         }
         providerConfigs = loaded
+        // 旧版全局开关迁移：写入已配置服务商的 per-vendor 键（不覆盖已存在的值），再移除旧键
+        if let legacyThinking {
+            for vendor in loaded.keys where defaults.object(forKey: vendor.thinkingEnabledDefaultsKey) == nil {
+                defaults.set(legacyThinking, forKey: vendor.thinkingEnabledDefaultsKey)
+            }
+        }
+        defaults.removeObject(forKey: LegacyProviderKeys.thinkingEnabled)
 
         let persistedActive = defaults.string(forKey: LegacyProviderKeys.activeVendor)
             .flatMap(ProviderVendor.init(rawValue:))
@@ -135,7 +144,8 @@ final class AppState: ObservableObject {
         vendor: ProviderVendor,
         baseURL: String,
         apiKey: String,
-        model: String
+        model: String,
+        models: [String] = []
     ) throws {
         let providerBaseURL = try Self.validatedBaseURL(baseURL)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -148,19 +158,24 @@ final class AppState: ObservableObject {
             // 未填写新 Key：校验该服务商已保存的 Key 可用
             _ = try resolvedAPIKey(vendor: vendor, apiKey: apiKey)
         } else {
-            try keychains[vendor]?.save(trimmedKey)
+            try keyStores[vendor]?.save(trimmedKey)
         }
 
         var updated = providerConfigs
+        let thinkingEnabled = providerConfigs[vendor]?.thinkingEnabled ?? true
         updated[vendor] = ProviderConfig(
             baseURL: providerBaseURL.absoluteString,
             model: trimmedModel,
-            hasAPIKey: true
+            hasAPIKey: true,
+            models: models,
+            thinkingEnabled: thinkingEnabled
         )
         providerConfigs = updated
         defaults.set(providerBaseURL.absoluteString, forKey: vendor.baseURLDefaultsKey)
         defaults.set(trimmedModel, forKey: vendor.modelDefaultsKey)
-        keychainError = nil
+        defaults.set(models, forKey: vendor.modelsDefaultsKey)
+        defaults.set(thinkingEnabled, forKey: vendor.thinkingEnabledDefaultsKey)
+        authError = nil
 
         if vendor == activeVendor {
             // 保存当前使用的服务商：同步 legacy 键并重建运行时
@@ -175,8 +190,8 @@ final class AppState: ObservableObject {
     }
 
     func deleteProviderAPIKey(vendor: ProviderVendor) throws {
-        guard let keychain = keychains[vendor] else { return }
-        try keychain.delete()
+        guard let keyStore = keyStores[vendor] else { return }
+        try keyStore.delete()
         var updated = providerConfigs
         if var config = updated[vendor] {
             config.hasAPIKey = false
@@ -185,11 +200,12 @@ final class AppState: ObservableObject {
         providerConfigs = updated
         defaults.removeObject(forKey: vendor.baseURLDefaultsKey)
         defaults.removeObject(forKey: vendor.modelDefaultsKey)
+        defaults.removeObject(forKey: vendor.modelsDefaultsKey)
         if vendor == activeVendor {
             installProvider(nil, stopActiveStreams: true)
             syncLegacyKeys()
         }
-        keychainError = nil
+        authError = nil
     }
 
     func availableModels(vendor: ProviderVendor, baseURL: String, apiKey: String) async throws -> [String] {
@@ -208,7 +224,7 @@ final class AppState: ObservableObject {
         if !trimmedKey.isEmpty {
             return trimmedKey
         }
-        guard let storedKey = try keychains[vendor]?.load(), !storedKey.isEmpty else {
+        guard let storedKey = try keyStores[vendor]?.load(), !storedKey.isEmpty else {
             throw APIConfigurationError.missingAPIKey
         }
         return storedKey
@@ -229,11 +245,27 @@ final class AppState: ObservableObject {
         try deleteProviderAPIKey(vendor: activeVendor)
     }
 
-    func setThinkingEnabled(_ enabled: Bool) {
-        guard thinkingEnabled != enabled else { return }
-        thinkingEnabled = enabled
-        defaults.set(enabled, forKey: "thinkingEnabled")
-        refreshRuntimes(stopActiveStreams: false)
+    func setActiveModel(_ model: String, for vendor: ProviderVendor) {
+        guard vendor == activeVendor,
+              var config = providerConfigs[vendor],
+              config.model != model else { return }
+        config.model = model
+        providerConfigs[vendor] = config
+        defaults.set(model, forKey: vendor.modelDefaultsKey)
+        syncLegacyKeys()
+        installProvider(makeProvider(vendor: vendor), stopActiveStreams: true)
+    }
+
+    func setThinkingEnabled(_ enabled: Bool, for vendor: ProviderVendor) {
+        guard let config = providerConfigs[vendor],
+              config.thinkingEnabled != enabled else { return }
+        var updated = providerConfigs
+        updated[vendor]?.thinkingEnabled = enabled
+        providerConfigs = updated
+        defaults.set(enabled, forKey: vendor.thinkingEnabledDefaultsKey)
+        if vendor == activeVendor {
+            refreshRuntimes(stopActiveStreams: false)
+        }
     }
 
     // MARK: - 会话管理
@@ -351,7 +383,7 @@ final class AppState: ObservableObject {
                 provider: $0,
                 configuration: GenericAgentRuntime.Configuration(
                     model: model,
-                    reasoningEnabled: thinkingEnabled
+                    reasoningEnabled: providerConfigs[activeVendor]?.thinkingEnabled ?? true
                 )
             )
         }
@@ -362,7 +394,7 @@ final class AppState: ObservableObject {
         guard let config = providerConfigs[vendor],
               config.hasAPIKey,
               let providerBaseURL = try? Self.validatedBaseURL(config.baseURL),
-              let storedKey = try? keychains[vendor]?.load(),
+              let storedKey = try? keyStores[vendor]?.load(),
               !storedKey.isEmpty else {
             return nil
         }
@@ -380,17 +412,17 @@ final class AppState: ObservableObject {
 
     private static func migrateLegacyConfiguration(
         defaults: UserDefaults,
-        keychains: [ProviderVendor: APIKeyStoring]
+        keyStores: [ProviderVendor: APIKeyStoring]
     ) {
         guard let legacyBase = defaults.string(forKey: LegacyProviderKeys.baseURL) else { return }
         let migratedVendor = ProviderVendor.allCases.first {
             $0.defaultBaseURL == legacyBase
         } ?? .openai
 
-        if let legacyKey = try? keychains[migratedVendor]?.forAccount(LegacyProviderKeys.keychainAccount).load(),
+        if let legacyKey = try? keyStores[migratedVendor]?.forAccount(LegacyProviderKeys.keychainAccount).load(),
            !legacyKey.isEmpty {
-            try? keychains[migratedVendor]?.save(legacyKey)
-            try? keychains[migratedVendor]?.forAccount(LegacyProviderKeys.keychainAccount).delete()
+            try? keyStores[migratedVendor]?.save(legacyKey)
+            try? keyStores[migratedVendor]?.forAccount(LegacyProviderKeys.keychainAccount).delete()
         }
 
         defaults.set(legacyBase, forKey: migratedVendor.baseURLDefaultsKey)

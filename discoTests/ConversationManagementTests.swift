@@ -7,7 +7,7 @@ final class ConversationManagementTests: XCTestCase {
         let defaults = UserDefaults(suiteName: #function)!
         defaults.removePersistentDomain(forName: #function)
         let appState = AppState(
-            keychain: InMemoryKeychainStore(),
+            keychain: InMemoryAuthStore(),
             defaults: defaults,
             persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
         )
@@ -41,7 +41,7 @@ final class ConversationManagementTests: XCTestCase {
         let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
 
         let firstAppState = AppState(
-            keychain: InMemoryKeychainStore(),
+            keychain: InMemoryAuthStore(),
             defaults: defaults,
             persistence: persistence
         )
@@ -58,7 +58,7 @@ final class ConversationManagementTests: XCTestCase {
         }
 
         let restoredAppState = AppState(
-            keychain: InMemoryKeychainStore(),
+            keychain: InMemoryAuthStore(),
             defaults: defaults,
             persistence: persistence
         )
@@ -70,7 +70,7 @@ final class ConversationManagementTests: XCTestCase {
 
         restoredConversation.store.clear()
         let appStateAfterClear = AppState(
-            keychain: InMemoryKeychainStore(),
+            keychain: InMemoryAuthStore(),
             defaults: defaults,
             persistence: persistence
         )
@@ -82,7 +82,7 @@ final class ConversationManagementTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: #function))
         defaults.removePersistentDomain(forName: #function)
         let appState = AppState(
-            keychain: InMemoryKeychainStore(),
+            keychain: InMemoryAuthStore(),
             defaults: defaults,
             persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
         )

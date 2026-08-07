@@ -66,7 +66,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         }
     }
 
-    /// 该服务商 API Key 在 Keychain 中使用的 account
+    /// 该服务商 API Key 在 auth 文件中使用的 account
     var keychainAccount: String {
         "\(rawValue)-api-key"
     }
@@ -74,25 +74,33 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     /// 该服务商配置在 UserDefaults 中的 key
     var baseURLDefaultsKey: String { "provider.\(rawValue).baseURL" }
     var modelDefaultsKey: String { "provider.\(rawValue).model" }
+    var modelsDefaultsKey: String { "provider.\(rawValue).models" }
+    var thinkingEnabledDefaultsKey: String { "provider.\(rawValue).thinkingEnabled" }
 }
 
 // MARK: - 服务商配置
 
-/// 单个服务商的持久化配置。API Key 本身不进内存，存放在 Keychain（按服务商隔离）。
+/// 单个服务商的持久化配置。API Key 本身不进内存，存放在 ~/.disco/config/auth.json（按服务商隔离）。
 struct ProviderConfig: Equatable {
     var baseURL: String
     var model: String
     var hasAPIKey: Bool
+    /// 该服务商最近一次从服务端加载的可用模型列表（供聊天页快速切换，不实时刷新）
+    var models: [String]
+    /// 该服务商是否开启思考模式（reasoning）
+    var thinkingEnabled: Bool
 
     var isConfigured: Bool {
         hasAPIKey && !model.isEmpty && !baseURL.isEmpty
     }
 }
 
-/// 旧版单服务商配置使用的 Keychain account 与 UserDefaults key（用于迁移）
+/// 旧版单服务商配置使用的 account 与 UserDefaults key（用于迁移）
 enum LegacyProviderKeys {
     static let keychainAccount = "openai-platform-api-key"
     static let baseURL = "apiBaseURL"
     static let model = "apiModel"
     static let activeVendor = "activeProvider"
+    /// 旧版全局思考模式开关（迁移到按服务商后移除）
+    static let thinkingEnabled = "thinkingEnabled"
 }

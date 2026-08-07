@@ -180,5 +180,5 @@ private struct ConversationRow: View {
 
 #Preview {
     ContentView()
-        .environmentObject(AppState(keychain: InMemoryKeychainStore()))
+        .environmentObject(AppState(keychain: InMemoryAuthStore()))
 }

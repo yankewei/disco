@@ -15,7 +15,7 @@ struct DiscoApp: App {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             _appState = StateObject(
                 wrappedValue: AppState(
-                    keychain: InMemoryKeychainStore(),
+                    keychain: InMemoryAuthStore(),
                     persistence: VolatileConversationPersistence()
                 )
             )

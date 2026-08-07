@@ -109,7 +109,6 @@ struct SettingsView: View {
             ScrollView {
                 VStack(spacing: 26) {
                     providerSection
-                    generationSection
                 }
                 .padding(.horizontal, 28)
                 .padding(.vertical, 24)
@@ -152,30 +151,6 @@ struct SettingsView: View {
                             expandedVendor = expandedVendor == vendor ? nil : vendor
                         }
                     }
-                }
-            }
-        }
-    }
-
-    private var generationSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SettingsSectionHeader(
-                title: "生成选项",
-                caption: "开启后模型会先进行推理，再生成回答"
-            )
-
-            SettingsCard {
-                SettingInputRow(icon: "brain", title: "思考模式") {
-                    Toggle(
-                        "思考模式",
-                        isOn: Binding(
-                            get: { appState.thinkingEnabled },
-                            set: { appState.setThinkingEnabled($0) }
-                        )
-                    )
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .accessibilityLabel("思考模式")
                 }
             }
         }
@@ -332,7 +307,7 @@ private struct VendorConfigPanel: View {
 
                 SettingInputRow(icon: "key.fill", title: "API Key") {
                     SecureField(
-                        (config?.hasAPIKey ?? false) ? "已保存在 Keychain，留空继续使用" : "输入 API Key",
+                        (config?.hasAPIKey ?? false) ? "已保存，留空继续使用" : "输入 API Key",
                         text: $apiKey
                     )
                     .textFieldStyle(.plain)
@@ -374,6 +349,19 @@ private struct VendorConfigPanel: View {
 
             modelList
                 .frame(height: 180)
+
+            SettingInputRow(icon: "brain", title: "思考模式", caption: "开启后该服务商的请求会先进行推理") {
+                Toggle(
+                    "思考模式",
+                    isOn: Binding(
+                        get: { appState.config(for: vendor)?.thinkingEnabled ?? true },
+                        set: { appState.setThinkingEnabled($0, for: vendor) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .accessibilityLabel("思考模式")
+            }
 
             Divider()
                 .opacity(0.65)
@@ -461,7 +449,7 @@ private struct VendorConfigPanel: View {
             isPresented: $isConfirmingKeyDeletion,
             titleVisibility: .visible
         ) {
-            Button("从 Keychain 删除", role: .destructive) {
+            Button("删除已保存的 Key", role: .destructive) {
                 deleteKey()
             }
             Button("取消", role: .cancel) {}
@@ -487,7 +475,7 @@ private struct VendorConfigPanel: View {
         case .saved:
             StatusLabel(icon: "checkmark.circle.fill", text: "配置已保存", color: .green)
         case .keyDeleted:
-            StatusLabel(icon: "trash", text: "API Key 已从 Keychain 删除", color: .secondary)
+            StatusLabel(icon: "trash", text: "API Key 已删除", color: .secondary)
         }
     }
 
@@ -589,7 +577,8 @@ private struct VendorConfigPanel: View {
                 vendor: vendor,
                 baseURL: baseURL,
                 apiKey: apiKey,
-                model: selectedModel
+                model: selectedModel,
+                models: models
             )
             apiKey = ""
             status = .saved
@@ -694,6 +683,7 @@ private struct SettingsCard<Content: View>: View {
 private struct SettingInputRow<Content: View>: View {
     let icon: String
     let title: String
+    var caption: String?
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -708,6 +698,11 @@ private struct SettingInputRow<Content: View>: View {
                 Text(title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let caption {
+                    Text(caption)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
                 content
                     .font(.body)
             }
