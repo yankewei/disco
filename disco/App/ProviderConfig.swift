@@ -98,6 +98,19 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 当前模型可使用的供应商托管工具。能力判断集中在服务商层，
+    /// Provider/Runtime 只消费统一的 HostedToolKind。
+    func hostedTools(for model: String) -> Set<HostedToolKind> {
+        switch self {
+        case .deepseek where model.lowercased() == "deepseek-v4-flash":
+            [.webSearch]
+        case .openai:
+            [.webSearch]
+        default:
+            []
+        }
+    }
+
     static func reasoningEffortTitle(_ effort: String) -> String {
         switch effort.lowercased() {
         case "none": "关闭"

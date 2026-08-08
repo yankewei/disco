@@ -1,8 +1,12 @@
 # macOS 原生多模型 Agent：产品计划与技术架构
 
-版本：0.1  
-日期：2026-08-05  
-状态：立项草案
+版本：0.2
+
+日期：2026-08-08
+
+状态：架构蓝图；coding agent 纵向切片实施中
+
+当前仓库的详细差距、目标接口、Codex 协议映射、审批与安全规则、持久化设计、分阶段任务和验收标准见 [`coding-agent-implementation-plan.md`](./coding-agent-implementation-plan.md)。本文继续作为产品目标与总体架构的单一事实来源，实施细节以该文档为准。
 
 ## 1. 执行摘要
 
@@ -726,6 +730,8 @@ stateDiagram-v2
 
 这三条链路验证成功后再建设完整 SwiftUI 界面，可以最早暴露协议、取消、进程管理和权限边界问题。
 
+当前代码已经完成第 2 条链路中的 app-server 子进程、握手、thread/turn、文本/推理事件和 thread 恢复，但尚未接入工作区、命令/文件 item、审批、diff 和丰富持久化。下一阶段不再按孤立技术点推进，而按 [`coding-agent-implementation-plan.md`](./coding-agent-implementation-plan.md) 的 Phase A～C 完成第一条 Codex coding agent 纵向闭环；随后再按 Phase D～E 实现 Generic Runtime 与独立 Tool Host。
+
 ## 23. 参考资料
 
 - [OpenAI Codex App Server](https://learn.chatgpt.com/docs/app-server)
@@ -734,5 +740,3 @@ stateDiagram-v2
 - [OpenAI Function Calling](https://developers.openai.com/api/docs/guides/function-calling)
 - [OpenAI SDK 与社区 Swift 库](https://developers.openai.com/api/docs/libraries#swift)
 - [Swift AsyncHTTPClient](https://github.com/swift-server/async-http-client)
-
-

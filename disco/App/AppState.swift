@@ -610,7 +610,8 @@ final class AppState: ObservableObject {
             configuration: GenericAgentRuntime.Configuration(
                 model: config.model,
                 reasoningEnabled: config.thinkingEnabled,
-                reasoningEffort: selectedReasoningEffort(for: vendor)
+                reasoningEffort: selectedReasoningEffort(for: vendor),
+                hostedTools: vendor.hostedTools(for: config.model)
             )
         )
     }
@@ -630,9 +631,19 @@ final class AppState: ObservableObject {
               !storedKey.isEmpty else {
             return nil
         }
+        let dialect: OpenAIResponsesProvider.Dialect
+        switch vendor {
+        case .openai:
+            dialect = .openAI
+        case .deepseek:
+            dialect = .deepSeek
+        default:
+            dialect = .compatible
+        }
         return OpenAIResponsesProvider(
             apiKey: storedKey,
-            baseURL: providerBaseURL
+            baseURL: providerBaseURL,
+            dialect: dialect
         )
     }
 

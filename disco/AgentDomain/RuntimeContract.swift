@@ -19,6 +19,8 @@ struct AgentRunRequest: Sendable {
 enum AgentEvent: Sendable, Equatable {
     case messageDelta(String)
     case reasoningDelta(String)
+    case hostedToolUpdated(HostedToolSnapshot)
+    case citationAdded(TextCitation)
     case runCompleted(RunID)
     case runFailed(RunID, AgentFailure)
     case runCancelled(RunID)

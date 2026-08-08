@@ -8,17 +8,20 @@ struct ModelRequest: Sendable {
     let model: String
     let reasoningEnabled: Bool
     let reasoningEffort: String?
+    let hostedTools: Set<HostedToolKind>
 
     init(
         messages: [ChatMessage],
         model: String,
         reasoningEnabled: Bool,
-        reasoningEffort: String? = nil
+        reasoningEffort: String? = nil,
+        hostedTools: Set<HostedToolKind> = []
     ) {
         self.messages = messages
         self.model = model
         self.reasoningEnabled = reasoningEnabled
         self.reasoningEffort = reasoningEffort
+        self.hostedTools = hostedTools
     }
 }
 
@@ -26,6 +29,8 @@ struct ModelRequest: Sendable {
 enum ModelEvent: Sendable, Equatable {
     case textDelta(String)
     case reasoningDelta(String)
+    case hostedToolUpdated(HostedToolSnapshot)
+    case citationAdded(TextCitation)
 }
 
 /// 模型服务接入点（ADR-001）。

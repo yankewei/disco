@@ -254,15 +254,15 @@ private struct MessageRow: View {
                     VStack(alignment: .leading, spacing: 10) {
                         // 无思考内容的生成中（thinking 关闭时）用扫光占位；
                         // 有 reasoning 时由思考块头部承担状态展示。
-                        if message.text.isEmpty && isStreaming && message.reasoning.isEmpty {
+                        if message.isEmpty && isStreaming {
                             ThinkingIndicator()
                         }
 
                         ForEach(Array(message.parts.enumerated()), id: \.offset) { _, part in
                             switch part {
-                            case let .text(text):
-                                if !text.isEmpty {
-                                    MarkdownView(text)
+                            case let .text(content):
+                                if !content.text.isEmpty {
+                                    MarkdownView(content.citationMarkdown)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             case let .reasoning(reasoning):
@@ -272,7 +272,13 @@ private struct MessageRow: View {
                                 )
                             case let .toolCall(call):
                                 ToolCallRow(call: call)
+                            case let .hostedTool(tool):
+                                HostedWebSearchRow(tool: tool)
                             }
+                        }
+
+                        if !message.sources.isEmpty {
+                            MessageSourcesSection(sources: message.sources)
                         }
 
                         if !message.text.isEmpty {
@@ -492,6 +498,173 @@ private struct ReasoningDisclosure: View {
             Text("思考过程")
                 .font(.caption.weight(.medium))
         }
+    }
+}
+
+/// 供应商托管的网络搜索块；只展示状态，不参与本地 Tool 审批或执行。
+private struct HostedWebSearchRow: View {
+    let tool: HostedToolSnapshot
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "globe.badge.magnifyingglass")
+                        .font(.system(size: 11, weight: .medium))
+                    Text(statusTitle)
+                        .font(.caption.weight(.medium))
+                        .modifier(ShimmerModifier(
+                            reduceMotion: reduceMotion || tool.status == .completed
+                        ))
+                    if let summary = actionSummary {
+                        Text("· \(summary)")
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 12)
+                    if hasDetails {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasDetails)
+            .accessibilityLabel(accessibilityTitle)
+
+            if isExpanded && hasDetails {
+                VStack(alignment: .leading, spacing: 7) {
+                    if let action = tool.action {
+                        HostedToolActionDetails(action: action)
+                    }
+                    ForEach(Array(tool.sources.enumerated()), id: \.offset) { _, source in
+                        SourceLink(source: source)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Color.primary.opacity(0.05),
+                    in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+                )
+            }
+        }
+        .padding(.leading, 8)
+    }
+
+    private var statusTitle: String {
+        switch tool.status {
+        case .inProgress: "准备搜索网络"
+        case .searching: "正在搜索网络"
+        case .completed: "已完成网络搜索"
+        }
+    }
+
+    private var actionSummary: String? {
+        switch tool.action {
+        case let .search(queries): queries.first
+        case let .openPage(url): URL(string: url)?.host ?? url
+        case let .findInPage(_, pattern): pattern
+        case nil: nil
+        }
+    }
+
+    private var hasDetails: Bool {
+        tool.action != nil || !tool.sources.isEmpty
+    }
+
+    private var accessibilityTitle: String {
+        [statusTitle, actionSummary].compactMap { $0 }.joined(separator: "，")
+    }
+}
+
+private struct HostedToolActionDetails: View {
+    let action: HostedToolAction
+
+    var body: some View {
+        switch action {
+        case let .search(queries):
+            if queries.isEmpty {
+                Label("搜索网络", systemImage: "magnifyingglass")
+            } else {
+                ForEach(Array(queries.enumerated()), id: \.offset) { _, query in
+                    Label(query, systemImage: "magnifyingglass")
+                }
+            }
+        case let .openPage(url):
+            Label(URL(string: url)?.host ?? url, systemImage: "doc.text.magnifyingglass")
+        case let .findInPage(url, pattern):
+            Label("在 \(URL(string: url)?.host ?? url) 中查找“\(pattern)”", systemImage: "text.magnifyingglass")
+        }
+    }
+}
+
+private struct MessageSourcesSection: View {
+    let sources: [HostedToolSource]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label("来源", systemImage: "link")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ForEach(Array(sources.enumerated()), id: \.offset) { index, source in
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text("\(index + 1).")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    SourceLink(source: source)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Color.primary.opacity(0.04),
+            in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+        )
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct SourceLink: View {
+    let source: HostedToolSource
+
+    var body: some View {
+        if let url = URL(string: source.url),
+           let scheme = url.scheme?.lowercased(),
+           scheme == "https" || scheme == "http" {
+            Link(destination: url) {
+                Label(title, systemImage: "arrow.up.right.square")
+                    .font(.caption)
+                    .lineLimit(2)
+            }
+            .buttonStyle(.plain)
+        } else {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+    }
+
+    private var title: String {
+        if let title = source.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title
+        }
+        return URL(string: source.url)?.host ?? source.url
     }
 }
 
