@@ -94,4 +94,17 @@ final class VendorEditGateTests: XCTestCase {
         gate.draftAPIKey = "sk-1"
         XCTAssertTrue(gate.canSelectModel)
     }
+
+    /// 订阅服务商（ChatGPT/Codex）：无 Base URL / API Key 输入，
+    /// 模型加载后即可直接选择（无指纹依赖）
+    func testSubscriptionVendorWithEmptyCredentialsAllowsSelection() {
+        let gate = makeGate(
+            savedBaseURL: "",
+            draftBaseURL: "",
+            draftAPIKey: "",
+            hasLoadedModels: true,
+            verifiedFingerprint: nil
+        )
+        XCTAssertTrue(gate.canSelectModel)
+    }
 }

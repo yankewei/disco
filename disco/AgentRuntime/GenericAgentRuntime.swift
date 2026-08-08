@@ -16,6 +16,13 @@ final class GenericAgentRuntime: AgentRuntime {
     struct Configuration: Sendable {
         let model: String
         let reasoningEnabled: Bool
+        let reasoningEffort: String?
+
+        init(model: String, reasoningEnabled: Bool, reasoningEffort: String? = nil) {
+            self.model = model
+            self.reasoningEnabled = reasoningEnabled
+            self.reasoningEffort = reasoningEffort
+        }
     }
 
     private let provider: any ModelProvider
@@ -51,7 +58,8 @@ final class GenericAgentRuntime: AgentRuntime {
                         request: ModelRequest(
                             messages: request.messages,
                             model: configuration.model,
-                            reasoningEnabled: configuration.reasoningEnabled
+                            reasoningEnabled: configuration.reasoningEnabled,
+                            reasoningEffort: configuration.reasoningEffort
                         )
                     ) {
                         try Task.checkCancellation()
@@ -93,6 +101,10 @@ final class GenericAgentRuntime: AgentRuntime {
     }
 
     func cancel(runID: RunID) async {
+        activeTask?.cancel()
+    }
+
+    func shutdown() async {
         activeTask?.cancel()
     }
 }

@@ -12,13 +12,18 @@ final class ConversationStore: ObservableObject {
     private var requestTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var activeRunID: RunID?
-    private let onMessagesChanged: ([ChatMessage]) -> Void
+    private let onMessagesChanged: ([ChatMessage], String?) -> Void
+    /// 订阅服务商（ChatGPT/Codex）的会话线程 id；其余服务商为 nil。
+    /// 是持久化的单一来源：更新后立即通过 onMessagesChanged 落盘。
+    private(set) var threadID: String?
 
     init(
         messages: [ChatMessage] = [],
-        onMessagesChanged: @escaping ([ChatMessage]) -> Void = { _ in }
+        threadID: String? = nil,
+        onMessagesChanged: @escaping ([ChatMessage], String?) -> Void = { _, _ in }
     ) {
         self.messages = messages
+        self.threadID = threadID
         self.onMessagesChanged = onMessagesChanged
     }
 
@@ -30,8 +35,26 @@ final class ConversationStore: ObservableObject {
         !isStreaming && errorMessage != nil && messages.last?.role == .user
     }
 
-    func configure(runtime: (any AgentRuntime)?) {
+    var canRegenerateLastResponse: Bool {
+        guard runtime != nil, !isStreaming, messages.count >= 2 else { return false }
+        return messages[messages.count - 1].role == .assistant
+            && messages[messages.count - 2].role == .user
+    }
+
+    /// 替换运行时，返回旧的运行时（供调用方释放资源，如终止 codex 子进程）。
+    @discardableResult
+    func configure(runtime: (any AgentRuntime)?) -> (any AgentRuntime)? {
+        let oldRuntime = self.runtime
         self.runtime = runtime
+        return oldRuntime
+    }
+
+    /// 更新订阅会话的线程 id（CodexRuntime 首次运行时回调）。
+    /// 立即持久化，保证重启后能 thread/resume 续接上下文。
+    func updateThreadID(_ id: String) {
+        guard threadID != id else { return }
+        threadID = id
+        persistImmediately()
     }
 
     func send() {
@@ -56,7 +79,11 @@ final class ConversationStore: ObservableObject {
 
             do {
                 for try await event in runtime.start(
-                    request: AgentRunRequest(runID: runID, messages: requestMessages)
+                    request: AgentRunRequest(
+                        runID: runID,
+                        messages: requestMessages,
+                        resumeThreadID: self.threadID
+                    )
                 ) {
                     guard !Task.isCancelled, activeRunID == runID else { return }
                     handle(event, assistantID: assistantID)
@@ -120,6 +147,9 @@ final class ConversationStore: ObservableObject {
     func clear() {
         cancelRequest()
         messages.removeAll()
+        // 清空本地对话也意味着开始新的 Codex 上下文，不能让下一条消息
+        // 继续复用旧的 app-server thread。
+        threadID = nil
         errorMessage = nil
         persistImmediately()
     }
@@ -132,6 +162,15 @@ final class ConversationStore: ObservableObject {
         guard canRetry, let lastMessage = messages.last else { return }
         messages.removeLast()
         draft = lastMessage.text
+        send()
+    }
+
+    /// 丢弃最后一轮回答，使用同一条用户消息重新运行。
+    func regenerateLastResponse() {
+        guard canRegenerateLastResponse else { return }
+        messages.removeLast()
+        let userMessage = messages.removeLast()
+        draft = userMessage.text
         send()
     }
 
@@ -152,13 +191,13 @@ final class ConversationStore: ObservableObject {
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self else { return }
             persistenceTask = nil
-            onMessagesChanged(messages)
+            onMessagesChanged(messages, threadID)
         }
     }
 
     private func persistImmediately() {
         persistenceTask?.cancel()
         persistenceTask = nil
-        onMessagesChanged(messages)
+        onMessagesChanged(messages, threadID)
     }
 }

@@ -9,30 +9,34 @@ protocol APIKeyStoring {
     func forAccount(_ account: String) -> APIKeyStoring
 }
 
-/// API Key 明文存储在沙盒容器的 Application Support 目录
-/// （~/Library/Containers/<bundle-id>/Data/Library/Application Support/disco/config/auth.json，0600 权限、原子写入）。
+/// API Key 明文存储在 Application Support 目录
+/// （~/Library/Application Support/disco/config/auth.json，0600 权限、原子写入）。
 ///
 /// 与 gh / aws 等 CLI 的做法一致：文件可读、可备份、可迁移；
 /// 代价是没有系统级加密，同一用户下的其他进程可读取。
 /// account 作为 JSON 键，按服务商隔离。
+///
+/// 历史位置（首次读取时自动迁移，不阻塞使用）：
+/// - 旧版沙盒容器：~/Library/Containers/<bundle-id>/Data/Library/Application Support/disco/config/auth.json
+/// - 更早版本：~/Library/Containers/<bundle-id>/Data/.disco/config/auth.json
 struct AuthFileStore: APIKeyStoring {
     private let account: String
     private let fileURL: URL
 
     init(account: String = "api-key", fileURL: URL? = nil) {
         self.account = account
-        if let fileURL {
-            self.fileURL = fileURL
-        } else {
-            // Apple 推荐：数据放在沙盒容器的 Application Support 目录，
-            // 而非容器根下的隐藏目录（旧版本的位置）。
-            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-            self.fileURL = support
-                .appendingPathComponent("disco", isDirectory: true)
-                .appendingPathComponent("config", isDirectory: true)
-                .appendingPathComponent("auth.json")
-        }
+        self.fileURL = fileURL ?? Self.defaultFileURL()
+    }
+
+    /// 默认存储位置：真实 Application Support 下的 disco/config/auth.json
+    private static func defaultFileURL() -> URL {
+        // Apple 推荐：数据放在 Application Support 目录
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return support
+            .appendingPathComponent("disco", isDirectory: true)
+            .appendingPathComponent("config", isDirectory: true)
+            .appendingPathComponent("auth.json")
     }
 
     func forAccount(_ account: String) -> APIKeyStoring {
@@ -65,23 +69,58 @@ struct AuthFileStore: APIKeyStoring {
             .appendingPathComponent("auth.json")
     }
 
-    /// 实际使用的文件：优先 Application Support 新位置；
-    /// 新位置缺失且旧位置存在时，把旧文件迁移过去（迁移失败则回退读旧位置，不阻塞已有 Key）。
-    private func resolvedFileURL() -> URL {
-        let hasNew = FileManager.default.fileExists(atPath: fileURL.path)
-        let hasLegacy = FileManager.default.fileExists(atPath: legacyFileURL.path)
-        guard !hasNew, hasLegacy else { return fileURL }
+    /// 早期版本处于沙盒容器内的 Application Support 位置（本应用曾启用 App Sandbox）
+    private var containerFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers")
+            .appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.yankewei.disco")
+            .appendingPathComponent("Data/Library/Application Support")
+            .appendingPathComponent("disco", isDirectory: true)
+            .appendingPathComponent("config", isDirectory: true)
+            .appendingPathComponent("auth.json")
+    }
 
-        do {
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try FileManager.default.moveItem(at: legacyFileURL, to: fileURL)
-        } catch {
-            // 迁移失败（如权限问题）：继续读旧位置，不阻塞使用
+    /// 更早版本：容器根 ~/.disco/config（沙盒内 homeDirectoryForCurrentUser 即容器 Data 目录）
+    private var containerRootLegacyFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers")
+            .appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.yankewei.disco")
+            .appendingPathComponent("Data/.disco/config/auth.json")
+    }
+
+    /// 实际使用的文件：优先新位置（真实 Application Support）；
+    /// 缺失时依次尝试容器位置与更早位置并迁移过去。
+    /// 迁移失败则回退读原位置，不阻塞已有 Key。
+    ///
+    /// 注意：迁移只对**默认位置**生效（`usesDefaultLocation`）。
+    /// 测试注入自定义 fileURL 时直接使用该路径，绝不触碰真实用户文件。
+    private func resolvedFileURL() -> URL {
+        guard usesDefaultLocation else { return fileURL }
+        let candidates = [
+            legacyFileURL,
+            containerRootLegacyFileURL,
+            containerFileURL,
+        ]
+        guard !FileManager.default.fileExists(atPath: fileURL.path) else { return fileURL }
+        for source in candidates where FileManager.default.fileExists(atPath: source.path) {
+            do {
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try FileManager.default.moveItem(at: source, to: fileURL)
+            } catch {
+                // 迁移失败（如权限问题）：继续读原位置，不阻塞使用
+            }
+            return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : source
         }
-        return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : legacyFileURL
+        return fileURL
+    }
+
+    /// 是否使用默认存储位置：迁移逻辑只对默认位置生效，
+    /// 防止测试注入的自定义 fileURL 意外迁移真实用户数据
+    private var usesDefaultLocation: Bool {
+        fileURL == Self.defaultFileURL()
     }
 
     private func readAll() throws -> [String: String] {

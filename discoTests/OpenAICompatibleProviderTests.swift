@@ -34,6 +34,24 @@ final class OpenAICompatibleProviderTests: XCTestCase {
         XCTAssertEqual(text, "Hello!")
     }
 
+    func testConfiguredReasoningEffortIsSentAsIs() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MaxReasoningURLProtocol.self]
+        let provider = OpenAIResponsesProvider(
+            apiKey: "test-key",
+            baseURL: URL(string: "https://api.deepseek.com")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        let text = try await streamText(
+            provider,
+            model: "deepseek-v4-flash",
+            reasoningEnabled: true,
+            reasoningEffort: "max"
+        )
+        XCTAssertEqual(text, "Hello!")
+    }
+
     func testOpenAIKeepsUsingResponsesAndDecodesSeparateSSEFrames() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [OpenAIURLProtocol.self]
@@ -160,6 +178,19 @@ private final class ThinkingDisabledURLProtocol: URLProtocol, @unchecked Sendabl
 
     override func startLoading() {
         assertResponsesRequest(request, expectedEffort: "none")
+        sendSSEStream(helloStreamSSE())
+    }
+
+    override func stopLoading() {}
+}
+
+private final class MaxReasoningURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        assertResponsesRequest(request, expectedEffort: "max")
         sendSSEStream(helloStreamSSE())
     }
 
@@ -347,13 +378,15 @@ private extension OpenAICompatibleProviderTests {
     func streamText(
         _ provider: OpenAIResponsesProvider,
         model: String = OpenAIResponsesProvider.defaultModel,
-        reasoningEnabled: Bool = true
+        reasoningEnabled: Bool = true,
+        reasoningEffort: String? = nil
     ) async throws -> String {
         var text = ""
         for try await event in provider.stream(request: ModelRequest(
             messages: [ChatMessage(role: .user, text: "Hi")],
             model: model,
-            reasoningEnabled: reasoningEnabled
+            reasoningEnabled: reasoningEnabled,
+            reasoningEffort: reasoningEffort
         )) {
             if case let .textDelta(delta) = event {
                 text += delta

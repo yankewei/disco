@@ -68,7 +68,7 @@ struct SettingsView: View {
         .onChange(of: appState.providerConfigs) { _, _ in
             // 验证保存完成后，从“待配置”中移除
             appState.pendingVendors = appState.pendingVendors.filter {
-                appState.config(for: $0)?.isConfigured != true
+                !$0.isConfigured(appState.config(for: $0))
             }
         }
     }
@@ -236,7 +236,7 @@ struct SettingsView: View {
     // MARK: 状态归纳
 
     private func connectionStatus(for vendor: ProviderVendor) -> ConnectionStatus {
-        ConnectionStatus(config: appState.config(for: vendor))
+        ConnectionStatus(vendor: vendor, config: appState.config(for: vendor))
     }
 }
 
@@ -247,8 +247,8 @@ private enum ConnectionStatus {
     case unverified
     case unconfigured
 
-    init(config: ProviderConfig?) {
-        guard let config, config.hasAPIKey else {
+    init(vendor: ProviderVendor, config: ProviderConfig?) {
+        guard let config, vendor.isConfigured(config) else {
             self = .unconfigured
             return
         }
@@ -496,7 +496,18 @@ private struct VendorDetailPanel: View {
     @State private var revealedKey: String?
     /// 是否处于"更换 Key"的输入状态
     @State private var isEditingKey = false
+    /// 订阅服务商（ChatGPT/Codex）的登录检测状态
+    @State private var codexLoginState: CodexLoginState = .checking
     @FocusState private var focusedField: CredentialField?
+
+    /// 订阅登录检测结果（单一来源，避免散落的条件分支产生矛盾文案）
+    private enum CodexLoginState: Equatable {
+        case checking
+        case signedIn(email: String?, planTitle: String)
+        case signedOut
+        case apiKeyMode
+        case failed(String)
+    }
 
     private enum CredentialField: Hashable {
         case baseURL
@@ -557,8 +568,9 @@ private struct VendorDetailPanel: View {
     }
 
     private var canVerify: Bool {
-        !isVerifying
-            && !trimmedBaseURL.isEmpty
+        guard !isVerifying else { return false }
+        if !vendor.requiresAPIKey { return true }
+        return !trimmedBaseURL.isEmpty
             && (!trimmedAPIKey.isEmpty || config?.hasAPIKey == true)
     }
 
@@ -569,7 +581,7 @@ private struct VendorDetailPanel: View {
     }
 
     private var status: ConnectionStatus {
-        ConnectionStatus(config: config)
+        ConnectionStatus(vendor: vendor, config: config)
     }
 
     var body: some View {
@@ -583,7 +595,9 @@ private struct VendorDetailPanel: View {
                 credentialsCard
                 verifyRow
                 modelSection
-                thinkingRow
+                if vendor.requiresAPIKey {
+                    thinkingRow
+                }
             }
             .padding(20)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -626,6 +640,10 @@ private struct VendorDetailPanel: View {
                 verifiedFingerprint = nil
                 verifyError = error.localizedDescription
             }
+        }
+        .task(id: vendor) {
+            guard vendor == .chatgpt else { return }
+            await refreshCodexLoginStatus()
         }
         .confirmationDialog(
             "移除 \(vendor.title) 的配置？",
@@ -676,26 +694,159 @@ private struct VendorDetailPanel: View {
 
     // MARK: 凭据
 
+    /// 凭据区：API Key 服务商显示 Base URL + Key；
+    /// 订阅类（ChatGPT/Codex）显示登录说明（登录态由 codex CLI 管理）。
+    @ViewBuilder
     private var credentialsCard: some View {
-        VStack(spacing: 0) {
-            SettingInputRow(icon: "network", title: "Base URL") {
-                TextField(
-                    vendor.defaultBaseURL.isEmpty ? "https://api.example.com/v1" : vendor.defaultBaseURL,
-                    text: $draft.baseURL
-                )
-                .textFieldStyle(.plain)
-                .focused($focusedField, equals: .baseURL)
-                .accessibilityLabel("Base URL")
-            }
+        if vendor.requiresAPIKey {
+            VStack(spacing: 0) {
+                SettingInputRow(icon: "network", title: "Base URL") {
+                    TextField(
+                        vendor.defaultBaseURL.isEmpty ? "https://api.example.com/v1" : vendor.defaultBaseURL,
+                        text: $draft.baseURL
+                    )
+                    .textFieldStyle(.plain)
+                    .focused($focusedField, equals: .baseURL)
+                    .accessibilityLabel("Base URL")
+                }
 
-            Divider()
-                .padding(.leading, 54)
+                Divider()
+                    .padding(.leading, 54)
 
-            SettingInputRow(icon: "key.fill", title: "API Key") {
-                apiKeyRow
+                SettingInputRow(icon: "key.fill", title: "API Key") {
+                    apiKeyRow
+                }
             }
+            .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+        } else {
+            subscriptionCard
         }
+    }
+
+    /// 订阅服务商说明卡：无需 API Key，登录态由 codex CLI 管理（ADR-003）
+    private var subscriptionCard: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 14) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(DiscoTheme.accent)
+                    .frame(width: 30, height: 30)
+                    .background(DiscoTheme.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("使用 Codex (OpenAI) 登录")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await refreshCodexLoginStatus() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(codexLoginState == .checking)
+                .help("重新检测登录状态")
+            }
+
+            loginStatusRow
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+
+    /// 登录状态行：绿=已登录订阅，红=未登录，橙=其他认证/检测失败
+    @ViewBuilder
+    private var loginStatusRow: some View {
+        HStack(spacing: 8) {
+            switch codexLoginState {
+            case .checking:
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在检测登录状态…")
+            case let .signedIn(email, planTitle):
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text(loginStatusText(email: email, planTitle: planTitle))
+            case .signedOut:
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.red)
+                Text("未登录 Codex (OpenAI)。请先在终端运行 codex login。")
+            case .apiKeyMode:
+                Image(systemName: "key.fill")
+                    .foregroundStyle(.orange)
+                Text("当前为 API Key 模式，未使用 Codex (OpenAI) 登录。")
+            case let .failed(message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("无法检测登录状态：\(message)")
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func loginStatusText(email: String?, planTitle: String) -> String {
+        var text = "已登录"
+        if let email, !email.isEmpty {
+            text += "（\(email)）"
+        }
+        if !planTitle.isEmpty {
+            text += " · \(planTitle) 计划"
+        }
+        return text
+    }
+
+    /// 订阅计划展示名（未知计划回退原始值）
+    private static func planTitle(_ planType: String?) -> String {
+        switch planType {
+        case "free": "Free"
+        case "plus": "Plus"
+        case "pro": "Pro"
+        case "team": "Team"
+        case "business": "Business"
+        case "enterprise": "Enterprise"
+        case "edu": "Edu"
+        case let .some(other): other
+        case .none: ""
+        }
+    }
+
+    /// 检测 codex 登录状态（走 account/read，不触碰 auth.json）
+    private func refreshCodexLoginStatus() async {
+        codexLoginState = .checking
+        do {
+            let status = try await appState.codexAccountStatus()
+            guard !Task.isCancelled else { return }
+            switch status.kind {
+            case let .chatgpt(email, planType):
+                codexLoginState = .signedIn(email: email, planTitle: Self.planTitle(planType))
+            case .apiKey:
+                codexLoginState = .apiKeyMode
+            case let .other(type):
+                codexLoginState = .signedIn(email: nil, planTitle: type)
+            case .signedOut:
+                codexLoginState = .signedOut
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            codexLoginState = .failed(error.localizedDescription)
+        }
     }
 
     /// Key 行三态：已保存（掩码，可查看/更换）、查看明文、输入新 Key
@@ -937,23 +1088,44 @@ private struct VendorDetailPanel: View {
     // MARK: 选项
 
     private var thinkingRow: some View {
-        SettingInputRow(
+        let efforts = appState.reasoningEfforts(for: vendor)
+        return SettingInputRow(
             icon: "brain",
-            title: "思考模式",
-            caption: config == nil ? "完成配置后可调整" : "开启后该服务商的请求会先进行推理"
+            title: efforts.count > 2 ? "推理强度" : "思考模式",
+            caption: config == nil
+                ? "完成配置后可调整"
+                : efforts.count > 2 ? "选择关闭、低、高或最高" : "开启后该服务商的请求会先进行推理"
         ) {
-            Toggle(
-                "思考模式",
-                isOn: Binding(
-                    get: { config?.thinkingEnabled ?? true },
-                    set: { appState.setThinkingEnabled($0, for: vendor) }
+            if efforts.count > 2 {
+                Picker(
+                    "推理强度",
+                    selection: Binding(
+                        get: { appState.selectedReasoningEffort(for: vendor) ?? "high" },
+                        set: { appState.setReasoningEffort($0, for: vendor) }
+                    )
+                ) {
+                    ForEach(efforts, id: \.self) { effort in
+                        Text(ProviderVendor.reasoningEffortTitle(effort))
+                            .tag(effort)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(config == nil)
+                .accessibilityLabel("推理强度")
+            } else {
+                Toggle(
+                    "思考模式",
+                    isOn: Binding(
+                        get: { config?.thinkingEnabled ?? true },
+                        set: { appState.setThinkingEnabled($0, for: vendor) }
+                    )
                 )
-            )
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .disabled(config == nil)
-            .accessibilityLabel("思考模式")
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(config == nil)
+                .accessibilityLabel("思考模式")
+            }
         }
         .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
     }
