@@ -36,7 +36,9 @@ private struct ConversationSidebar: View {
     /// 当前服务商已保存 Key 但从未验证过连接时，提示用户去设置页验证
     private var needsVerificationAttention: Bool {
         guard let config = appState.config(for: appState.activeVendor) else { return false }
-        return config.hasAPIKey && config.lastVerifiedAt == nil
+        return appState.activeVendor.requiresAPIKey
+            && config.hasAPIKey
+            && config.lastVerifiedAt == nil
     }
 
     var body: some View {
@@ -80,7 +82,7 @@ private struct ConversationSidebar: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("连接设置")
                             .font(.callout.weight(.medium))
-                        Text(appState.hasAPIKey ? appState.model : "尚未连接模型")
+                        Text(appState.isActiveVendorConfigured ? appState.model : "尚未连接模型")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

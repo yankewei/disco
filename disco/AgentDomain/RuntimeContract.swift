@@ -8,6 +8,9 @@ typealias RunID = UUID
 struct AgentRunRequest: Sendable {
     let runID: RunID
     let messages: [ChatMessage]
+    /// 续接的 codex thread id（订阅服务商用；API Key 运行时忽略）。
+    /// 有值时 thread/resume 而非新建线程，保证重启后上下文不丢失。
+    var resumeThreadID: String? = nil
 }
 
 /// 统一 Agent 事件（计划 §8 AgentEvent）。
@@ -39,4 +42,8 @@ extension AgentFailure {
 protocol AgentRuntime: Sendable {
     func start(request: AgentRunRequest) -> AsyncThrowingStream<AgentEvent, Error>
     func cancel(runID: RunID) async
+
+    /// 释放运行时持有的资源（如 codex 子进程）。
+    /// 会话删除或配置变更替换运行时前调用，避免遗留孤儿进程。
+    func shutdown() async
 }

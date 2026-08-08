@@ -4,11 +4,26 @@ import SwiftUI
 
 struct ChatView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var store: ConversationStore
     @State private var isConfirmingClear = false
+    @State private var isAtLatestMessage = true
+    @State private var shouldFollowLatestMessage = true
+    @State private var isUserScrolling = false
+
+    private static let latestMessageAnchor = "latest-message-anchor"
 
     private var providerHost: String {
-        URL(string: appState.baseURL)?.host ?? appState.baseURL
+        // 订阅服务商没有 Base URL，展示服务商名
+        if appState.activeVendor == .chatgpt { return "Codex (OpenAI)" }
+        return URL(string: appState.baseURL)?.host ?? appState.baseURL
+    }
+
+    private var conversationTitle: String {
+        guard let text = store.messages.first(where: { $0.role == .user })?.text else {
+            return "新对话"
+        }
+        return text.split(whereSeparator: \Character.isNewline).first.map(String.init) ?? "新对话"
     }
 
     var body: some View {
@@ -21,7 +36,7 @@ struct ChatView: View {
                     LazyVStack(spacing: 32) {
                         if store.messages.isEmpty {
                             EmptyConversationView(
-                                isConfigured: appState.hasAPIKey,
+                                isConfigured: appState.isActiveVendorConfigured,
                                 model: appState.model,
                                 providerHost: providerHost
                             )
@@ -32,11 +47,22 @@ struct ChatView: View {
                             ForEach(store.messages) { message in
                                 MessageRow(
                                     message: message,
-                                    isStreaming: store.isStreaming && message.id == store.messages.last?.id
+                                    isStreaming: store.isStreaming && message.id == store.messages.last?.id,
+                                    errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
+                                    canRetry: store.canRetry,
+                                    retry: store.retryLastMessage,
+                                    dismissError: store.dismissError,
+                                    canRegenerate: message.id == store.messages.last?.id
+                                        && store.canRegenerateLastResponse,
+                                    regenerate: store.regenerateLastResponse
                                 )
                                 .id(message.id)
                             }
                         }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.latestMessageAnchor)
                     }
                     .frame(maxWidth: 760)
                     .padding(.horizontal, 28)
@@ -44,57 +70,79 @@ struct ChatView: View {
                     .padding(.bottom, 20)
                     .frame(maxWidth: .infinity)
                 }
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+                } action: { _, isAtLatest in
+                    isAtLatestMessage = isAtLatest
+                    if isAtLatest {
+                        shouldFollowLatestMessage = true
+                    } else if isUserScrolling {
+                        shouldFollowLatestMessage = false
+                    }
+                }
+                .onScrollPhaseChange { _, phase in
+                    isUserScrolling = phase.isScrolling && phase != .animating
+                }
                 .onChange(of: store.messages) {
-                    guard let id = store.messages.last?.id else { return }
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo(id, anchor: .bottom)
+                    guard shouldFollowLatestMessage else { return }
+                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                }
+                .onAppear {
+                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                }
+                .overlay(alignment: .bottom) {
+                    if !isAtLatestMessage && !shouldFollowLatestMessage {
+                        Button {
+                            shouldFollowLatestMessage = true
+                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                                proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                            }
+                        } label: {
+                            Label("回到最新", systemImage: "arrow.down")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(DiscoTheme.elevatedSurface, in: Capsule())
+                                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                        }
+                        .buttonStyle(DiscoPressButtonStyle())
+                        .padding(.bottom, 12)
+                        .transition(
+                            reduceMotion
+                                ? .opacity
+                                : .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))
+                        )
+                        .accessibilityLabel("回到最新消息")
                     }
                 }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 10) {
-                if let errorMessage = store.errorMessage {
-                    ChatErrorBanner(
-                        message: errorMessage,
-                        canRetry: store.canRetry,
-                        retry: store.retryLastMessage,
-                        dismiss: store.dismissError
-                    )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-
-                ComposerView(
-                    store: store,
-                    isConfigured: appState.hasAPIKey
-                )
-            }
+            ComposerView(
+                store: store,
+                isConfigured: appState.isActiveVendorConfigured
+            )
             .frame(maxWidth: 760)
             .padding(.horizontal, 20)
             .padding(.bottom, 18)
             .frame(maxWidth: .infinity)
         }
-        .animation(.easeOut(duration: 0.2), value: store.errorMessage)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: shouldFollowLatestMessage)
+        .navigationTitle(conversationTitle)
         .toolbar {
             ToolbarSpacer(.flexible)
 
-            ToolbarItemGroup(placement: .primaryAction) {
-                SettingsLink {
-                    ModelStatusPill(
-                        model: appState.model,
-                        isConfigured: appState.hasAPIKey
-                    )
-                }
-                .help(appState.hasAPIKey ? "配置模型与 API" : "连接模型")
-
-                Button {
-                    isConfirmingClear = true
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button("清空当前对话", systemImage: "trash", role: .destructive) {
+                        isConfirmingClear = true
+                    }
+                    .disabled(store.messages.isEmpty)
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "ellipsis.circle")
                         .frame(width: 20, height: 20)
                 }
-                .help("清空当前对话")
-                .disabled(store.messages.isEmpty)
+                .help("更多对话操作")
             }
         }
         .confirmationDialog(
@@ -113,28 +161,9 @@ struct ChatView: View {
             guard !store.messages.isEmpty else { return }
             isConfirmingClear = true
         }
-    }
-}
-
-private struct ModelStatusPill: View {
-    let model: String
-    let isConfigured: Bool
-
-    var body: some View {
-        HStack(spacing: 7) {
-            Circle()
-                .fill(isConfigured ? DiscoTheme.accent : Color.secondary.opacity(0.45))
-                .frame(width: 7, height: 7)
-
-            Text(isConfigured ? model : "连接模型")
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
+        .task(id: "\(appState.activeVendor.rawValue):\(appState.model)") {
+            await appState.refreshCodexModelCatalogIfNeeded()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(.quaternary, in: Capsule())
-        .help(model)
     }
 }
 
@@ -190,22 +219,35 @@ private struct EmptyConversationView: View {
 private struct MessageRow: View {
     let message: ChatMessage
     let isStreaming: Bool
+    let errorMessage: String?
+    let canRetry: Bool
+    let retry: () -> Void
+    let dismissError: () -> Void
+    let canRegenerate: Bool
+    let regenerate: () -> Void
 
     @State private var isHovered = false
 
     var body: some View {
-        Group {
+        VStack(spacing: 8) {
             if message.role == .user {
                 HStack(alignment: .top) {
                     Spacer(minLength: 100)
-                    Text(message.text)
-                        .font(.body)
-                        .lineSpacing(4)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 15)
-                        .padding(.vertical, 11)
-                        .background(DiscoTheme.accent.opacity(0.11))
-                        .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Text(message.text)
+                            .font(.body)
+                            .lineSpacing(4)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 15)
+                            .padding(.vertical, 11)
+                            .background(DiscoTheme.accent.opacity(0.11))
+                            .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
+
+                        if !message.text.isEmpty {
+                            messageActionButton("复制", systemImage: "doc.on.doc", action: copyMessage)
+                                .opacity(isHovered ? 1 : 0.45)
+                        }
+                    }
                 }
             } else {
                 HStack(alignment: .top, spacing: 13) {
@@ -234,15 +276,17 @@ private struct MessageRow: View {
                         }
 
                         if !message.text.isEmpty {
-                            Button(action: copyMessage) {
-                                Label("复制", systemImage: "doc.on.doc")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 5)
-                                    .background(.quaternary, in: Capsule())
+                            HStack(spacing: 4) {
+                                messageActionButton("复制", systemImage: "doc.on.doc", action: copyMessage)
+
+                                if canRegenerate {
+                                    messageActionButton(
+                                        "重新生成",
+                                        systemImage: "arrow.clockwise",
+                                        action: regenerate
+                                    )
+                                }
                             }
-                            .buttonStyle(DiscoPressButtonStyle())
                             .opacity(isHovered ? 1 : 0.55)
                         }
                     }
@@ -250,6 +294,27 @@ private struct MessageRow: View {
 
                     Spacer(minLength: 40)
                 }
+            }
+
+            if let errorMessage {
+                HStack {
+                    if message.role == .user {
+                        Spacer(minLength: 100)
+                    }
+
+                    ChatInlineError(
+                        message: errorMessage,
+                        canRetry: canRetry,
+                        retry: retry,
+                        dismiss: dismissError
+                    )
+                    .frame(maxWidth: message.role == .user ? 520 : 680)
+
+                    if message.role == .assistant {
+                        Spacer(minLength: 40)
+                    }
+                }
+                .transition(.opacity)
             }
         }
         .frame(maxWidth: .infinity)
@@ -260,7 +325,29 @@ private struct MessageRow: View {
                     copyMessage()
                 }
             }
+            if canRegenerate {
+                Button("重新生成") {
+                    regenerate()
+                }
+            }
         }
+        .animation(.easeOut(duration: 0.16), value: errorMessage)
+    }
+
+    private func messageActionButton(
+        _ title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(.quaternary, in: Capsule())
+        }
+        .buttonStyle(DiscoPressButtonStyle())
     }
 
     private func copyMessage() {
@@ -306,12 +393,13 @@ private struct ShimmerModifier: ViewModifier {
 
 private struct ReasoningDisclosure: View {
     let reasoning: String
-    /// 思考阶段（流式中且正文未出）：头部显示「思考中」+ 扫光，内容限高滚动；
-    /// 思考结束：头部变「思考过程」，自动收起，展开时完整显示。
+    /// 思考阶段默认保持紧凑，用户主动展开后不再自动改变其选择。
     let isThinking: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
+    @State private var thinkingStartedAt: Date?
+    @State private var completedThinkingDuration: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -324,14 +412,7 @@ private struct ReasoningDisclosure: View {
                     Image(systemName: "brain")
                         .font(.system(size: 11, weight: .medium))
 
-                    if isThinking {
-                        Text("思考中")
-                            .font(.caption.weight(.medium))
-                            .modifier(ShimmerModifier(reduceMotion: reduceMotion))
-                    } else {
-                        Text("思考过程")
-                            .font(.caption.weight(.medium))
-                    }
+                    reasoningStatus
 
                     Spacer(minLength: 12)
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -382,14 +463,34 @@ private struct ReasoningDisclosure: View {
         }
         .padding(.leading, 8)
         .onAppear {
-            if isThinking {
-                isExpanded = true
-            }
+            if isThinking { thinkingStartedAt = Date() }
         }
         .onChange(of: isThinking) { _, thinking in
-            withAnimation(.easeOut(duration: 0.18)) {
-                isExpanded = thinking
+            if thinking {
+                thinkingStartedAt = Date()
+                completedThinkingDuration = nil
+            } else if let thinkingStartedAt {
+                completedThinkingDuration = max(1, Int(Date().timeIntervalSince(thinkingStartedAt)))
+                self.thinkingStartedAt = nil
             }
+        }
+    }
+
+    @ViewBuilder
+    private var reasoningStatus: some View {
+        if isThinking {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let elapsed = max(0, Int(context.date.timeIntervalSince(thinkingStartedAt ?? context.date)))
+                Text("正在思考 · \(elapsed) 秒")
+                    .font(.caption.weight(.medium))
+                    .modifier(ShimmerModifier(reduceMotion: reduceMotion))
+            }
+        } else if let completedThinkingDuration {
+            Text("思考了 \(completedThinkingDuration) 秒")
+                .font(.caption.weight(.medium))
+        } else {
+            Text("思考过程")
+                .font(.caption.weight(.medium))
         }
     }
 }
@@ -444,7 +545,7 @@ private struct ToolCallRow: View {
     }
 }
 
-private struct ChatErrorBanner: View {
+private struct ChatInlineError: View {
     let message: String
     let canRetry: Bool
     let retry: () -> Void
@@ -463,7 +564,7 @@ private struct ChatErrorBanner: View {
 
             if canRetry {
                 Button("重试", action: retry)
-                    .buttonStyle(.plain)
+                    .buttonStyle(DiscoPressButtonStyle())
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.red)
             }
@@ -472,7 +573,7 @@ private struct ChatErrorBanner: View {
                 Image(systemName: "xmark")
                     .frame(width: 20, height: 20)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(DiscoPressButtonStyle())
             .foregroundStyle(.secondary)
             .help("关闭错误")
         }
@@ -490,16 +591,15 @@ private struct ComposerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var isModelDrawerPresented = false
+    @State private var isReasoningSettingsPresented = false
+    @State private var isModelTriggerHovered = false
+    @State private var isReasoningTriggerHovered = false
     @FocusState private var isFocused: Bool
-
-    private var activeVendor: ProviderVendor {
-        appState.activeVendor
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             TextField(
-                isConfigured ? "输入消息" : "连接模型后开始对话",
+                composerPlaceholder,
                 text: $store.draft,
                 axis: .vertical
             )
@@ -507,9 +607,11 @@ private struct ComposerView: View {
             .font(.body)
             .lineLimit(1...6)
             .focused($isFocused)
-            .disabled(!isConfigured || store.isStreaming)
+            .disabled(!isConfigured)
             .onKeyPress(.return, phases: .down) { keyPress in
-                guard !keyPress.modifiers.contains(.command) else { return .ignored }
+                if keyPress.modifiers.contains(.command) {
+                    return store.isStreaming ? .handled : .ignored
+                }
                 store.draft.append("\n")
                 return .handled
             }
@@ -517,7 +619,7 @@ private struct ComposerView: View {
             HStack(spacing: 8) {
                 if isConfigured {
                     modelDrawerTrigger
-                    thinkingToggle
+                    reasoningSettingsTrigger
                 } else {
                     Image(systemName: "lock.fill")
                     Text("API Key 仅保存在本机")
@@ -525,8 +627,12 @@ private struct ComposerView: View {
 
                 Spacer(minLength: 12)
 
-                if isConfigured {
-                    Text("⌘↩︎")
+                if store.isStreaming {
+                    Text("回复生成中")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else if isConfigured {
+                    Text("⌘↩︎ 发送")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 } else {
@@ -538,27 +644,7 @@ private struct ComposerView: View {
                     .buttonStyle(.plain)
                 }
 
-                Button {
-                    if store.isStreaming {
-                        store.stop()
-                    } else {
-                        store.send()
-                    }
-                } label: {
-                    Image(systemName: store.isStreaming ? "stop.fill" : "arrow.up")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
-                        .background(
-                            store.isStreaming ? Color.primary.opacity(0.72) : DiscoTheme.accent,
-                            in: Circle()
-                        )
-                }
-                .buttonStyle(DiscoPressButtonStyle())
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(!store.isStreaming && !store.canSend)
-                .opacity((store.isStreaming || store.canSend) ? 1 : 0.38)
-                .help(store.isStreaming ? "停止生成" : "发送")
+                composerActionButton
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -576,27 +662,123 @@ private struct ComposerView: View {
                 isFocused = true
             }
         }
+        .onChange(of: isModelDrawerPresented) { _, presented in
+            if !presented { isFocused = true }
+        }
+        .onChange(of: isReasoningSettingsPresented) { _, presented in
+            if !presented { isFocused = true }
+        }
     }
 
     // MARK: - 配置行控件
 
-    /// 打开模型抽屉的入口胶囊：显示当前服务商与模型，宽度随文字自适应
+    private var composerPlaceholder: String {
+        if !isConfigured { return "连接模型后开始对话" }
+        return store.isStreaming ? "可继续输入下一条消息" : "输入消息"
+    }
+
+    /// 模型入口直接打开双栏选择器，不再经过综合设置菜单。
     private var modelDrawerTrigger: some View {
-        Button {
+        let backgroundOpacity: Double
+        let borderOpacity: Double
+        if isModelDrawerPresented {
+            backgroundOpacity = 0.20
+            borderOpacity = 0.52
+        } else if isModelTriggerHovered {
+            backgroundOpacity = 0.16
+            borderOpacity = 0.40
+        } else {
+            backgroundOpacity = 0.11
+            borderOpacity = 0.28
+        }
+
+        return Button {
             isModelDrawerPresented = true
         } label: {
-            segmentLabel(modelLabel)
-                .contentTransition(.opacity)
-                .padding(.horizontal, 10)
-                .frame(minHeight: 28)
-                .background(.quaternary, in: Capsule())
+            HStack(spacing: 6) {
+                VendorBrandIcon(vendor: appState.activeVendor)
+                Text(modelLabel)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(DiscoTheme.accent)
+            }
+            .contentTransition(.opacity)
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 11)
+            .frame(minHeight: 30)
+            .background(DiscoTheme.accent.opacity(backgroundOpacity), in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(DiscoTheme.accent.opacity(borderOpacity), lineWidth: 1)
+            }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(DiscoPressButtonStyle())
         .disabled(store.isStreaming)
-        .help("选择服务商与模型")
+        .opacity(store.isStreaming ? 0.52 : 1)
+        .onHover { isModelTriggerHovered = $0 }
+        .help(store.isStreaming ? "回复完成后可切换模型" : "选择服务商与模型")
         .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: modelLabel)
         .popover(isPresented: $isModelDrawerPresented, arrowEdge: .bottom) {
             ModelDrawer(dismiss: { isModelDrawerPresented = false })
+        }
+    }
+
+    private var reasoningSettingsTrigger: some View {
+        let vendor = appState.activeVendor
+        let efforts = appState.reasoningEfforts(for: vendor)
+        let capabilityIsMissing = vendor == .chatgpt
+            && appState.config(for: vendor)?.modelReasoningCapabilities[appState.model] == nil
+        let title = reasoningSelectionTitle(appState: appState, vendor: vendor)
+        let isDisabled = store.isStreaming || (efforts.isEmpty && vendor != .chatgpt)
+        let backgroundOpacity: Double
+        let borderOpacity: Double
+        if isReasoningSettingsPresented {
+            backgroundOpacity = 0.20
+            borderOpacity = 0.54
+        } else if isReasoningTriggerHovered {
+            backgroundOpacity = 0.16
+            borderOpacity = 0.42
+        } else {
+            backgroundOpacity = 0.11
+            borderOpacity = 0.30
+        }
+
+        return Button {
+            isReasoningSettingsPresented = true
+        } label: {
+            HStack(spacing: 5) {
+                if appState.isRefreshingCodexModelCatalog && capabilityIsMissing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(DiscoTheme.reasoningAccent)
+                } else {
+                    Image(systemName: "brain")
+                }
+                Text("\(vendor == .chatgpt || efforts.count > 2 ? "推理" : "思考")：\(title)")
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(DiscoTheme.reasoningAccent)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 30)
+            .background(DiscoTheme.reasoningAccent.opacity(backgroundOpacity), in: Capsule())
+            .overlay {
+                Capsule()
+                    .stroke(DiscoTheme.reasoningAccent.opacity(borderOpacity), lineWidth: 1)
+            }
+        }
+        .buttonStyle(DiscoPressButtonStyle())
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.52 : 1)
+        .onHover { isReasoningTriggerHovered = $0 }
+        .help(store.isStreaming ? "回复完成后可调整推理设置" : "调整推理设置")
+        .popover(isPresented: $isReasoningSettingsPresented, arrowEdge: .bottom) {
+            ReasoningSettingsPopover(dismiss: { isReasoningSettingsPresented = false })
         }
     }
 
@@ -605,38 +787,195 @@ private struct ComposerView: View {
         appState.model.isEmpty ? appState.activeVendor.title : "\(appState.activeVendor.title) · \(appState.model)"
     }
 
-    /// 抽屉入口的标签：文字（不截断）+ 下箭头，宽度随内容自适应
-    private func segmentLabel(_ text: String) -> some View {
-        HStack(spacing: 5) {
-            Text(text)
-                .lineLimit(1)
-            Image(systemName: "chevron.down")
-                .font(.system(size: 8, weight: .semibold))
+    @ViewBuilder
+    private var composerActionButton: some View {
+        if store.isStreaming {
+            Button(action: store.stop) {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 40)
+                    .background(Color.primary.opacity(0.72), in: Circle())
+            }
+            .buttonStyle(DiscoPressButtonStyle())
+            .help("停止生成")
+        } else {
+            Button(action: store.send) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 40)
+                    .background(DiscoTheme.accent, in: Circle())
+            }
+            .buttonStyle(DiscoPressButtonStyle())
+            .keyboardShortcut(.return, modifiers: [.command])
+            .disabled(!store.canSend)
+            .opacity(store.canSend ? 1 : 0.38)
+            .help("发送")
+        }
+    }
+}
+
+/// 独立推理设置菜单，模型切换不再经过这里。
+private struct ReasoningSettingsPopover: View {
+    @EnvironmentObject private var appState: AppState
+
+    let dismiss: () -> Void
+
+    private var vendor: ProviderVendor { appState.activeVendor }
+    private var efforts: [String] { appState.reasoningEfforts(for: vendor) }
+    private var selectedEffort: String? { appState.selectedReasoningEffort(for: vendor) }
+    private var codexCapabilityIsMissing: Bool {
+        vendor == .chatgpt
+            && appState.config(for: vendor)?.modelReasoningCapabilities[appState.model] == nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(vendor == .chatgpt || efforts.count > 2 ? "推理强度" : "思考模式")
+                    .font(.headline)
+                Spacer()
+                Text(reasoningSelectionTitle(appState: appState, vendor: vendor))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            if vendor == .chatgpt && efforts.isEmpty {
+                codexUnavailableState
+            } else {
+                if vendor == .chatgpt {
+                    effortRow(nil)
+                }
+
+                LazyVStack(spacing: 0) {
+                    ForEach(efforts, id: \.self) { effort in
+                        effortRow(effort)
+                    }
+                }
+
+                Divider()
+
+                Button {
+                    appState.resetReasoningSettings(for: vendor)
+                    dismiss()
+                } label: {
+                    Label("恢复默认设置", systemImage: "arrow.counterclockwise")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(DiscoPressButtonStyle())
+            }
+        }
+        .frame(width: 240)
+        .task {
+            guard codexCapabilityIsMissing else { return }
+            await appState.refreshCodexModelCatalogIfNeeded()
         }
     }
 
-    private var thinkingToggle: some View {
-        let isOn = appState.config(for: activeVendor)?.thinkingEnabled ?? true
+    @ViewBuilder
+    private var codexUnavailableState: some View {
+        VStack(spacing: 10) {
+            if appState.isRefreshingCodexModelCatalog {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在读取当前模型的推理能力…")
+                    .foregroundStyle(.secondary)
+            } else if let error = appState.codexModelCatalogError, codexCapabilityIsMissing {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                Button("重新加载") {
+                    Task { await appState.refreshCodexModelCatalogIfNeeded() }
+                }
+            } else if codexCapabilityIsMissing {
+                Text("尚未加载当前模型的推理能力。")
+                    .foregroundStyle(.secondary)
+
+                Button("加载推理强度") {
+                    Task { await appState.refreshCodexModelCatalogIfNeeded() }
+                }
+            } else {
+                Label("当前模型不支持调整推理强度。", systemImage: "brain.head.profile")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .font(.caption)
+        .padding(16)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func effortRow(_ effort: String?) -> some View {
+        let title: String
+        if let effort {
+            title = ProviderVendor.reasoningEffortTitle(effort)
+        } else {
+            title = "默认"
+        }
 
         return Button {
-            appState.setThinkingEnabled(!isOn, for: activeVendor)
+            appState.setReasoningEffort(effort, for: vendor)
+            dismiss()
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "brain")
-                Text("思考")
+            HStack(spacing: 10) {
+                Text(title)
+                Spacer()
+                if selectedEffort == effort {
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(DiscoTheme.reasoningAccent)
+                }
             }
-            .foregroundStyle(isOn ? DiscoTheme.accent : Color.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(
-                isOn ? DiscoTheme.accent.opacity(0.14) : Color.clear,
-                in: Capsule()
-            )
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
         }
         .buttonStyle(DiscoPressButtonStyle())
-        .disabled(store.isStreaming)
-        .help(isOn ? "思考模式已开启，点击关闭" : "思考模式已关闭，点击开启")
     }
+}
+
+private func reasoningSelectionTitle(appState: AppState, vendor: ProviderVendor) -> String {
+    let efforts = appState.reasoningEfforts(for: vendor)
+    if vendor == .chatgpt {
+        let capabilityIsMissing = appState.config(for: vendor)?
+            .modelReasoningCapabilities[appState.model] == nil
+        if capabilityIsMissing && appState.isRefreshingCodexModelCatalog {
+            return "正在加载"
+        }
+        if capabilityIsMissing && appState.codexModelCatalogError != nil {
+            return "不可用"
+        }
+        if capabilityIsMissing {
+            return "待加载"
+        }
+        if efforts.isEmpty {
+            return "不支持"
+        }
+    }
+    guard !efforts.isEmpty else { return "关闭" }
+    let selectedEffort = appState.selectedReasoningEffort(for: vendor)
+    if efforts.count <= 2 {
+        return selectedEffort == "none" ? "关闭" : "开启"
+    }
+    if let selectedEffort {
+        return ProviderVendor.reasoningEffortTitle(selectedEffort)
+    }
+    if let defaultEffort = appState.defaultReasoningEffort(for: vendor) {
+        return ProviderVendor.reasoningEffortTitle(defaultEffort)
+    }
+    return "默认"
 }
 
 /// 模型抽屉：左列选服务商、右列展示该服务商全部模型；选中模型后切换并关闭
@@ -654,7 +993,7 @@ private struct ModelDrawer: View {
     /// 已配置 API Key 的服务商
     private var vendors: [ProviderVendor] {
         ProviderVendor.allCases.filter {
-            $0.isAvailable && appState.config(for: $0)?.hasAPIKey == true
+            $0.isAvailable && $0.isConfigured(appState.config(for: $0))
         }
     }
 
@@ -757,7 +1096,11 @@ private struct ModelDrawer: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if models.isEmpty {
+                if vendor.supportedReasoningEfforts.count > 2 {
+                    Label("支持推理强度", systemImage: "brain")
+                        .font(.caption2)
+                        .foregroundStyle(DiscoTheme.accent)
+                } else if models.isEmpty {
                     Text("尚未加载模型列表")
                         .font(.caption)
                         .foregroundStyle(.tertiary)

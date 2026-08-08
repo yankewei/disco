@@ -2,8 +2,10 @@ import AppKit
 import SwiftUI
 
 enum DiscoTheme {
-    /// 主强调色：柔和蓝灰（单一强调色，其余全部走系统中性色，保持简约）
+    /// 主强调色：柔和蓝灰，用于品牌、模型选择与主要操作。
     static let accent = Color(red: 0.32, green: 0.44, blue: 0.58)
+    /// 推理功能的低饱和梅紫色，与模型入口形成稳定区分，并随系统明暗模式适配。
+    static let reasoningAccent = Color("ReasoningAccent")
     /// 强调色的同色系明/暗变体，仅用于 DiscoMark 的渐变，避免多色噪声
     static let accentLight = Color(red: 0.55, green: 0.65, blue: 0.76)
     static let accentDark = Color(red: 0.20, green: 0.29, blue: 0.42)

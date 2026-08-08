@@ -192,6 +192,36 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(restored.config(for: .openai)?.thinkingEnabled, true)
     }
 
+    func testDeepSeekReasoningEffortSupportsLevelsAndPersistsSelection() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let appState = try makeAppState(defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "deepseek-key",
+            model: "deepseek-v4-flash"
+        )
+
+        XCTAssertEqual(appState.reasoningEfforts(for: .deepseek), ["none", "low", "high", "max"])
+
+        appState.setReasoningEffort("max", for: .deepseek)
+        XCTAssertEqual(appState.selectedReasoningEffort(for: .deepseek), "max")
+        XCTAssertTrue(appState.config(for: .deepseek)?.thinkingEnabled == true)
+
+        let restored = try makeAppState(defaults: defaults)
+        XCTAssertEqual(restored.selectedReasoningEffort(for: .deepseek), "max")
+
+        restored.resetReasoningSettings(for: .deepseek)
+        XCTAssertEqual(restored.selectedReasoningEffort(for: .deepseek), "high")
+
+        restored.setReasoningEffort("none", for: .deepseek)
+        XCTAssertEqual(restored.selectedReasoningEffort(for: .deepseek), "none")
+        XCTAssertFalse(restored.config(for: .deepseek)?.thinkingEnabled == true)
+    }
+
     func testSaveProviderConfigPersistsModelListAndSwitchModel() throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -324,12 +354,246 @@ final class AppStateTests: XCTestCase {
 
 @MainActor
 private func makeAppState(
-    keychain: APIKeyStoring = InMemoryAuthStore(),
-    defaults: UserDefaults
+    keychain: APIKeyStoring? = nil,
+    defaults: UserDefaults,
+    codexTransportFactory: @MainActor @Sendable @escaping () -> CodexAppServerTransport = {
+        CodexAppServerTransport()
+    }
 ) throws -> AppState {
     AppState(
-        keychain: keychain,
+        keychain: keychain ?? InMemoryAuthStore(),
         defaults: defaults,
-        persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
+        persistence: try ConversationPersistence(isStoredInMemoryOnly: true),
+        codexTransportFactory: codexTransportFactory
     )
+}
+
+// MARK: - ChatGPT 订阅（codex app-server）
+
+extension AppStateTests {
+    /// 订阅服务商保存配置：无需 Base URL / API Key，验证通过即视为已连接
+    func testChatGPTSubscriptionSavesWithoutAPIKey() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let keychain = InMemoryAuthStore()
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "  gpt-5.6  ",
+            models: ["gpt-5.6", "gpt-5.6-mini"]
+        )
+
+        let config = appState.config(for: .chatgpt)
+        XCTAssertEqual(config?.baseURL, "")
+        XCTAssertEqual(config?.model, "gpt-5.6")
+        XCTAssertEqual(config?.models, ["gpt-5.6", "gpt-5.6-mini"])
+        XCTAssertFalse(config?.hasAPIKey == true)
+        XCTAssertTrue(ProviderVendor.chatgpt.isConfigured(config))
+        XCTAssertTrue(appState.isActiveVendorConfigured)
+        // 订阅服务商不写入任何 API Key
+        XCTAssertNil(try keychain.load())
+        // 当前没有其他已配置服务商，保存后自动设为当前使用
+        XCTAssertEqual(appState.activeVendor, .chatgpt)
+    }
+
+    /// 重启后 ChatGPT 订阅仍应保持已配置；订阅服务商本来就没有 API Key。
+    func testChatGPTSubscriptionRemainsConfiguredAfterReloadWithoutAPIKey() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let initial = try makeAppState(keychain: InMemoryAuthStore(), defaults: defaults)
+        try initial.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+
+        let restored = try makeAppState(keychain: InMemoryAuthStore(), defaults: defaults)
+
+        XCTAssertFalse(restored.config(for: .chatgpt)?.hasAPIKey == true)
+        XCTAssertTrue(ProviderVendor.chatgpt.isConfigured(restored.config(for: .chatgpt)))
+        XCTAssertTrue(restored.isActiveVendorConfigured)
+        XCTAssertEqual(restored.model, "gpt-5.6")
+    }
+
+    /// 订阅服务商切换模型（setActiveModel 路径）
+    func testChatGPTSubscriptionSwitchModel() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let appState = try makeAppState(defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6", "gpt-5.6-mini"]
+        )
+        appState.setActiveModel("gpt-5.6-mini", for: .chatgpt)
+
+        XCTAssertEqual(appState.config(for: .chatgpt)?.model, "gpt-5.6-mini")
+        XCTAssertEqual(appState.model, "gpt-5.6-mini")
+    }
+
+    /// 移除订阅配置：清空配置且不再视为已连接
+    func testChatGPTSubscriptionDeleteClearsConfiguration() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let appState = try makeAppState(defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+        try appState.deleteProviderAPIKey(vendor: .chatgpt)
+
+        // 与 API Key 服务商一致的删除语义：配置保留但不再视为已连接
+        XCTAssertEqual(appState.config(for: .chatgpt)?.hasAPIKey, false)
+        XCTAssertEqual(appState.config(for: .chatgpt)?.model, "")
+        XCTAssertFalse(appState.hasAPIKey)
+        XCTAssertEqual(appState.model, "")
+    }
+
+    /// Codex 的模型能力与用户选择均应跨应用重启保留；未选择时仍使用服务端默认档位。
+    func testCodexReasoningCapabilityAndSelectionPersist() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let capabilities = [
+            "gpt-5.6": ModelReasoningCapability(
+                supportedEfforts: ["low", "medium", "high"],
+                defaultEffort: "medium"
+            ),
+        ]
+        defaults.set(
+            try JSONEncoder().encode(capabilities),
+            forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey
+        )
+        defaults.set("", forKey: ProviderVendor.chatgpt.baseURLDefaultsKey)
+
+        let appState = try makeAppState(defaults: defaults)
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+
+        XCTAssertEqual(appState.reasoningEfforts(for: .chatgpt), ["low", "medium", "high"])
+        XCTAssertNil(appState.selectedReasoningEffort(for: .chatgpt))
+        XCTAssertEqual(appState.defaultReasoningEffort(for: .chatgpt), "medium")
+
+        appState.setReasoningEffort("high", for: .chatgpt)
+        let restored = try makeAppState(defaults: defaults)
+
+        XCTAssertEqual(restored.selectedReasoningEffort(for: .chatgpt), "high")
+        XCTAssertEqual(restored.defaultReasoningEffort(for: .chatgpt), "medium")
+
+        restored.resetReasoningSettings(for: .chatgpt)
+        XCTAssertNil(restored.selectedReasoningEffort(for: .chatgpt))
+    }
+
+    /// 旧配置没有模型能力目录时，进入聊天页应自动从 model/list 补齐并持久化。
+    func testRefreshCodexModelCatalogBackfillsMissingReasoningCapabilities() async throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let appState = try makeAppState(defaults: defaults) {
+            let process = ScriptedLineProcess(script: handshakeScript() + [
+                .on("model/list") { request in
+                    [rpcResult(request, result: [
+                        "data": [
+                            [
+                                "id": "gpt-5.6",
+                                "model": "gpt-5.6",
+                                "displayName": "GPT-5.6",
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": [
+                                    ["reasoningEffort": "low"],
+                                    ["reasoningEffort": "medium"],
+                                    ["reasoningEffort": "high"],
+                                ],
+                            ],
+                        ],
+                        "nextCursor": "",
+                    ])]
+                },
+            ])
+            return CodexAppServerTransport(process: process, configuration: .standard())
+        }
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+        XCTAssertTrue(appState.reasoningEfforts(for: .chatgpt).isEmpty)
+
+        await appState.refreshCodexModelCatalogIfNeeded()
+
+        XCTAssertEqual(appState.reasoningEfforts(for: .chatgpt), ["low", "medium", "high"])
+        XCTAssertEqual(appState.defaultReasoningEffort(for: .chatgpt), "medium")
+        let data = try XCTUnwrap(
+            defaults.data(forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey)
+        )
+        let persisted = try JSONDecoder().decode(
+            [String: ModelReasoningCapability].self,
+            from: data
+        )
+        XCTAssertEqual(persisted["gpt-5.6"]?.supportedEfforts, ["low", "medium", "high"])
+    }
+
+    /// 能力目录已明确记录空档位时，表示模型不支持调整，不应反复请求 model/list。
+    func testRefreshCodexModelCatalogDoesNotReloadKnownUnsupportedModel() async throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let capabilities = [
+            "gpt-4o": ModelReasoningCapability(supportedEfforts: [], defaultEffort: nil),
+        ]
+        defaults.set(
+            try JSONEncoder().encode(capabilities),
+            forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey
+        )
+        defaults.set("", forKey: ProviderVendor.chatgpt.baseURLDefaultsKey)
+
+        var transportCount = 0
+        let appState = try makeAppState(defaults: defaults) {
+            transportCount += 1
+            return CodexAppServerTransport(
+                process: ScriptedLineProcess(script: handshakeScript()),
+                configuration: .standard()
+            )
+        }
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-4o",
+            models: ["gpt-4o"]
+        )
+        let transportCountBeforeRefresh = transportCount
+
+        await appState.refreshCodexModelCatalogIfNeeded()
+
+        XCTAssertTrue(appState.reasoningEfforts(for: .chatgpt).isEmpty)
+        XCTAssertEqual(transportCount, transportCountBeforeRefresh)
+    }
+
 }

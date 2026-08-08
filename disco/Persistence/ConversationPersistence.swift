@@ -6,6 +6,9 @@ struct ConversationSnapshot {
     let createdAt: Date
     let updatedAt: Date
     let messages: [ChatMessage]
+    /// 订阅服务商（ChatGPT/Codex）的会话线程 id；重启后用于 thread/resume。
+    /// API Key 服务商不使用，始终为 nil。
+    let threadID: String?
 }
 
 @MainActor
@@ -21,11 +24,30 @@ final class ConversationPersistence: ConversationPersisting {
     private let context: ModelContext
 
     init(isStoredInMemoryOnly: Bool = false) throws {
-        let configuration = ModelConfiguration(
-            for: PersistedConversation.self,
-            PersistedMessage.self,
-            isStoredInMemoryOnly: isStoredInMemoryOnly
-        )
+        let configuration: ModelConfiguration
+        if isStoredInMemoryOnly {
+            configuration = ModelConfiguration(
+                for: PersistedConversation.self,
+                PersistedMessage.self,
+                isStoredInMemoryOnly: true
+            )
+        } else {
+            // 显式指定存储位置：~/Library/Application Support/disco/conversations.store
+            // （本应用曾启用 App Sandbox，数据在容器内；关闭沙盒后迁移旧存储，见 migrateFromContainer）
+            let directory = FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first
+                ?? FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Application Support")
+            let storeURL = directory
+                .appendingPathComponent("disco", isDirectory: true)
+                .appendingPathComponent("conversations.store")
+            try Self.migrateContainerStoreIfNeeded(to: storeURL)
+            configuration = ModelConfiguration(
+                "disco",
+                url: storeURL
+            )
+        }
         container = try ModelContainer(
             for: PersistedConversation.self,
             PersistedMessage.self,
@@ -33,6 +55,32 @@ final class ConversationPersistence: ConversationPersisting {
         )
         context = container.mainContext
         context.autosaveEnabled = false
+    }
+
+    /// 沙盒容器内的旧 SwiftData 存储迁移到新位置（关闭 App Sandbox 后）。
+    /// 新位置已存在时不迁移；迁移失败不阻塞启动（空会话可接受）。
+    private static func migrateContainerStoreIfNeeded(to storeURL: URL) throws {
+        guard !FileManager.default.fileExists(atPath: storeURL.path) else { return }
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.yankewei.disco"
+        let containerStore = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers")
+            .appendingPathComponent(bundleID)
+            .appendingPathComponent("Data/Library/Application Support/default.store")
+        guard FileManager.default.fileExists(atPath: containerStore.path) else { return }
+
+        try FileManager.default.createDirectory(
+            at: storeURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        // SwiftData 采用 WAL：连带 -wal / -shm 一起迁移
+        for suffix in ["", "-wal", "-shm"] {
+            let source = URL(fileURLWithPath: containerStore.path + suffix)
+            guard FileManager.default.fileExists(atPath: source.path) else { continue }
+            try FileManager.default.moveItem(
+                at: source,
+                to: URL(fileURLWithPath: storeURL.path + suffix)
+            )
+        }
     }
 
     func loadConversations() throws -> [ConversationSnapshot] {
@@ -58,7 +106,8 @@ final class ConversationPersistence: ConversationPersisting {
                 id: conversation.id,
                 createdAt: conversation.createdAt,
                 updatedAt: conversation.updatedAt,
-                messages: messages
+                messages: messages,
+                threadID: conversation.threadID
             )
         }
     }
@@ -81,6 +130,7 @@ final class ConversationPersistence: ConversationPersisting {
         }
 
         persistedConversation.updatedAt = conversation.updatedAt
+        persistedConversation.threadID = conversation.threadID
 
         let existingMessages = Dictionary(
             uniqueKeysWithValues: persistedConversation.messages.map { ($0.id, $0) }
@@ -147,13 +197,16 @@ private final class PersistedConversation {
     @Attribute(.unique) var id: UUID
     var createdAt: Date
     var updatedAt: Date
+    /// 订阅服务商的会话线程 id（其余服务商为 nil）
+    var threadID: String?
     @Relationship(deleteRule: .cascade, inverse: \PersistedMessage.conversation)
     var messages: [PersistedMessage] = []
 
-    init(id: UUID, createdAt: Date, updatedAt: Date) {
+    init(id: UUID, createdAt: Date, updatedAt: Date, threadID: String? = nil) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.threadID = threadID
     }
 }
 

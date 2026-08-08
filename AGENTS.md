@@ -94,7 +94,8 @@ discoTests/                   # XCTest 单元测试，@testable import disco
 
 ## 安全注意事项
 
-- API Key 明文存储在沙盒容器的 Application Support 目录：`~/Library/Containers/<bundle-id>/Data/Library/Application Support/disco/config/auth.json`（0600 权限、原子写入），按服务商 account 隔离。旧版位于容器根 `~/.disco/config/auth.json` 的文件会在首次读取时自动迁移。这是当前 MVP 的明确取舍（对齐 gh/aws CLI 的做法），蓝图中的 Keychain 方案尚未实施——不要假设 Keychain 已在使用。
+- API Key 明文存储在 Application Support 目录：`~/Library/Application Support/disco/config/auth.json`（0600 权限、原子写入），按服务商 account 隔离。旧版位于沙盒容器（`~/Library/Containers/<bundle-id>/Data/Library/Application Support/disco/config/auth.json`，本应用曾启用 App Sandbox）与更早的 `~/.disco/config/auth.json` 的文件会在首次读取时自动迁移。这是当前 MVP 的明确取舍（对齐 gh/aws CLI 的做法），蓝图中的 Keychain 方案尚未实施——不要假设 Keychain 已在使用。
+- 应用不启用 App Sandbox（ADR-006：不以 Mac App Store 沙箱为目标），因此可以拉起本地 `codex app-server` 子进程复用 ChatGPT/Codex 订阅；即便无沙箱，应用自身仍保持最小权限边界（Base URL 强制 HTTPS、凭据文件 0600、日志脱敏）。
 - 凭据不得写入 UserDefaults、SwiftData 或日志。
 - Base URL 强制 HTTPS，配置错误直接拒绝保存（`APIConfigurationError`）。
 - `.gitignore` 仅忽略 Xcode 用户态文件与 `.reasonix/`；不要提交任何含真实 Key 的文件。

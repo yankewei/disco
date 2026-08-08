@@ -7,6 +7,19 @@ struct ModelRequest: Sendable {
     let messages: [ChatMessage]
     let model: String
     let reasoningEnabled: Bool
+    let reasoningEffort: String?
+
+    init(
+        messages: [ChatMessage],
+        model: String,
+        reasoningEnabled: Bool,
+        reasoningEffort: String? = nil
+    ) {
+        self.messages = messages
+        self.model = model
+        self.reasoningEnabled = reasoningEnabled
+        self.reasoningEffort = reasoningEffort
+    }
 }
 
 /// Provider 输出的统一模型事件（ADR-002：统一事件，保留 provider 私有 DTO）。

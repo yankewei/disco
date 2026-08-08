@@ -8,7 +8,7 @@ final class ConversationStoreTests: XCTestCase {
         let persisted = StreamRecorder()
         let store = ConversationStore(
             messages: [ChatMessage(role: .user, text: "之前的问题")],
-            onMessagesChanged: { messages in
+            onMessagesChanged: { messages, _ in
                 Task { await persisted.record(messages) }
             }
         )
@@ -145,6 +145,50 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.reasoning, "先分析再回答")
         XCTAssertEqual(store.messages.last?.text, "最终回答")
         XCTAssertNil(store.errorMessage)
+    }
+
+    func testRegenerateLastResponseReusesLastUserMessageAndReplacesAnswer() async throws {
+        let recorder = StreamRecorder()
+        let store = ConversationStore(messages: [
+            ChatMessage(role: .user, text: "保留的上下文"),
+            ChatMessage(role: .assistant, text: "之前的回答"),
+            ChatMessage(role: .user, text: "重新回答这个问题"),
+            ChatMessage(role: .assistant, text: "需要替换的回答"),
+        ])
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: recorder,
+                result: .success([.textDelta("新的回答")])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
+
+        XCTAssertTrue(store.canRegenerateLastResponse)
+        store.regenerateLastResponse()
+        try await waitUntilStreamingFinishes(store)
+
+        let receivedMessages = await recorder.messages
+        XCTAssertEqual(
+            receivedMessages.map(\.text),
+            ["保留的上下文", "之前的回答", "重新回答这个问题"]
+        )
+        XCTAssertEqual(
+            store.messages.map(\.text),
+            ["保留的上下文", "之前的回答", "重新回答这个问题", "新的回答"]
+        )
+        XCTAssertTrue(store.canRegenerateLastResponse)
+    }
+
+    func testClearStartsANewCodexThread() {
+        let store = ConversationStore(
+            messages: [ChatMessage(role: .user, text: "旧消息")],
+            threadID: "thr_old"
+        )
+
+        store.clear()
+
+        XCTAssertTrue(store.messages.isEmpty)
+        XCTAssertNil(store.threadID)
     }
 
     private func waitUntilStreamingFinishes(_ store: ConversationStore) async throws {

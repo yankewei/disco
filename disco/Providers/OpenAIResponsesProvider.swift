@@ -69,7 +69,8 @@ struct OpenAIResponsesProvider: ModelProvider {
                             stream: true,
                             store: false,
                             reasoning: ReasoningConfig(
-                                effort: request.reasoningEnabled ? .high : .none
+                                effort: request.reasoningEffort
+                                    ?? (request.reasoningEnabled ? "high" : "none")
                             )
                         )
                     )
@@ -196,12 +197,7 @@ private struct ResponsesRequestBody: Encodable {
 }
 
 private struct ReasoningConfig: Encodable {
-    let effort: ReasoningEffort
-}
-
-private enum ReasoningEffort: String, Encodable {
-    case high
-    case none
+    let effort: String
 }
 
 private struct InputMessage: Encodable {

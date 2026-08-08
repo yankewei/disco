@@ -12,13 +12,15 @@ struct ConversationSession: Identifiable {
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         messages: [ChatMessage] = [],
-        onMessagesChanged: @escaping ([ChatMessage]) -> Void = { _ in }
+        threadID: String? = nil,
+        onMessagesChanged: @escaping ([ChatMessage], String?) -> Void = { _, _ in }
     ) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         store = ConversationStore(
             messages: messages,
+            threadID: threadID,
             onMessagesChanged: onMessagesChanged
         )
     }
