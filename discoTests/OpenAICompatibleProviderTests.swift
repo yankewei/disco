@@ -377,7 +377,7 @@ private extension URLProtocol {
 private extension OpenAICompatibleProviderTests {
     func streamText(
         _ provider: OpenAIResponsesProvider,
-        model: String = OpenAIResponsesProvider.defaultModel,
+        model: String,
         reasoningEnabled: Bool = true,
         reasoningEffort: String? = nil
     ) async throws -> String {

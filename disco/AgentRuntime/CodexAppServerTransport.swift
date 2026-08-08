@@ -293,7 +293,6 @@ final class CodexAppServerTransport {
     }
 
     private struct PendingRequest {
-        let method: String
         let continuation: CheckedContinuation<CodexJSONValue, Error>
         var timeoutTask: Task<Void, Never>?
     }
@@ -344,7 +343,7 @@ final class CodexAppServerTransport {
     func start() async throws {
         guard !isInitialized else { throw CodexAppServerError.alreadyInitialized }
         isStopping = false
-        if process == nil || process?.isRunning == false {
+        if process?.isRunning != true {
             process = processFactory()
         }
         guard let process else { throw CodexAppServerError.stopped }
@@ -597,12 +596,13 @@ final class CodexAppServerTransport {
     private func handleNotification(method: String, params: CodexJSONValue?) {
         switch method {
         case "turn/started":
-            decode(params, as: CodexTurnStartedNotification.self).map(handleTurnStarted)
+            guard let notification = decode(params, as: CodexTurnStartedNotification.self) else { return }
+            handleTurnStarted(notification)
         case "item/started":
-            decode(params, as: CodexItemLifecycleNotification.self).map { lifecycle in
-                guard let active = activeTurns[lifecycle.threadId], let itemID = lifecycle.itemID else { return }
-                active.continuation.yield(.itemStarted(itemID: itemID, itemType: lifecycle.itemType))
-            }
+            guard let lifecycle = decode(params, as: CodexItemLifecycleNotification.self),
+                  let active = activeTurns[lifecycle.threadId],
+                  let itemID = lifecycle.itemID else { return }
+            active.continuation.yield(.itemStarted(itemID: itemID, itemType: lifecycle.itemType))
         case "item/agentMessage/delta":
             if let delta = decode(params, as: CodexAgentMessageDeltaNotification.self) {
                 activeTurns[delta.threadId]?.continuation.yield(.agentMessageDelta(delta.delta))
@@ -612,12 +612,13 @@ final class CodexAppServerTransport {
                 activeTurns[delta.threadId]?.continuation.yield(.reasoningSummaryDelta(delta.delta))
             }
         case "item/completed":
-            decode(params, as: CodexItemLifecycleNotification.self).map { lifecycle in
-                guard let active = activeTurns[lifecycle.threadId], let itemID = lifecycle.itemID else { return }
-                active.continuation.yield(.itemCompleted(itemID: itemID, itemType: lifecycle.itemType))
-            }
+            guard let lifecycle = decode(params, as: CodexItemLifecycleNotification.self),
+                  let active = activeTurns[lifecycle.threadId],
+                  let itemID = lifecycle.itemID else { return }
+            active.continuation.yield(.itemCompleted(itemID: itemID, itemType: lifecycle.itemType))
         case "turn/completed":
-            decode(params, as: CodexTurnCompletedNotification.self).map(handleTurnCompleted)
+            guard let notification = decode(params, as: CodexTurnCompletedNotification.self) else { return }
+            handleTurnCompleted(notification)
         default:
             break
         }
@@ -696,7 +697,7 @@ final class CodexAppServerTransport {
 
         let value = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<CodexJSONValue, Error>) in
-            pending[id] = PendingRequest(method: method, continuation: continuation, timeoutTask: nil)
+            pending[id] = PendingRequest(continuation: continuation, timeoutTask: nil)
             let timeoutTask = Task { @MainActor [weak self] in
                 do {
                     try await Task.sleep(for: self?.configuration.requestTimeout ?? .seconds(30))

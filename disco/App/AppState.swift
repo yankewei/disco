@@ -372,12 +372,15 @@ final class AppState: ObservableObject {
 
     func setThinkingEnabled(_ enabled: Bool, for vendor: ProviderVendor) {
         guard var config = providerConfigs[vendor] else { return }
-        let syncedEffort: String? = if vendor.requiresAPIKey {
-            enabled
-                ? (config.reasoningEffort == "none" ? "high" : config.reasoningEffort ?? "high")
-                : "none"
+        let syncedEffort: String?
+        if !vendor.requiresAPIKey {
+            syncedEffort = config.reasoningEffort
+        } else if !enabled {
+            syncedEffort = "none"
+        } else if config.reasoningEffort == "none" {
+            syncedEffort = "high"
         } else {
-            config.reasoningEffort
+            syncedEffort = config.reasoningEffort ?? "high"
         }
         guard config.thinkingEnabled != enabled || config.reasoningEffort != syncedEffort else {
             return
@@ -429,12 +432,10 @@ final class AppState: ObservableObject {
         if vendor.requiresAPIKey {
             guard let effort, supported.contains(effort) else { return }
             config.thinkingEnabled = effort != "none"
-        } else {
-            guard effort == nil || supported.contains(effort!) else { return }
+        } else if let effort {
+            guard supported.contains(effort) else { return }
         }
-        guard config.reasoningEffort != effort || (vendor.requiresAPIKey && config.thinkingEnabled != (effort != "none")) else {
-            return
-        }
+        guard config.reasoningEffort != effort else { return }
         config.reasoningEffort = effort
         var updated = providerConfigs
         updated[vendor] = config
@@ -621,8 +622,7 @@ final class AppState: ObservableObject {
         return transport
     }
 
-    private func makeProvider(vendor: ProviderVendor? = nil) -> OpenAIResponsesProvider? {
-        let vendor = vendor ?? activeVendor
+    private func makeProvider(vendor: ProviderVendor) -> OpenAIResponsesProvider? {
         guard let config = providerConfigs[vendor],
               config.hasAPIKey,
               let providerBaseURL = try? Self.validatedBaseURL(config.baseURL),

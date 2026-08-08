@@ -105,6 +105,8 @@ final class CodexRuntime: AgentRuntime {
         request: AgentRunRequest,
         continuation: AsyncThrowingStream<AgentEvent, Error>.Continuation
     ) async {
+        defer { continuation.finish() }
+
         var didEmitTerminal = false
         func emitTerminal(_ event: AgentEvent) {
             guard !didEmitTerminal else { return }
@@ -116,14 +118,12 @@ final class CodexRuntime: AgentRuntime {
             try await ensureReady()
             guard !Task.isCancelled else {
                 emitTerminal(.runCancelled(runID))
-                continuation.finish()
                 return
             }
 
             let input = request.messages.last(where: { $0.role == .user })?.text ?? ""
             guard let threadID else {
                 emitTerminal(.runFailed(runID, AgentFailure(message: "Codex 会话线程尚未就绪。")))
-                continuation.finish()
                 return
             }
             var hasText = false
@@ -134,9 +134,7 @@ final class CodexRuntime: AgentRuntime {
             ) {
                 try Task.checkCancellation()
                 switch turnEvent {
-                case .started:
-                    break
-                case .itemStarted, .itemCompleted:
+                case .started, .itemStarted, .itemCompleted:
                     break
                 case let .agentMessageDelta(delta):
                     hasText = true
@@ -154,7 +152,6 @@ final class CodexRuntime: AgentRuntime {
                     case let .failed(message):
                         emitTerminal(.runFailed(runID, AgentFailure(message: message)))
                     }
-                    continuation.finish()
                     return
                 }
             }
@@ -165,16 +162,12 @@ final class CodexRuntime: AgentRuntime {
             } else {
                 emitTerminal(.runFailed(runID, AgentFailure(message: "turn 未正常结束。")))
             }
-            continuation.finish()
         } catch is CancellationError {
             emitTerminal(.runCancelled(runID))
-            continuation.finish()
         } catch let error as URLError where error.code == .cancelled {
             emitTerminal(.runCancelled(runID))
-            continuation.finish()
         } catch {
             emitTerminal(.runFailed(runID, AgentFailure(message: error.localizedDescription)))
-            continuation.finish()
         }
     }
 

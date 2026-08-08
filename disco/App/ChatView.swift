@@ -679,8 +679,18 @@ private struct ComposerView: View {
 
     /// 模型入口直接打开双栏选择器，不再经过综合设置菜单。
     private var modelDrawerTrigger: some View {
-        let backgroundOpacity = isModelDrawerPresented ? 0.20 : (isModelTriggerHovered ? 0.16 : 0.11)
-        let borderOpacity = isModelDrawerPresented ? 0.52 : (isModelTriggerHovered ? 0.40 : 0.28)
+        let backgroundOpacity: Double
+        let borderOpacity: Double
+        if isModelDrawerPresented {
+            backgroundOpacity = 0.20
+            borderOpacity = 0.52
+        } else if isModelTriggerHovered {
+            backgroundOpacity = 0.16
+            borderOpacity = 0.40
+        } else {
+            backgroundOpacity = 0.11
+            borderOpacity = 0.28
+        }
 
         return Button {
             isModelDrawerPresented = true
@@ -723,8 +733,18 @@ private struct ComposerView: View {
             && appState.config(for: vendor)?.modelReasoningCapabilities[appState.model] == nil
         let title = reasoningSelectionTitle(appState: appState, vendor: vendor)
         let isDisabled = store.isStreaming || (efforts.isEmpty && vendor != .chatgpt)
-        let backgroundOpacity = isReasoningSettingsPresented ? 0.20 : (isReasoningTriggerHovered ? 0.16 : 0.11)
-        let borderOpacity = isReasoningSettingsPresented ? 0.54 : (isReasoningTriggerHovered ? 0.42 : 0.30)
+        let backgroundOpacity: Double
+        let borderOpacity: Double
+        if isReasoningSettingsPresented {
+            backgroundOpacity = 0.20
+            borderOpacity = 0.54
+        } else if isReasoningTriggerHovered {
+            backgroundOpacity = 0.16
+            borderOpacity = 0.42
+        } else {
+            backgroundOpacity = 0.11
+            borderOpacity = 0.30
+        }
 
         return Button {
             isReasoningSettingsPresented = true
@@ -897,12 +917,19 @@ private struct ReasoningSettingsPopover: View {
     }
 
     private func effortRow(_ effort: String?) -> some View {
-        Button {
+        let title: String
+        if let effort {
+            title = ProviderVendor.reasoningEffortTitle(effort)
+        } else {
+            title = "默认"
+        }
+
+        return Button {
             appState.setReasoningEffort(effort, for: vendor)
             dismiss()
         } label: {
             HStack(spacing: 10) {
-                Text(effort.map(ProviderVendor.reasoningEffortTitle) ?? "默认")
+                Text(title)
                 Spacer()
                 if selectedEffort == effort {
                     Image(systemName: "checkmark")

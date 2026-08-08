@@ -22,28 +22,40 @@ enum CodexJSONValue: Codable, Equatable, Sendable {
     case null
 
     init(from decoder: Decoder) throws {
-        if let container = try? decoder.singleValueContainer(), container.decodeNil() {
-            self = .null
-        } else if let container = try? decoder.singleValueContainer(), let value = try? container.decode(Bool.self) {
-            self = .boolean(value)
-        } else if let container = try? decoder.singleValueContainer(), let value = try? container.decode(Double.self) {
-            self = .number(value)
-        } else if let container = try? decoder.singleValueContainer(), let value = try? container.decode(String.self) {
-            self = .string(value)
-        } else if var container = try? decoder.unkeyedContainer() {
+        if let container = try? decoder.singleValueContainer() {
+            if container.decodeNil() {
+                self = .null
+                return
+            }
+            if let value = try? container.decode(Bool.self) {
+                self = .boolean(value)
+                return
+            }
+            if let value = try? container.decode(Double.self) {
+                self = .number(value)
+                return
+            }
+            if let value = try? container.decode(String.self) {
+                self = .string(value)
+                return
+            }
+        }
+
+        if var container = try? decoder.unkeyedContainer() {
             var values: [CodexJSONValue] = []
             while !container.isAtEnd {
                 values.append(try container.decode(CodexJSONValue.self))
             }
             self = .array(values)
-        } else {
-            let container = try decoder.container(keyedBy: DynamicCodingKey.self)
-            var values: [String: CodexJSONValue] = [:]
-            for key in container.allKeys {
-                values[key.stringValue] = try container.decode(CodexJSONValue.self, forKey: key)
-            }
-            self = .object(values)
+            return
         }
+
+        let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+        var values: [String: CodexJSONValue] = [:]
+        for key in container.allKeys {
+            values[key.stringValue] = try container.decode(CodexJSONValue.self, forKey: key)
+        }
+        self = .object(values)
     }
 
     func encode(to encoder: Encoder) throws {

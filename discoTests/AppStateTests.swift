@@ -354,14 +354,14 @@ final class AppStateTests: XCTestCase {
 
 @MainActor
 private func makeAppState(
-    keychain: APIKeyStoring = InMemoryAuthStore(),
+    keychain: APIKeyStoring? = nil,
     defaults: UserDefaults,
-    codexTransportFactory: @MainActor @escaping () -> CodexAppServerTransport = {
+    codexTransportFactory: @MainActor @Sendable @escaping () -> CodexAppServerTransport = {
         CodexAppServerTransport()
     }
 ) throws -> AppState {
     AppState(
-        keychain: keychain,
+        keychain: keychain ?? InMemoryAuthStore(),
         defaults: defaults,
         persistence: try ConversationPersistence(isStoredInMemoryOnly: true),
         codexTransportFactory: codexTransportFactory

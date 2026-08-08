@@ -1089,14 +1089,21 @@ private struct VendorDetailPanel: View {
 
     private var thinkingRow: some View {
         let efforts = appState.reasoningEfforts(for: vendor)
+        let supportsMultipleEfforts = efforts.count > 2
+        let caption: String
+        if config == nil {
+            caption = "完成配置后可调整"
+        } else if supportsMultipleEfforts {
+            caption = "选择关闭、低、高或最高"
+        } else {
+            caption = "开启后该服务商的请求会先进行推理"
+        }
         return SettingInputRow(
             icon: "brain",
-            title: efforts.count > 2 ? "推理强度" : "思考模式",
-            caption: config == nil
-                ? "完成配置后可调整"
-                : efforts.count > 2 ? "选择关闭、低、高或最高" : "开启后该服务商的请求会先进行推理"
+            title: supportsMultipleEfforts ? "推理强度" : "思考模式",
+            caption: caption
         ) {
-            if efforts.count > 2 {
+            if supportsMultipleEfforts {
                 Picker(
                     "推理强度",
                     selection: Binding(
