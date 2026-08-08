@@ -262,7 +262,7 @@ private struct MessageRow: View {
                             switch part {
                             case let .text(content):
                                 if !content.text.isEmpty {
-                                    MarkdownView(content.citationMarkdown)
+                                    MarkdownView(content.text)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             case let .reasoning(reasoning):
@@ -273,13 +273,10 @@ private struct MessageRow: View {
                             case let .toolCall(call):
                                 ToolCallRow(call: call)
                             case let .hostedTool(tool):
-                                HostedWebSearchRow(tool: tool)
+                                HostedWebSearchRow(tool: tool, isStreaming: isStreaming)
                             }
                         }
 
-                        if !message.sources.isEmpty {
-                            MessageSourcesSection(sources: message.sources)
-                        }
 
                         if !message.text.isEmpty {
                             HStack(spacing: 4) {
@@ -380,19 +377,23 @@ private struct ShimmerModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         TimelineView(.animation(minimumInterval: 1 / 30, paused: reduceMotion)) { context in
-            let progress = context.date.timeIntervalSinceReferenceDate
-                .truncatingRemainder(dividingBy: duration) / duration
-            let position = -0.4 + progress * 1.8
+            if reduceMotion {
+                content
+            } else {
+                let progress = context.date.timeIntervalSinceReferenceDate
+                    .truncatingRemainder(dividingBy: duration) / duration
+                let position = -0.4 + progress * 1.8
 
-            content
-                .overlay {
-                    LinearGradient(
-                        colors: [.clear, Color.primary.opacity(0.85), .clear],
-                        startPoint: UnitPoint(x: position - 0.25, y: 0.5),
-                        endPoint: UnitPoint(x: position + 0.25, y: 0.5)
-                    )
-                }
-                .mask(content)
+                content
+                    .overlay {
+                        LinearGradient(
+                            colors: [.clear, Color.primary.opacity(0.85), .clear],
+                            startPoint: UnitPoint(x: position - 0.25, y: 0.5),
+                            endPoint: UnitPoint(x: position + 0.25, y: 0.5)
+                        )
+                    }
+                    .mask(content)
+            }
         }
     }
 }
@@ -504,6 +505,7 @@ private struct ReasoningDisclosure: View {
 /// 供应商托管的网络搜索块；只展示状态，不参与本地 Tool 审批或执行。
 private struct HostedWebSearchRow: View {
     let tool: HostedToolSnapshot
+    let isStreaming: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
@@ -518,11 +520,13 @@ private struct HostedWebSearchRow: View {
                 HStack(spacing: 6) {
                     Image(systemName: "globe.badge.magnifyingglass")
                         .font(.system(size: 11, weight: .medium))
-                    Text(statusTitle)
-                        .font(.caption.weight(.medium))
-                        .modifier(ShimmerModifier(
-                            reduceMotion: reduceMotion || tool.status == .completed
-                        ))
+                    if let statusTitle {
+                        Text(statusTitle)
+                            .font(.caption.weight(.medium))
+                            .modifier(ShimmerModifier(
+                                reduceMotion: reduceMotion || tool.status == .completed
+                            ))
+                    }
                     if let summary = actionSummary {
                         Text("· \(summary)")
                             .font(.caption)
@@ -548,9 +552,6 @@ private struct HostedWebSearchRow: View {
                     if let action = tool.action {
                         HostedToolActionDetails(action: action)
                     }
-                    ForEach(Array(tool.sources.enumerated()), id: \.offset) { _, source in
-                        SourceLink(source: source)
-                    }
                 }
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -563,11 +564,12 @@ private struct HostedWebSearchRow: View {
         .padding(.leading, 8)
     }
 
-    private var statusTitle: String {
+    private var statusTitle: String? {
+        guard isStreaming || tool.status == .completed else { return nil }
         switch tool.status {
-        case .inProgress: "准备搜索网络"
-        case .searching: "正在搜索网络"
-        case .completed: "已完成网络搜索"
+        case .inProgress: return "准备搜索网络"
+        case .searching: return "正在搜索网络"
+        case .completed: return "已完成网络搜索"
         }
     }
 
@@ -581,7 +583,7 @@ private struct HostedWebSearchRow: View {
     }
 
     private var hasDetails: Bool {
-        tool.action != nil || !tool.sources.isEmpty
+        tool.action != nil
     }
 
     private var accessibilityTitle: String {
@@ -607,64 +609,6 @@ private struct HostedToolActionDetails: View {
         case let .findInPage(url, pattern):
             Label("在 \(URL(string: url)?.host ?? url) 中查找“\(pattern)”", systemImage: "text.magnifyingglass")
         }
-    }
-}
-
-private struct MessageSourcesSection: View {
-    let sources: [HostedToolSource]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Label("来源", systemImage: "link")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            ForEach(Array(sources.enumerated()), id: \.offset) { index, source in
-                HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Text("\(index + 1).")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                    SourceLink(source: source)
-                }
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color.primary.opacity(0.04),
-            in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
-        )
-        .accessibilityElement(children: .contain)
-    }
-}
-
-private struct SourceLink: View {
-    let source: HostedToolSource
-
-    var body: some View {
-        if let url = URL(string: source.url),
-           let scheme = url.scheme?.lowercased(),
-           scheme == "https" || scheme == "http" {
-            Link(destination: url) {
-                Label(title, systemImage: "arrow.up.right.square")
-                    .font(.caption)
-                    .lineLimit(2)
-            }
-            .buttonStyle(.plain)
-        } else {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-        }
-    }
-
-    private var title: String {
-        if let title = source.title?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !title.isEmpty {
-            return title
-        }
-        return URL(string: source.url)?.host ?? source.url
     }
 }
 
