@@ -17,11 +17,18 @@ final class GenericAgentRuntime: AgentRuntime {
         let model: String
         let reasoningEnabled: Bool
         let reasoningEffort: String?
+        let hostedTools: Set<HostedToolKind>
 
-        init(model: String, reasoningEnabled: Bool, reasoningEffort: String? = nil) {
+        init(
+            model: String,
+            reasoningEnabled: Bool,
+            reasoningEffort: String? = nil,
+            hostedTools: Set<HostedToolKind> = []
+        ) {
             self.model = model
             self.reasoningEnabled = reasoningEnabled
             self.reasoningEffort = reasoningEffort
+            self.hostedTools = hostedTools
         }
     }
 
@@ -59,7 +66,8 @@ final class GenericAgentRuntime: AgentRuntime {
                             messages: request.messages,
                             model: configuration.model,
                             reasoningEnabled: configuration.reasoningEnabled,
-                            reasoningEffort: configuration.reasoningEffort
+                            reasoningEffort: configuration.reasoningEffort,
+                            hostedTools: configuration.hostedTools
                         )
                     ) {
                         try Task.checkCancellation()
@@ -69,6 +77,10 @@ final class GenericAgentRuntime: AgentRuntime {
                             continuation.yield(.messageDelta(delta))
                         case let .reasoningDelta(delta):
                             continuation.yield(.reasoningDelta(delta))
+                        case let .hostedToolUpdated(snapshot):
+                            continuation.yield(.hostedToolUpdated(snapshot))
+                        case let .citationAdded(citation):
+                            continuation.yield(.citationAdded(citation))
                         }
                     }
 

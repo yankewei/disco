@@ -147,6 +147,82 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.errorMessage)
     }
 
+    func testHostedSearchUpdatesInPlaceAndKeepsCitation() async throws {
+        let store = ConversationStore()
+        let searching = HostedToolSnapshot(
+            id: "ws_1",
+            kind: .webSearch,
+            status: .searching,
+            action: .search(queries: ["Swift 最新版本"]),
+            sources: []
+        )
+        let completed = HostedToolSnapshot(
+            id: "ws_1",
+            kind: .webSearch,
+            status: .completed,
+            action: searching.action,
+            sources: [HostedToolSource(url: "https://swift.org", title: "Swift")]
+        )
+        let citation = TextCitation(
+            startIndex: 0,
+            endIndex: 5,
+            url: "https://swift.org",
+            title: "Swift"
+        )
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([
+                    .hostedToolUpdated(searching),
+                    .textDelta("Swift 最新版本"),
+                    .citationAdded(citation),
+                    .hostedToolUpdated(completed),
+                ])
+            ),
+            configuration: .init(
+                model: "test-model",
+                reasoningEnabled: true,
+                hostedTools: [.webSearch]
+            )
+        ))
+        store.draft = "查一下 Swift"
+
+        store.send()
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.last?.parts, [
+            .hostedTool(completed),
+            .text(TextContent(text: "Swift 最新版本", citations: [citation])),
+        ])
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testToolOnlyFailureKeepsSearchActivity() async throws {
+        let store = ConversationStore()
+        let search = HostedToolSnapshot(
+            id: "ws_1",
+            kind: .webSearch,
+            status: .searching,
+            action: .search(queries: ["无法完成的搜索"]),
+            sources: []
+        )
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([.hostedToolUpdated(search)])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
+        store.draft = "搜索"
+
+        store.send()
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.last?.parts, [.hostedTool(search)])
+        XCTAssertEqual(store.errorMessage, AgentFailure.noTextOutput.message)
+        XCTAssertTrue(store.canRetry)
+    }
+
     func testRegenerateLastResponseReusesLastUserMessageAndReplacesAnswer() async throws {
         let recorder = StreamRecorder()
         let store = ConversationStore(messages: [

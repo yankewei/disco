@@ -32,7 +32,10 @@ final class ConversationStore: ObservableObject {
     }
 
     var canRetry: Bool {
-        !isStreaming && errorMessage != nil && messages.last?.role == .user
+        guard !isStreaming, errorMessage != nil, let last = messages.last else { return false }
+        if last.role == .user { return true }
+        return last.role == .assistant
+            && messages.dropLast().last?.role == .user
     }
 
     var canRegenerateLastResponse: Bool {
@@ -108,17 +111,25 @@ final class ConversationStore: ObservableObject {
             guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
             messages[index].appendReasoning(delta)
             schedulePersistence()
+        case let .hostedToolUpdated(snapshot):
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].upsertHostedTool(snapshot)
+            schedulePersistence()
+        case let .citationAdded(citation):
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].appendCitation(citation)
+            schedulePersistence()
         case let .runFailed(_, failure):
             errorMessage = failure.message
             removeEmptyPlaceholder(assistantID)
-        case .reasoningDelta, .runCompleted, .runCancelled:
+        case .runCompleted, .runCancelled:
             break
         }
     }
 
     private func removeEmptyPlaceholder(_ assistantID: UUID) {
         guard let index = messages.firstIndex(where: { $0.id == assistantID }),
-              messages[index].text.isEmpty else { return }
+              messages[index].isEmpty else { return }
         messages.remove(at: index)
     }
 
@@ -135,7 +146,7 @@ final class ConversationStore: ObservableObject {
         cancelRequest()
 
         var removedPlaceholder = false
-        if let last = messages.last, last.role == .assistant, last.text.isEmpty {
+        if let last = messages.last, last.role == .assistant, last.isEmpty {
             messages.removeLast()
             removedPlaceholder = true
         }
@@ -160,8 +171,14 @@ final class ConversationStore: ObservableObject {
 
     func retryLastMessage() {
         guard canRetry, let lastMessage = messages.last else { return }
-        messages.removeLast()
-        draft = lastMessage.text
+        if lastMessage.role == .assistant {
+            messages.removeLast()
+            guard let userMessage = messages.popLast(), userMessage.role == .user else { return }
+            draft = userMessage.text
+        } else {
+            messages.removeLast()
+            draft = lastMessage.text
+        }
         send()
     }
 

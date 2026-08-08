@@ -3,6 +3,15 @@ import XCTest
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    func testHostedWebSearchCapabilitiesAreVendorAndModelSpecific() {
+        XCTAssertEqual(ProviderVendor.openai.hostedTools(for: "gpt-5.6"), [.webSearch])
+        XCTAssertEqual(ProviderVendor.deepseek.hostedTools(for: "deepseek-v4-flash"), [.webSearch])
+        XCTAssertTrue(ProviderVendor.deepseek.hostedTools(for: "deepseek-v4-pro").isEmpty)
+        XCTAssertTrue(ProviderVendor.moonshot.hostedTools(for: "kimi-latest").isEmpty)
+        XCTAssertTrue(ProviderVendor.zhipu.hostedTools(for: "glm-5").isEmpty)
+        XCTAssertTrue(ProviderVendor.chatgpt.hostedTools(for: "gpt-5.6-codex").isEmpty)
+    }
+
     func testSaveConfigurationTrimsValuesPersistsThemAndUsesStoredKey() throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

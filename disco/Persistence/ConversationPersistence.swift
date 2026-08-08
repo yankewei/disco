@@ -92,14 +92,15 @@ final class ConversationPersistence: ConversationPersisting {
                 .sorted { $0.position < $1.position }
                 .compactMap { message -> ChatMessage? in
                     guard let role = ChatMessage.Role(rawValue: message.role) else { return nil }
-                    return ChatMessage(
+                    return Self.restoreMessage(
                         id: message.id,
                         role: role,
                         text: message.text,
-                        reasoning: message.reasoning
+                        reasoning: message.reasoning,
+                        partsData: message.partsData
                     )
                 }
-            if messages.last?.role == .assistant, messages.last?.text.isEmpty == true {
+            if messages.last?.role == .assistant, messages.last?.isEmpty == true {
                 messages.removeLast()
             }
             return ConversationSnapshot(
@@ -146,6 +147,7 @@ final class ConversationPersistence: ConversationPersisting {
                 persistedMessage.role = message.role.rawValue
                 persistedMessage.text = message.text
                 persistedMessage.reasoning = message.reasoning
+                persistedMessage.partsData = try PersistedPartsEnvelope.encode(message.parts)
                 persistedMessage.position = position
             } else {
                 let persistedMessage = PersistedMessage(
@@ -153,6 +155,7 @@ final class ConversationPersistence: ConversationPersisting {
                     role: message.role.rawValue,
                     text: message.text,
                     reasoning: message.reasoning,
+                    partsData: try PersistedPartsEnvelope.encode(message.parts),
                     position: position,
                     conversation: persistedConversation
                 )
@@ -172,6 +175,20 @@ final class ConversationPersistence: ConversationPersisting {
             context.delete(conversation)
             try context.save()
         }
+    }
+
+    /// 新 parts 格式优先；损坏、未知版本或旧记录统一回退到 legacy 列。
+    static func restoreMessage(
+        id: UUID,
+        role: ChatMessage.Role,
+        text: String,
+        reasoning: String,
+        partsData: Data?
+    ) -> ChatMessage {
+        if let partsData, let parts = try? PersistedPartsEnvelope.decode(partsData) {
+            return ChatMessage(id: id, role: role, parts: parts)
+        }
+        return ChatMessage(id: id, role: role, text: text, reasoning: reasoning)
     }
 }
 
@@ -216,6 +233,7 @@ private final class PersistedMessage {
     var role: String
     var text: String
     var reasoning: String = ""
+    var partsData: Data? = nil
     var position: Int
     var conversation: PersistedConversation?
 
@@ -224,6 +242,7 @@ private final class PersistedMessage {
         role: String,
         text: String,
         reasoning: String,
+        partsData: Data? = nil,
         position: Int,
         conversation: PersistedConversation
     ) {
@@ -231,7 +250,98 @@ private final class PersistedMessage {
         self.role = role
         self.text = text
         self.reasoning = reasoning
+        self.partsData = partsData
         self.position = position
         self.conversation = conversation
     }
+}
+
+/// parts 的稳定持久化线格式。显式 version/type 避免依赖 Swift enum 的合成编码格式。
+private struct PersistedPartsEnvelope: Codable {
+    private static let currentVersion = 1
+
+    let version: Int
+    let parts: [PersistedPart]
+
+    static func encode(_ parts: [ChatMessage.Part]) throws -> Data {
+        try JSONEncoder().encode(
+            PersistedPartsEnvelope(version: currentVersion, parts: parts.map(PersistedPart.init))
+        )
+    }
+
+    static func decode(_ data: Data) throws -> [ChatMessage.Part] {
+        let envelope = try JSONDecoder().decode(PersistedPartsEnvelope.self, from: data)
+        guard envelope.version == currentVersion else {
+            throw PartsCodingError.unsupportedVersion
+        }
+        return try envelope.parts.map { try $0.part }
+    }
+}
+
+private struct PersistedPart: Codable {
+    enum Kind: String, Codable {
+        case text
+        case reasoning
+        case hostedTool
+        case toolCall
+    }
+
+    let type: Kind
+    let text: TextContent?
+    let reasoning: String?
+    let hostedTool: HostedToolSnapshot?
+    let toolCall: ChatMessage.ToolCallSnapshot?
+
+    init(_ part: ChatMessage.Part) {
+        switch part {
+        case let .text(content):
+            type = .text
+            text = content
+            reasoning = nil
+            hostedTool = nil
+            toolCall = nil
+        case let .reasoning(value):
+            type = .reasoning
+            text = nil
+            reasoning = value
+            hostedTool = nil
+            toolCall = nil
+        case let .hostedTool(snapshot):
+            type = .hostedTool
+            text = nil
+            reasoning = nil
+            hostedTool = snapshot
+            toolCall = nil
+        case let .toolCall(snapshot):
+            type = .toolCall
+            text = nil
+            reasoning = nil
+            hostedTool = nil
+            toolCall = snapshot
+        }
+    }
+
+    var part: ChatMessage.Part {
+        get throws {
+            switch type {
+            case .text:
+                guard let text else { throw PartsCodingError.missingPayload }
+                return .text(text)
+            case .reasoning:
+                guard let reasoning else { throw PartsCodingError.missingPayload }
+                return .reasoning(reasoning)
+            case .hostedTool:
+                guard let hostedTool else { throw PartsCodingError.missingPayload }
+                return .hostedTool(hostedTool)
+            case .toolCall:
+                guard let toolCall else { throw PartsCodingError.missingPayload }
+                return .toolCall(toolCall)
+            }
+        }
+    }
+}
+
+private enum PartsCodingError: Error {
+    case unsupportedVersion
+    case missingPayload
 }

@@ -71,6 +71,68 @@ final class ConversationPersistenceTests: XCTestCase {
         XCTAssertEqual(restoredAssistant.reasoning, "内部思考")
     }
 
+    func testHostedSearchAndCitationsPersistInPartOrder() throws {
+        let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
+        let citation = TextCitation(
+            startIndex: 0,
+            endIndex: 4,
+            url: "https://example.com/source",
+            title: "示例来源"
+        )
+        let search = HostedToolSnapshot(
+            id: "ws_1",
+            kind: .webSearch,
+            status: .completed,
+            action: .search(queries: ["今日新闻"]),
+            sources: [
+                HostedToolSource(url: "https://example.com/source", title: "示例来源"),
+            ]
+        )
+        let assistant = ChatMessage(
+            role: .assistant,
+            parts: [
+                .reasoning("需要查找最新信息"),
+                .hostedTool(search),
+                .text(TextContent(text: "今日新闻摘要", citations: [citation])),
+            ]
+        )
+
+        try persistence.saveConversation(
+            ConversationSnapshot(
+                id: UUID(),
+                createdAt: .now,
+                updatedAt: .now,
+                messages: [
+                    ChatMessage(role: .user, text: "今天有什么新闻？"),
+                    assistant,
+                ],
+                threadID: nil
+            )
+        )
+
+        let restored = try XCTUnwrap(persistence.loadConversations().first?.messages.last)
+        XCTAssertEqual(restored.parts, assistant.parts)
+        XCTAssertEqual(restored.sources, search.sources)
+    }
+
+    func testCorruptPartsDataFallsBackToLegacyTextAndReasoning() {
+        let id = UUID()
+
+        let restored = ConversationPersistence.restoreMessage(
+            id: id,
+            role: .assistant,
+            text: "旧正文",
+            reasoning: "旧思考",
+            partsData: Data("not-json".utf8)
+        )
+
+        XCTAssertEqual(restored.id, id)
+        XCTAssertEqual(restored.parts, [
+            .reasoning("旧思考"),
+            .text(TextContent(text: "旧正文")),
+        ])
+    }
+
     /// 订阅服务商：会话线程 id 持久化往返（重启后用于 thread/resume）
     func testThreadIDPersistsAcrossSaveAndLoad() throws {
         let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
