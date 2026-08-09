@@ -4,13 +4,20 @@
 
 ## 项目概览
 
-**disco** 是一款 macOS 原生应用，用 SwiftUI + AppKit 编写。当前形态是一个多模型 AI 聊天客户端，并已接入初步的 ChatGPT/Codex 订阅运行时：用户可以配置多家 OpenAI 兼容服务商（DeepSeek、OpenAI、Moonshot Kimi、Kimi Code、智谱 GLM）或复用本机 Codex 登录，然后在会话中流式对话，支持推理（reasoning）展示与本地会话持久化。
+**disco** 是一款 macOS 原生应用，用 SwiftUI + AppKit 编写。当前形态是一个多模型 AI 聊天客户端，并已接入初步的 ChatGPT/Codex 订阅运行时：用户可以配置多家 OpenAI 兼容服务商（DeepSeek、OpenAI、Moonshot Kimi、Kimi Code、智谱 GLM）或复用本机 Codex 登录，然后在会话中流式对话，支持推理（reasoning）、token usage、上下文压缩展示与本地会话持久化。Kimi Code 当前接入的是 Chat Completions API，不是 Kimi CLI Agent。
 
-项目的长期目标是演进为完整的多模型 coding agent。总体蓝图见仓库根目录的 `macos-multi-model-agent-plan.md`（中文，含 ADR-001~006 架构决策）。**当前代码仍属于聊天 MVP，但已实现 Codex Runtime 的第一段链路**：能启动 `codex app-server`、读取登录/模型信息、start/resume thread、start/interrupt turn，并映射文本、推理和终止事件；尚无 Project/Workspace、命令与文件 item、审批、diff、Generic 工具循环或 Tool Host。`ChatMessage.Part.toolCall` 仍只是展示预留。
+项目的长期目标是演进为完整的多模型 coding agent。总体蓝图见仓库根目录的 `macos-multi-model-agent-plan.md`（中文，含 ADR-001~006 架构决策）。**当前代码仍属于聊天 MVP，但已实现 Codex Runtime 的第一段链路**：能启动 `codex app-server`、读取登录/模型信息、start/resume thread、start/interrupt turn，并映射文本、推理、usage、上下文压缩和终止事件；尚无 Project/Workspace、命令与文件 item、审批、diff、Generic 工具循环或 Tool Host。`ChatMessage.Part.toolCall` 仍只是展示预留。
 
-实现或修改 Project/Workspace、Agent 事件、Codex 协议、审批、diff、Generic 工具循环、Tool Host、运行持久化或 coding-agent UI 前，先阅读 `coding-agent-implementation-plan.md`，并以对应 Phase 的完成标准作为交付边界。
+实现或修改 Project/Workspace、Agent 事件、Codex 协议、审批、diff、Generic 工具循环、Tool Host、运行持久化或 coding-agent UI 前，先阅读 `coding-agent-implementation-plan.md`，并以对应 Phase 的完成标准作为交付边界。上下文压缩当前行为和已知缺口记录在 `context-compaction-implementation-plan.md`；Kimi Code API/未来 ACP 的路线决策记录在 `kimi-code-integration-research.md`。
 
 注意：蓝图与实现存在有意的取舍，例如蓝图建议 AsyncHTTPClient + Keychain，当前 MVP 使用 URLSession + 明文凭据文件（见下文"安全注意事项"）。以代码现状为准，蓝图中的章节引用（如 `计划 §8`、`ADR-001`）用于说明设计意图。
+
+## 文档索引
+
+- `macos-multi-model-agent-plan.md`：长期产品蓝图与 ADR-001～006。
+- `coding-agent-implementation-plan.md`：coding agent 的阶段性实施路线和验收标准。
+- `context-compaction-implementation-plan.md`：上下文压缩 v1 的当前实现记录、持久化契约和待补测试。
+- `kimi-code-integration-research.md`：Kimi Code API 当前决策与未来 ACP 接入边界。
 
 ## 技术栈
 
@@ -58,10 +65,12 @@ disco/
 │   ├── RuntimeContract.swift # AgentRuntime 协议、AgentRunRequest、AgentEvent
 │   └── ChatMessage.swift     # 消息模型（有序 parts：text / reasoning / toolCall）
 ├── AgentRuntime/
-│   ├── GenericAgentRuntime.swift       # 通用文本运行时：ModelEvent → AgentEvent
-│   ├── CodexAppServerProtocol.swift    # codex-cli 0.144.5 的版本化 wire DTO
-│   ├── CodexAppServerTransport.swift   # app-server 子进程、JSONL/JSON-RPC 与 thread/turn 路由
-│   └── CodexRuntime.swift              # Codex 事件 → AgentEvent、取消与 thread 恢复
+│   ├── GenericAgentRuntime.swift       # 通用文本运行时：上下文压缩、ModelEvent → AgentEvent
+│   ├── ContextCompactor.swift          # Generic checkpoint、摘要和 overflow recovery
+│   ├── TokenEstimator.swift             # 本地 token 粗略估算
+│   ├── CodexAppServerProtocol.swift    # codex-cli 0.147.0 的版本化 wire DTO
+│   ├── CodexAppServerTransport.swift   # app-server 子进程、JSONL/JSON-RPC、usage/compact 路由
+│   └── CodexRuntime.swift              # Codex 事件 → AgentEvent、取消、usage 与 thread 恢复
 ├── Providers/
 │   ├── OpenAIResponsesProvider.swift         # OpenAI Responses API + 兼容服务商
 │   └── OpenAIChatCompletionsProvider.swift   # Chat Completions API；当前用于 Kimi Code
@@ -77,12 +86,12 @@ discoTests/                   # XCTest 单元测试，@testable import disco
 - **Provider 与 Runtime 正交（ADR-001）**：`ModelProvider` 只做认证、请求构造、流式协议解析与错误转换，是无状态传输；模型、推理开关由 Runtime 按会话配置填入 `ModelRequest`。
 - **统一事件，不统一原始协议（ADR-002）**：内部统一为 `ModelEvent` / `AgentEvent`，但保留 provider 私有的 DTO 与 SSE 解析。UI 层不接触 provider 具体错误类型，Runtime 在边界处翻译为 `AgentFailure`（用户可读的中文消息）。
 - **终止事件保证**：一次运行恰好发射一个终止事件（`runCompleted` / `runFailed` / `runCancelled`），随后流结束。改动 Runtime 时必须维持该不变量。
-- **Codex wire 与领域隔离**：`CodexAppServerTransport`/`CodexRuntime` 消化 JSON-RPC method、request ID、thread/turn/item ID 与审批 decision；SwiftUI 不解析 Codex payload。协议 DTO 固定对应 `codex-cli 0.144.5`，升级 CLI 时先生成并 diff schema，再更新 DTO 与合约测试。
-- **Codex 当前能力边界**：只支持 thread/turn、文本、推理和终止事件；`handleServerRequest` 会明确拒绝审批/工具请求。接入审批前不得声明对应 app-server capability，也不得把需要审批的请求当作已执行。
+- **Codex wire 与领域隔离**：`CodexAppServerTransport`/`CodexRuntime` 消化 JSON-RPC method、request ID、thread/turn/item ID、usage 和压缩生命周期；SwiftUI 不解析 Codex payload。协议 DTO 当前对应 `codex-cli 0.147.0`，升级 CLI 时先生成并 diff schema，再更新 DTO 与合约测试。
+- **Codex 当前能力边界**：支持 thread/turn、文本、推理、终止、token usage 和上下文压缩；`handleServerRequest` 仍明确拒绝审批/工具请求。接入审批前不得声明对应 app-server capability，也不得把需要审批的请求当作已执行。
 - **配置在运行时创建时固定**：`GenericAgentRuntime.Configuration` 创建后不可变；切换模型/推理开关时 `AppState` 重建 Runtime（计划 §6.3）。
 - **两套 API 并列**：OpenAI、DeepSeek、Moonshot Kimi 与 GLM 由 `OpenAIResponsesProvider` 走 `/responses`（`store: false`）；Kimi Code 由 `OpenAIChatCompletionsProvider` 走 `/chat/completions`，使用 Kimi 原生 `thinking` 与 `reasoning_content` 字段。
 - **Base URL 校验**：仅允许 HTTPS，无 user/password/query/fragment，尾部斜杠归一化（`AppState.validatedBaseURL`）。
-- **UserDefaults 键**：按服务商隔离，形如 `provider.<vendor>.baseURL|model|models|modelContextWindows|thinkingEnabled|verifiedAt`；旧版单服务商键（`apiBaseURL` 等）在启动时迁移，勿新增对 legacy 键的依赖。
+- **UserDefaults 键**：按服务商隔离，形如 `provider.<vendor>.baseURL|model|models|modelCatalog|modelContextWindows|contextWindowOverrides|thinkingEnabled|verifiedAt`；旧版单服务商键（`apiBaseURL` 等）在启动时迁移，勿新增对 legacy 键的依赖。
 
 ## 代码风格
 

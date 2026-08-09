@@ -1,111 +1,109 @@
-# Disco 上下文压缩 v1 详细实施计划
+# Disco 上下文压缩 v1 实现记录
 
-## 1. 目标与交付标准
+> 状态：已实现主链路，专项测试和少量收尾工作待补充
+> 代码基线：`main@531f128`
+> 原实施计划：本文件早期版本；当前文档以实际代码为准。
 
-实现两条独立链路：
+本文记录上下文压缩与用量追踪的当前行为、持久化边界和已知缺口。它不再是待执行的实施计划；如果代码和本文冲突，以代码和测试为准，修改行为时同步更新本文。
 
-- Codex Runtime 继续让 app-server 管理上下文，Disco 接入真实 usage、自动压缩事件和手动 `thread/compact/start`。
-- Generic Runtime 保留完整聊天记录，但发送给模型时使用“历史摘要 + 最近原始消息”，支持自动压缩、手动压缩、持久化和 context overflow 后单次恢复重试。
-- 压缩状态放在现有“上下文占用”面板中，不提前引入 Run/AgentItem 时间线。
-- Generic 使用当前会话模型生成摘要，关闭 reasoning 和托管工具。
-- 模型窗口未知时允许用户填写覆盖值；未填写前不做阈值压缩，只在服务端明确返回溢出时尝试恢复。
-- 自动策略默认约 72% 触发、压缩到约 50%，至少保留最近 4 个用户轮次原文。
+## 1. 交付范围
 
-完成后必须满足：
+本次实现包含两条独立链路：
 
-- 压缩不会删除、替换或隐藏本地聊天历史。
-- 重启后 Generic checkpoint 可以继续使用。
-- Codex 不在本地重复总结或重放历史。
-- 取消、失败、重试仍维持一次运行恰好一个终止事件。
-- 旧会话数据库可以无损打开。
+- **Generic Runtime**：在 Disco 本地保留完整聊天历史，向模型发送“系统约束 + 历史摘要 + 最近原始消息”；支持自动压缩、手动压缩、checkpoint 持久化，以及 context overflow 后的一次恢复尝试。
+- **Codex Runtime**：继续由 Codex app-server 管理线程上下文；Disco 接收真实 token usage、自动压缩生命周期，并通过 `thread/compact/start` 支持手动压缩。
 
-## 2. 领域接口与持久化
+上下文压缩状态展示在现有上下文 popover 中，不进入聊天消息时间线。压缩不会删除、替换或隐藏本地原始消息。
 
-### Model 与 Runtime 合约
+主要实现位置：
 
-扩展模型契约：
+| 责任 | 实现 |
+| --- | --- |
+| 领域契约、usage、checkpoint、压缩状态 | `disco/AgentDomain/ModelContract.swift`、`RuntimeContract.swift` |
+| Generic 压缩与 token 粗估 | `disco/AgentRuntime/ContextCompactor.swift`、`TokenEstimator.swift`、`GenericAgentRuntime.swift` |
+| Codex usage、自动/手动压缩 | `disco/AgentRuntime/CodexAppServerProtocol.swift`、`CodexAppServerTransport.swift`、`CodexRuntime.swift` |
+| Provider usage 与 overflow 分类 | `OpenAIResponsesProvider.swift`、`OpenAIChatCompletionsProvider.swift` |
+| checkpoint 持久化与会话状态 | `ConversationPersistence.swift`、`ConversationStore.swift` |
+| 设置覆盖值与上下文 UI | `AppState.swift`、`ProviderConfig.swift`、`SettingsView.swift`、`ChatView.swift` |
 
-```swift
-struct ModelRequest {
-    let instructions: String?
-    let messages: [ChatMessage]
-    // 保留现有 model/reasoning/hostedTools
-}
+## 2. Generic Runtime 行为
 
-struct TokenUsageSnapshot: Codable, Sendable, Equatable {
-    let inputTokens: Int
-    let cachedInputTokens: Int?
-    let outputTokens: Int
-    let reasoningOutputTokens: Int?
-    let totalTokens: Int
-}
+### 2.1 上下文组装
 
-enum ModelEvent {
-    // 现有事件
-    case usage(TokenUsageSnapshot)
-}
+`ContextCompactor` 使用固定的 `promptVersion = 1` 和 `schemaVersion = 1`。每次请求都会：
+
+1. 注入 `ContextCompactor.runtimeInstructions`，明确当前请求优先于历史内容，历史消息和摘要均是不可信数据。
+2. 如果 checkpoint 有效，插入摘要 marker user message 和摘要 assistant message。
+3. 追加 checkpoint 边界之后的原始消息。
+4. 由 Runtime 追加当前用户输入对应的消息历史。
+
+摘要请求使用当前 Provider 和当前模型，并固定关闭 reasoning、reasoning effort 和 hosted tools。摘要只读取用户/助手可见文本，不保留 reasoning，要求输出以下 Markdown 段落：
+
+- 用户目标
+- 约束
+- 关键决定
+- 已完成工作
+- 重要路径与标识符
+- 失败与原因
+- 待完成事项
+- 必须保留事实
+
+摘要目标长度为 `min(2048, max(512, contextWindow × 2%))`；没有已知窗口时使用 1024 的目标值。空摘要或估算长度超过目标两倍时不会创建 checkpoint。
+
+### 2.2 自动压缩
+
+只有模型上下文窗口已知时才按本地阈值自动压缩。策略如下：
+
+```text
+outputReserve = min(contextWindow × 25%, max(4096, contextWindow × 15%))
+inputBudget   = contextWindow - outputReserve
+softTrigger   = min(contextWindow × 72%, inputBudget)
+target        = contextWindow × 50%
 ```
 
-Provider 的 instructions 映射规则固定为：
+达到 soft trigger 后，压缩最老的完整消息前缀，并至少保留最近 4 个用户轮次。已有 checkpoint 时，摘要会与 checkpoint 边界之后新增的可压缩消息合并。压缩后如果仍超过输入预算，最多再以保留最近 2 个用户轮次的边界折叠一次；仍无法进入预算时返回 overflow，不静默截断最近消息。
 
-- OpenAI Responses 原生方言使用顶层 `instructions`。
-- Responses 兼容方言在 `input` 最前插入 `system` message。
-- Chat Completions 在 `messages` 最前插入 `system` message。
-- instructions 为 `nil` 时保持现有请求体不变。
+窗口未知时不做预防性阈值压缩，只在服务端明确返回 context overflow 后尝试恢复。
 
-扩展 Runtime 合约：
+### 2.3 手动压缩
 
-```swift
-struct ContextUsageSnapshot {
-    let current: TokenUsageSnapshot
-    let accumulated: TokenUsageSnapshot?
-    let contextWindow: Int?
-    let source: Source // provider / codex / estimate
-}
+- Generic 至少需要 5 个用户轮次，并且存在位于 checkpoint 之后的可压缩完整消息前缀。
+- Codex 必须已经有活动 thread，且当前没有正在运行的 turn。
+- 压缩期间不能发送消息、重新生成或再次压缩；停止或清空会话会取消压缩任务。
+- 手动压缩不创建聊天占位消息。
+- 失败时保留上一个有效 checkpoint 和成功记录。
 
-struct ContextCheckpoint: Codable, Sendable, Equatable {
-    let id: UUID
-    let schemaVersion: Int
-    let promptVersion: Int
-    let providerID: String
-    let model: String
-    let boundaryMessageID: UUID
-    let sourceDigest: String
-    let summary: String
-    let estimatedTokensBefore: Int
-    let estimatedTokensAfter: Int
-    let createdAt: Date
-}
+当前 Generic 压缩使用输入预算作为硬约束；`Policy.target` 保留了目标值计算，但并不代表会强制把所有会话压到该数值以下。
 
-struct ContextCompactionSnapshot: Codable, Sendable, Equatable {
-    let id: String
-    let runtimeKind: RuntimeKind
-    let trigger: Trigger       // automatic / manual / overflowRecovery
-    let status: Status         // running / completed / failed
-    let startedAt: Date
-    let completedAt: Date?
-    let beforeTokens: Int?
-    let afterTokens: Int?
-    let compactedMessageCount: Int?
-    let errorMessage: String?
-}
+### 2.4 Overflow 恢复
 
-struct ContextCompactionUpdate {
-    let snapshot: ContextCompactionSnapshot
-    let checkpoint: ContextCheckpoint?
-}
-```
+Provider 通过 `ModelFailureClassifying` 暴露稳定的 `contextOverflow` 分类。HTTP 400/413 本身不会被当作 overflow；Responses 和 Chat Completions Provider 优先使用服务端的 code/type，必要时才匹配受限的已知错误文本。`finish_reason = length` 仍表示输出长度错误。
 
-调整接口：
+主请求满足以下条件时才恢复：
 
-- `AgentRunRequest` 增加可选 `contextCheckpoint`。
-- `AgentEvent` 增加 `contextUsageUpdated` 和 `contextCompactionUpdated`。
-- `AgentRuntime` 增加 `compactContext(request:) async throws -> ContextCompactionUpdate`，Codex 与 Generic 都实现。
-- `AgentFailure` 增加稳定的 `code`、可选恢复建议和是否可重试；默认值保持现有初始化调用兼容，并新增 `contextOverflow`、`contextCompactionFailed`。
+- 尚未向 UI 发出文本、reasoning、hosted tool 或 citation；
+- 本轮尚未进行过 overflow recovery。
 
-### checkpoint 持久化
+恢复会生成新的 checkpoint，并重新发送一次主请求。摘要请求本身如果也 overflow，会按候选消息前缀逐步缩小，最多尝试 5 次。再次失败后返回稳定的 `contextOverflow`，提示用户填写上下文窗口、手动压缩或新建会话。
 
-在 Conversation 的 SwiftData 模型上增加可选 `contextStateData: Data?`，保存版本化 JSON：
+## 3. Checkpoint 与持久化
+
+### 3.1 Checkpoint 内容
+
+`ContextCheckpoint` 是可丢弃的派生缓存，不是聊天事实来源，包含：
+
+- checkpoint ID、schema version、prompt version；
+- provider ID 和 model；
+- 压缩边界消息 ID；
+- 边界之前有序消息 `id + role + text + reasoning` 的 SHA-256 digest；
+- 摘要正文和压缩前后 token 估算；
+- 创建时间。
+
+加载或发送前必须同时验证 schema、prompt、provider、model、boundary 和 digest。任一项不匹配就丢弃 checkpoint，保留原始消息。
+
+### 3.2 SwiftData 线格式
+
+`PersistedConversation.contextStateData` 保存版本化 JSON：
 
 ```swift
 struct PersistedConversationContextState {
@@ -115,204 +113,78 @@ struct PersistedConversationContextState {
 }
 ```
 
-具体规则：
+当前版本为 `1`。旧数据库中该字段为 `nil`；JSON 解码失败、版本不支持或校验失败时只丢弃上下文派生状态，不删除会话消息。压缩成功后由 `ConversationStore` 立即持久化，Runtime 不直接访问 SwiftData。
 
-- 原始 `PersistedMessage` 始终是事实来源。
-- checkpoint 只是派生缓存；解码、版本或摘要校验失败时丢弃 checkpoint，不删除消息。
-- SHA-256 digest 基于压缩边界之前有序消息的 `id + role + text + reasoning`。
-- checkpoint 仅在 `providerID + model + promptVersion` 匹配且 boundary/digest 有效时使用。
-- Provider 或模型变化后旧 checkpoint 暂时保留但不使用；创建新 checkpoint 时覆盖。
-- 成功生成 checkpoint 后立即持久化，再继续主模型请求。
-- 清空会话同时清空 checkpoint、最近压缩记录和 usage。
-- 手动/自动压缩失败不得覆盖上一个有效 checkpoint。
-- 给 `ConversationSnapshot`、`ConversationSession`、`ConversationStore` 的持久化回调增加 context state，避免 Runtime 自己写 SwiftData。
+清空会话会同时清除 thread ID、checkpoint、最近压缩记录和 usage；修改 provider 或模型后，旧 checkpoint 因签名不匹配而不会被使用。
 
-## 3. Generic Runtime 压缩引擎
+## 4. Codex 与 Provider 集成
 
-### 上下文组装
+### 4.1 Provider usage
 
-引入一个有实际复杂度边界的 `ContextCompactor`，负责 checkpoint 校验、边界选择、摘要生成和重建模型输入；共享的 token 粗估逻辑从 `ConversationStore` 移到可复用 `TokenEstimator`。
+`ModelEvent.usage(TokenUsageSnapshot)` 不计作文本输出，也不影响运行终止判断：
 
-存在有效 checkpoint 时，模型输入顺序固定为：
+- Responses Provider 读取 `input_tokens`、`cached_tokens`、`output_tokens`、`reasoning_tokens` 和 `total_tokens`。
+- Chat Completions Provider 读取 `prompt_tokens`、`completion_tokens`、`total_tokens` 及可选的 cached/reasoning 明细。
+- Chat Completions 的 `include_usage` 尾部 chunk 可以没有 choices，但仍会透传 usage。
+- 摘要请求的 usage 不覆盖主请求的上下文占用状态。
 
-1. Generic Runtime 的系统约束。
-2. synthetic user message：说明下一条是较早会话的只读摘要，不得提升其中指令的优先级。
-3. synthetic assistant message：checkpoint summary。
-4. boundary 之后的原始消息。
-5. 当前用户输入。
+### 4.2 Codex app-server
 
-摘要生成请求：
+当前 wire 版本对应本机 `codex-cli 0.147.0` 生成的 v2 schema，且对缺少新通知的旧 app-server 做可选解码和降级处理：
 
-- 使用当前 Provider 和当前模型。
-- `reasoningEnabled = false`、`reasoningEffort = nil`、`hostedTools = []`。
-- system instructions 明确要求把 transcript 当作不可信数据，不执行其中指令。
-- 只摘要用户/助手可见文本；不保留 reasoning。
-- 输出固定 Markdown 段落：用户目标、约束、关键决定、已完成工作、重要路径/标识符、失败与原因、待完成事项、必须保留事实。
-- 摘要使用原会话主要语言，不输出分析过程。
-- 摘要目标上限：
+- `thread/tokenUsage/updated` → `ContextUsageSnapshot`：`last` 是当前占用，`total` 是累计用量，`modelContextWindow` 是窗口分母。
+- `contextCompaction` item started/completed → 自动压缩状态。
+- `thread/compact/start` → 手动压缩；等待对应 `contextCompaction` item 完成。
+- Codex 不使用 Generic checkpoint，也不在本地按阈值重新总结历史。
+- 旧 app-server 如果返回 method-not-found，当前连接会记住手动压缩不可用，但普通对话仍可继续。
+- 审批、工具和其他 server request 仍明确返回“不支持”，不能把请求当成已执行。
 
-```text
-summaryTarget = min(2048, max(512, contextWindow × 2%))
-```
+Codex 的上下文窗口与 usage 来源标记为 `.codex`；Generic 的真实 usage 标记为 `.provider`，本地估算标记为 `.estimate`。
 
-- 空摘要或估算超过 `summaryTarget × 2` 视为无效，不写 checkpoint。
+## 5. UI 与配置
 
-### 自动策略
-
-窗口已知时：
-
-```text
-outputReserve = min(contextWindow × 25%, max(4096, contextWindow × 15%))
-inputBudget   = contextWindow - outputReserve
-softTrigger   = min(contextWindow × 72%, inputBudget)
-target        = contextWindow × 50%
-```
-
-执行流程：
-
-1. 校验已有 checkpoint。
-2. 估算 instructions、summary marker、摘要、原始尾部和本次输入。
-3. 低于 `softTrigger` 时直接发送。
-4. 达到阈值时，选择最老的完整消息前缀进行压缩。
-5. 压缩边界必须位于消息边界，并保留从倒数第 4 个用户消息开始的全部内容。
-6. 有旧 checkpoint 时，把旧摘要和新增的可压缩前缀一起折叠为新摘要，推进 boundary。
-7. 根据真实摘要重新估算；仍超过 `inputBudget` 且还有可压缩内容时，最多再折叠一次。
-8. 两次后仍无法进入预算，发出 `contextOverflow`，不得静默删除最近内容。
-
-手动 Generic 压缩：
-
-- 即使未达到 soft trigger，也尝试压缩到 target。
-- 少于 5 个用户轮次、没有可压缩前缀时返回“暂无可压缩历史”。
-- 不创建聊天占位消息。
-- 进行中禁止发送、重新生成和再次压缩；清空或停止会取消压缩任务。
-
-### 溢出恢复
-
-Provider 错误增加统一 `ModelFailureKind.contextOverflow` 分类：
-
-- 优先识别服务端 `code/type`，包括 context length/window exceeded 类代码。
-- Chat Completions 缺少结构化 code 时，再匹配经过限制的已知错误文本。
-- HTTP 400/413 不能单独被认定为 context overflow。
-- 输出达到 `finish_reason = length` 仍属于输出长度错误，不触发上下文重试。
-
-主请求发生 context overflow 时：
-
-- 只有在尚未向 UI 发出 text、reasoning、tool 或 citation 事件时才允许恢复重试。
-- 窗口已知：强制推进 checkpoint，再重试主请求一次。
-- 窗口未知：选取最老的可压缩完整前缀，目标先减少约一半估算输入；如果摘要请求本身也溢出，按消息边界对候选前缀二分缩小。
-- 主请求最多重试一次；再次溢出时返回稳定失败，提示用户填写模型上下文窗口、手动压缩或新建会话。
-- 若预防性压缩失败但原始请求仍低于 `inputBudget`，记录非致命压缩失败并继续原始请求。
-- 已超过预算、无可压缩前缀或摘要失败时终止运行，不做原始消息截断。
-
-## 4. Provider、Codex 和 UI
-
-### Provider usage
-
-Responses Provider 解码：
-
-- `input_tokens`
-- `cached_tokens`
-- `output_tokens`
-- `reasoning_tokens`
-- `total_tokens`
-
-Chat Completions Provider 解码：
-
-- `prompt_tokens`
-- `completion_tokens`
-- `total_tokens`
-- 可选 cached/reasoning 明细。
-
-SSE 中 choices 为空但带 usage 的 chunk 仍必须产生 `.usage`；usage 不计作文本输出，也不改变终止判断。摘要请求的 usage 只用于压缩记录，不覆盖主请求的上下文占用状态。
-
-### Codex app-server
-
-以本机实际安装的 `codex-cli 0.147.0` 重新生成 schema 并 diff，仅接入本功能需要的 DTO，同时保持旧通知缺失时可运行：
-
-- `thread/tokenUsage/updated`
-- `contextCompaction` ThreadItem
-- `thread/compact/start`
-
-实现规则：
-
-- Codex 不使用 Generic checkpoint，也不根据本地阈值触发自动压缩。
-- `thread/tokenUsage/updated` 映射为 `ContextUsageSnapshot`：`last` 作为当前占用，`total` 作为累计量，`modelContextWindow` 作为 UI 分母。
-- 自动 `contextCompaction` item started/completed 映射为压缩状态；schema 没有 before/after 时保持 `nil`，不得伪造。
-- Transport 新增 `compactThread(threadID:)`，发送 `thread/compact/start` 并等待对应 `contextCompaction` item 完成。
-- 手动压缩只能在线程已存在且没有活动 turn 时执行。
-- 旧 app-server 返回 method-not-found 时，在当前连接内标记手动压缩不受支持，并展示中文提示；自动对话继续可用。
-- 升级 wire 元数据和契约 fixture 到 0.147.0，但 initialize 不严格拒绝较旧版本。
-
-### 设置与上下文面板
-
-给 Provider 配置增加独立的 per-model context window override：
+Provider 配置支持按模型保存上下文窗口覆盖值：
 
 ```text
 provider.<vendor>.contextWindowOverrides
 ```
 
-规则：
+用户覆盖值优先于模型目录值；合法范围为 4,096～16,777,216 tokens，空值清除覆盖。刷新模型目录不会删除覆盖值，删除 Provider 时一并删除。
 
-- 用户覆盖值优先于服务端目录值和客户端已知值。
-- 输入必须是 4,096～16,777,216 的整数 token；空值表示清除覆盖。
-- 刷新模型目录不得删除覆盖值。
-- 删除 Provider 配置时一并删除覆盖。
-- 设置页在所选模型区域显示上下文窗口来源和可编辑 token 值。
+上下文 popover 展示：
 
-上下文 popover 改为：
+- 当前占用、上下文窗口、剩余量和占比；
+- “服务商返回 / Codex 服务端 / 本地估算”来源；
+- 最近一次成功压缩的时间、触发方式、前后 token；
+- 正在压缩或失败状态；
+- 可用时的“立即压缩”按钮。
 
-- 优先展示 Provider/Codex 返回的真实 usage，否则展示 checkpoint-aware 本地估算。
-- 明确标记“服务商返回”或“本地估算”。
-- 展示模型窗口、当前占用、剩余量和占比。
-- 展示最近一次成功压缩的时间、触发方式、压缩前后 token；缺失值显示“未知”。
-- 压缩进行中显示进度状态，失败显示非破坏性中文错误。
-- 提供“立即压缩”按钮；流式回复、正在压缩、无 Generic 可压缩前缀或 Codex 无 thread 时禁用。
-- Generic ring 使用 checkpoint 后模型可见上下文估算，不再累计全部 UI 历史；Codex ring 使用服务端窗口。
-- v1 不增加自动压缩开关，不增加独立摘要模型设置，也不创建聊天时间线压缩卡片。
+### 终止事件不变量
 
-## 5. 测试与验收
+Generic 和 Codex Runtime 都必须保证：一次运行恰好发射一个 `runCompleted`、`runFailed` 或 `runCancelled`，随后结束事件流。usage 和压缩状态事件不能代替终止事件，也不能在终止事件后继续发射。
 
-### 单元与契约测试
+## 6. 验证状态与后续工作
 
-- `TokenEstimator`：ASCII、中文、空文本、instructions、summary marker。
-- checkpoint：SwiftData 往返、旧库 `nil` 兼容、版本错误、digest 错误、boundary 丢失、运行时签名不匹配。
-- 边界选择：保留最近 4 个用户轮次、不拆消息、递归推进 checkpoint、尾部本身过大。
-- Generic Runtime：阈值以下不压缩；达到 72% 自动压缩；压缩后只发送摘要与尾部；完整 Store 消息不变。
-- 摘要请求：同一模型、reasoning 关闭、tools 为空、instructions 正确、空/超长摘要拒绝。
-- 溢出恢复：无输出时压缩并重试一次；已有任意可见事件时不重试；第二次溢出稳定失败。
-- 失败与取消：旧 checkpoint 保留、手动压缩可取消、自动压缩取消仍只产生一个 run terminal。
-- Provider：Responses/Chat usage 正常、任意 SSE 分片、choices 为空 usage chunk、结构化 overflow 分类、普通 400 不误判。
-- Codex：token usage DTO、contextCompaction started/completed、多 thread 隔离、手动 compact wire、method-not-found、活动 turn 禁止手动压缩。
-- Store/UI 状态：成功立即持久化、清空全部重置、发送与压缩互斥、popover 来源和按钮状态正确。
+本次 commit 已覆盖的测试方向主要包括：
 
-### 最终验证
+- Kimi Chat Completions 请求、thinking、reasoning_content、usage chunk、模型目录和 HTTP 错误；
+- Provider/模型上下文窗口目录、legacy metadata 迁移和覆盖值；
+- 会话估算 token 数量与上下文状态接入。
 
-运行完整测试：
+以下专项测试仍应补充或加强，完成后再把本文状态改为“已验证”：
 
-```bash
-xcodebuild test \
-  -project disco.xcodeproj \
-  -scheme disco \
-  -destination 'platform=macOS' \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO
-```
+- `TokenEstimator` 和 `ContextCompactor` 的边界选择、digest 校验、递归 checkpoint、摘要失败；
+- Generic 自动/手动压缩、overflow recovery、可见事件后的禁止重试；
+- context state 的 SwiftData 往返、旧库兼容和 checkpoint 失效降级；
+- Codex usage/compaction 多 thread 隔离、旧版 method-not-found 和活动 turn 互斥；
+- 取消、清空、模型切换时的压缩任务和持久化竞态；
+- UI popover 来源、按钮禁用条件和失败提示。
 
-手工验收至少包括：
+当前仍保留的代码收尾项：`AgentRuntime` 的默认 `compactContext` 扩展是兼容性兜底；Generic 和 Codex 都有真实实现后，可以在确认没有其他 conformer 后删除该兜底和对应 TODO。
 
-1. Generic 长会话达到阈值后自动压缩，聊天记录数量和内容不变。
-2. 重启应用后继续会话，发送请求仍使用已保存摘要。
-3. 修改模型后旧 checkpoint 不被误用，并按新窗口重新计算。
-4. 未知窗口填写覆盖值后 ring 和自动阈值立即生效。
-5. Codex 自动压缩时面板显示状态和服务端 usage。
-6. Codex 手动压缩成功；旧版不支持时只禁用该能力，不影响聊天。
-7. 压缩中点击停止或清空，不留下半成品 checkpoint。
+## 7. 维护规则
 
-## 已锁定假设
-
-- 首版同时覆盖 Codex 与 Generic，并包含手动压缩。
-- Generic 摘要使用当前模型，不增加单独模型或认证配置。
-- 默认平衡策略为约 72%/50%，保留最近 4 个用户轮次。
-- 未知窗口通过用户覆盖补齐；未填写前仅做 overflow 恢复。
-- 压缩记录只进入上下文面板，不进入聊天时间线。
-- 当前工作区已有未提交修改，实施时必须保留并逐文件合并，禁止 reset 或覆盖用户改动。
+- 修改压缩阈值、摘要 prompt、checkpoint schema 或持久化格式时，先更新本文，再更新代码和测试。
+- 修改 Codex CLI 版本时，先重新生成 schema，与现有 DTO/fixture 做 diff；不要只更新版本号。
+- 不要把 Generic checkpoint 当成可编辑聊天内容，也不要在 UI 中展示原始摘要为一条聊天消息。
+- 不要把 Kimi Code API Provider 描述为 Kimi CLI Agent；两者的工具、审批和 session 能力不同。

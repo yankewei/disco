@@ -4,9 +4,9 @@
 
 日期：2026-08-08
 
-状态：实施基线
+状态：长期路线基线；当前已实现能力以 `AGENTS.md` 和各专项实现记录为准
 
-适用代码基线：`main@f716e8c`、`codex-cli 0.144.5`
+适用代码基线：`main@531f128`、`codex-cli 0.147.0`
 
 ## 1. 文档目的
 
@@ -18,7 +18,7 @@
 4. 每个阶段需要修改哪些文件、增加哪些测试，以及何时才算完成。
 5. system prompt、`AGENTS.md`、结构化工具和安全策略分别应该放在哪里。
 
-本文是 coding agent 实施阶段的细化文档；产品目标、总体架构和 ADR-001～006 仍以 `macos-multi-model-agent-plan.md` 为准。两份文档发生冲突时：
+本文是 coding agent 实施阶段的长期细化文档；产品目标、总体架构和 ADR-001～006 仍以 `macos-multi-model-agent-plan.md` 为准。上下文压缩 v1 的当前实现、持久化契约和待补测试以 `context-compaction-implementation-plan.md` 为准；Kimi Code API/ACP 的路线决策以 `kimi-code-integration-research.md` 为准。上述文档发生冲突时：
 
 - 产品边界和长期方向以总蓝图为准。
 - 当前代码事实和近期实施顺序以本文为准。
@@ -42,15 +42,17 @@
 |---|---|---|
 | macOS 原生聊天界面 | SwiftUI + AppKit，支持会话侧栏、流式消息和推理展示 | `disco/App/` |
 | 多服务商配置 | OpenAI 兼容服务商与 ChatGPT/Codex 订阅配置 | `ProviderConfig.swift`、`SettingsView.swift` |
-| Generic 文本 Runtime | 消费 `ModelProvider` 文本/推理流，保证单一终止事件 | `GenericAgentRuntime.swift` |
-| Responses Provider | URLSession + SSE，发送历史消息，解析文本和推理 | `OpenAIResponsesProvider.swift` |
+| Generic 文本 Runtime | 消费 `ModelProvider` 文本/推理流，负责指令、上下文压缩、overflow recovery，并保证单一终止事件 | `GenericAgentRuntime.swift`、`ContextCompactor.swift` |
+| Token usage 与上下文状态 | Provider/Codex usage、checkpoint、上下文估算和压缩记录 | `ModelContract.swift`、`RuntimeContract.swift`、`ConversationPersistence.swift` |
+| Responses Provider | URLSession + SSE，发送历史消息，解析文本、推理、usage 和 context overflow | `OpenAIResponsesProvider.swift` |
 | Chat Completions Provider | URLSession + SSE，解析 `content` / `reasoning_content`；当前接入 Kimi Code | `OpenAIChatCompletionsProvider.swift` |
 | Codex 子进程与握手 | 启动 `codex app-server`，完成 initialize/initialized | `CodexAppServerTransport.swift` |
 | Codex thread/turn | thread start/resume、turn start/interrupt | `CodexAppServerTransport.swift` |
 | Codex 文本事件 | agent message delta、reasoning summary delta、turn completed | `CodexRuntime.swift` |
+| Codex usage 与上下文压缩 | token usage、自动/手动压缩状态、`thread/compact/start` | `CodexAppServerTransport.swift`、`CodexRuntime.swift` |
 | Codex thread 恢复标识 | 本地保存 thread ID，重启后 resume | `ConversationPersistence.swift` |
 | 协议测试替身 | 脚本化 `LineProcess`，不依赖真实网络或真实账号 | `CodexAppServerTestSupport.swift` |
-| 会话持久化 | SwiftData 保存消息、推理和 thread ID | `ConversationPersistence.swift` |
+| 会话持久化 | SwiftData 保存消息、推理、thread ID 和上下文派生状态 | `ConversationPersistence.swift` |
 
 ### 3.2 尚未具备
 
@@ -58,15 +60,14 @@
 |---|---|---|
 | Project / Workspace | 会话没有绑定仓库根目录 | Codex 不能可靠地知道应操作哪个项目 |
 | Codex thread 配置 | `thread/start` 只传 `model` | 没有 `cwd`、sandbox、approval policy |
-| 丰富 Agent 事件 | `AgentEvent` 只有文本、推理、完成/失败/取消 | UI 无法表达计划、命令、diff、审批和用量 |
-| Codex item 解码 | `item/started` / `item/completed` 只取 id/type | 命令、文件修改等内容被丢弃 |
+| 丰富 Agent 事件 | 仍缺少计划、通用 tool item、命令、diff 和审批领域事件 | UI 无法表达 coding-agent 活动 |
+| Codex item 解码 | `item/started` / `item/completed` 仍主要只取 id/type | 命令、文件修改等内容被丢弃 |
 | Server request | 审批、`requestUserInput` 和工具请求一律返回 `-32601` | 需要审批或用户补充信息的 coding task 会中断或被拒绝 |
 | Diff 与命令输出 | 未订阅或映射对应增量事件 | 用户看不到模型实际做了什么 |
 | Run 状态 | 只有 `isStreaming` 和消息占位 | 无法表示等待审批、等待工具和取消中状态 |
-| 丰富持久化 | 只保存 message/reasoning | 重启后丢失命令、审批、diff 和失败上下文 |
-| Generic 工具循环 | `ModelEvent` 不含 tool call | API Key 模型仍然只是聊天模型 |
+| 丰富持久化 | 目前只保存消息、推理、thread ID 和上下文派生状态 | 重启后仍会丢失命令、审批、diff 和完整运行上下文 |
+| Generic 工具循环 | `ModelEvent` 仍不含可执行 tool call | API Key 模型仍然只是聊天模型 |
 | Tool Host | 未实现 | Generic Runtime 无安全的本地执行能力 |
-| 系统指令 | 请求没有 system/developer instructions | Generic Runtime 没有稳定的 coding 行为契约 |
 
 ### 3.3 当前最关键的技术债
 
@@ -74,8 +75,8 @@
 2. `ChatMessage.Part.toolCall` 是展示占位，不足以承载命令状态、输出、文件变化、审批和恢复。
 3. `ConversationStore` 同时承担用户输入、运行协调、事件归并和展示状态；随着事件增加，需要把“事件归并为会话快照”的复杂逻辑集中起来，但不要为简单字段转发创建浅模块。
 4. 协议 DTO 当前手工收敛在一个文件中。扩展前必须继续保持版本化，不得把 Codex 原始 payload 泄漏到 UI 或持久化层。
-5. `CodexRPCEnvelope.id` 当前只有 `Int?`，而 0.144.5 schema 的 request ID 允许字符串或整数；审批请求和 `serverRequest/resolved` 接入前必须改为可哈希的联合类型。
-6. 当前 `AGENTS.md` 对 Codex Runtime 的描述落后于代码，需要随本文同步更新。
+5. `CodexRPCEnvelope.id` 当前只有 `Int?`，而 0.147.0 schema 的 request ID 允许字符串或整数；审批请求和 `serverRequest/resolved` 接入前必须改为可哈希的联合类型。
+6. 当前能力已经拆分到 `AGENTS.md`、上下文压缩实现记录和 Kimi 接入决策记录；修改架构边界时需要同步维护这些文档。
 
 ## 4. 设计原则
 
@@ -128,7 +129,7 @@ SwiftUI 只学习一个小的 Runtime 接口和统一领域事件。以下复杂
 
 ### 4.6 版本化 wire，稳定领域模型
 
-- Codex DTO 绑定 `codex-cli 0.144.5` 生成 schema。
+- Codex DTO 绑定当前锁定的 `codex-cli 0.147.0` 生成 schema；升级时重新生成并 diff。
 - 升级 Codex CLI 时先生成并 diff schema，再修改 DTO 和合约测试。
 - 未知 notification 默认记录诊断并忽略；损坏的 JSON-RPC envelope 才终止连接。
 - 领域事件保持稳定，wire 字段变化只在 Codex Adapter 内消化。
@@ -496,9 +497,9 @@ codex app-server generate-json-schema --out /tmp/disco-codex-schema
 
 生产 App 最终应捆绑经过签名和验证的固定 Codex 二进制；开发阶段可以继续定位本机 `codex`。
 
-#### 8.1.1 已验证的 0.144.5 能力
+#### 8.1.1 已验证的 0.147.0 能力
 
-2026-08-08 使用本机 `codex-cli 0.144.5` 生成的 v2 schema 已确认：
+2026-08-08 使用本机 `codex-cli 0.147.0` 生成的 v2 schema 已确认：
 
 | 位置 | 字段或取值 |
 |---|---|
@@ -524,7 +525,7 @@ codex app-server generate-json-schema --out /tmp/disco-codex-schema
 
 #### 8.1.2 `requestUserInput` 版本基线
 
-`item/tool/requestUserInput` 属于 experimental API，不在本文原始 `codex-cli 0.144.5` 稳定基线内。接入前必须把项目锁定版本升级到实际捆绑/支持的 Codex CLI，重新生成带 `--experimental` 的 schema 并提交 DTO/fixture diff；不能仅依据在线文档猜测字段。
+`item/tool/requestUserInput` 属于 experimental API，不在本文原始 `codex-cli 0.147.0` 稳定基线内。接入前必须把项目锁定版本升级到实际捆绑/支持的 Codex CLI，重新生成带 `--experimental` 的 schema 并提交 DTO/fixture diff；不能仅依据在线文档猜测字段。
 
 已使用 `codex-cli 0.147.0` schema 确认的目标 wire 形态：
 
@@ -1476,12 +1477,12 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 
 ### 21.2 Codex schema 快照
 
-- 用本机 0.144.5 生成 schema 到临时目录。
+- 用本机 0.147.0 生成 schema 到临时目录。
 - 记录需要的 thread start/resume、turn start、command/file item DTO。
 - 不把生成目录整体提交；只提交项目使用的 DTO 和必要 fixture。
 - 在测试中断言请求 JSON 包含 cwd 和策略。
 
-验收：scripted process 收到的 JSON 与 0.144.5 schema 一致。
+验收：scripted process 收到的 JSON 与 0.147.0 schema 一致。
 
 ### 21.3 Run 状态
 
@@ -1556,7 +1557,7 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 
 1. Project 是否支持多个 workspace root；建议第一版单 root，领域模型保留未来扩展空间但不提前实现多根 UI。
 2. Codex 二进制何时从“用户安装”切换为“应用捆绑”；建议 Beta 前完成。
-3. 第一版 approval policy 默认选择 `untrusted` 还是 `on-request`；枚举值已由 0.144.5 schema 确认，最终默认值以真实 smoke 的安全性和提示频率为准。
+3. 第一版 approval policy 默认选择 `untrusted` 还是 `on-request`；枚举值已由 0.147.0 schema 确认，最终默认值以真实 smoke 的安全性和提示频率为准。
 4. SwiftData 是否继续承载全部事件，还是迁移到显式 SQLite schema；Phase C 前评估 migration 和查询复杂度。
 5. 大输出保留期限和磁盘上限。
 6. Generic Runtime 首个正式 Provider；建议 OpenAI Platform Responses。
