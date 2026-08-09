@@ -62,6 +62,34 @@ final class CodexRuntime: AgentRuntime {
         }
     }
 
+    func compactContext(request: ContextCompactionRequest) async throws -> ContextCompactionUpdate {
+        guard activeRunID == nil else {
+            throw AgentFailure(
+                code: .contextCompactionFailed,
+                message: "回复生成中，暂时无法压缩上下文。"
+            )
+        }
+        guard let requestedThreadID = threadID ?? request.resumeThreadID else {
+            throw CodexAppServerError.noActiveThread
+        }
+        try await ensureReady()
+        guard let threadID, threadID == requestedThreadID else {
+            throw CodexAppServerError.noActiveThread
+        }
+        let startedAt = Date.now
+        let itemID = try await transport.compactThread(threadID: threadID)
+        return ContextCompactionUpdate(
+            snapshot: ContextCompactionSnapshot(
+                id: itemID,
+                runtimeKind: .codex,
+                trigger: .manual,
+                status: .completed,
+                startedAt: startedAt,
+                completedAt: .now
+            )
+        )
+    }
+
     func cancel(runID: RunID) async {
         guard activeRunID == runID else { return }
         activeTask?.cancel()
@@ -136,6 +164,46 @@ final class CodexRuntime: AgentRuntime {
                 switch turnEvent {
                 case .started, .itemStarted, .itemCompleted:
                     break
+                case let .contextUsageUpdated(usage):
+                    continuation.yield(.contextUsageUpdated(ContextUsageSnapshot(
+                        current: TokenUsageSnapshot(
+                            inputTokens: usage.last.inputTokens,
+                            cachedInputTokens: usage.last.cachedInputTokens,
+                            outputTokens: usage.last.outputTokens,
+                            reasoningOutputTokens: usage.last.reasoningOutputTokens,
+                            totalTokens: usage.last.totalTokens
+                        ),
+                        accumulated: TokenUsageSnapshot(
+                            inputTokens: usage.total.inputTokens,
+                            cachedInputTokens: usage.total.cachedInputTokens,
+                            outputTokens: usage.total.outputTokens,
+                            reasoningOutputTokens: usage.total.reasoningOutputTokens,
+                            totalTokens: usage.total.totalTokens
+                        ),
+                        contextWindow: usage.modelContextWindow,
+                        source: .codex
+                    )))
+                case let .contextCompactionStarted(itemID):
+                    continuation.yield(.contextCompactionUpdated(ContextCompactionUpdate(
+                        snapshot: ContextCompactionSnapshot(
+                            id: itemID,
+                            runtimeKind: .codex,
+                            trigger: .automatic,
+                            status: .running,
+                            startedAt: .now
+                        )
+                    )))
+                case let .contextCompactionCompleted(itemID):
+                    continuation.yield(.contextCompactionUpdated(ContextCompactionUpdate(
+                        snapshot: ContextCompactionSnapshot(
+                            id: itemID,
+                            runtimeKind: .codex,
+                            trigger: .automatic,
+                            status: .completed,
+                            startedAt: .now,
+                            completedAt: .now
+                        )
+                    )))
                 case let .agentMessageDelta(delta):
                     hasText = true
                     continuation.yield(.messageDelta(delta))

@@ -34,7 +34,7 @@ struct OpenAIResponsesProvider: ModelProvider {
         self.dialect = dialect
     }
 
-    func models() async throws -> [String] {
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
         var request = URLRequest(url: baseURL.appendingPathComponent("models"))
         request.httpMethod = "GET"
         request.timeoutInterval = 30
@@ -49,13 +49,13 @@ struct OpenAIResponsesProvider: ModelProvider {
             throw httpError(statusCode: httpResponse.statusCode, data: data)
         }
 
-        let models = try JSONDecoder().decode(ModelListResponse.self, from: data).data
-            .map(\.id)
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        guard !models.isEmpty else {
+        let catalog = try JSONDecoder().decode(ModelListResponse.self, from: data).data
+            .map { ModelCatalogEntry(id: $0.id) }
+            .sorted { $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending }
+        guard !catalog.isEmpty else {
             throw OpenAIProviderError.noModels
         }
-        return models
+        return catalog
     }
 
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
@@ -94,7 +94,15 @@ struct OpenAIResponsesProvider: ModelProvider {
                             .localizedCaseInsensitiveContains("text/event-stream") != true {
                             let body = try await read(bytes: bytes, limit: 10_485_760)
                             let response = try JSONDecoder().decode(APIResponse.self, from: body)
-                            if let message = response.error?.message, !message.isEmpty {
+                            if let error = response.error,
+                               let message = error.message, !message.isEmpty {
+                                if ContextOverflowMatcher.matches(
+                                    code: error.code,
+                                    type: error.type,
+                                    message: error.message
+                                ) {
+                                    throw OpenAIProviderError.contextOverflow(message: message)
+                                }
                                 throw OpenAIProviderError.responseFailed(message)
                             }
                             var parser = OpenAICompatibleStreamParser()
@@ -166,12 +174,25 @@ struct OpenAIResponsesProvider: ModelProvider {
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let input = request.messages.map {
+        var input = request.messages.map {
             InputMessage(role: $0.role.rawValue, content: $0.text)
+        }
+        // instructions 映射规则固定（计划《上下文压缩 v1》§2）：
+        // 原生方言用顶层 instructions；兼容方言在 input 最前插入 system message；
+        // nil 时保持现有请求体不变。
+        var instructions: String?
+        if let value = request.instructions {
+            switch dialect {
+            case .openAI:
+                instructions = value
+            case .deepSeek, .compatible:
+                input.insert(InputMessage(role: "system", content: value), at: 0)
+            }
         }
         urlRequest.httpBody = try JSONEncoder().encode(
             ResponsesRequestBody(
                 model: request.model,
+                instructions: instructions,
                 input: input,
                 stream: true,
                 store: false,
@@ -227,8 +248,18 @@ struct OpenAIResponsesProvider: ModelProvider {
     }
 
     private func httpError(statusCode: Int, data: Data) -> OpenAIProviderError {
-        let message = (try? JSONDecoder().decode(ErrorEnvelope.self, from: data))?.error.message
-        return .http(statusCode: statusCode, message: message)
+        let payload = try? JSONDecoder().decode(ErrorEnvelope.self, from: data)
+        let error = payload?.error
+        if ContextOverflowMatcher.matches(
+            code: error?.code,
+            type: error?.type,
+            message: error?.message
+        ) {
+            return .contextOverflow(
+                message: error?.message ?? "请求超出模型上下文窗口（HTTP \(statusCode)）。"
+            )
+        }
+        return .http(statusCode: statusCode, message: error?.message)
     }
 }
 
@@ -242,6 +273,8 @@ private struct APIModel: Decodable {
 
 private struct ResponsesRequestBody: Encodable {
     let model: String
+    /// 仅原生（openAI）方言使用的顶层 instructions（计划《上下文压缩 v1》§2）。
+    let instructions: String?
     let input: [InputMessage]
     let stream: Bool
     let store: Bool
@@ -252,6 +285,7 @@ private struct ResponsesRequestBody: Encodable {
 
     private enum CodingKeys: String, CodingKey {
         case model
+        case instructions
         case input
         case stream
         case store
@@ -259,6 +293,20 @@ private struct ResponsesRequestBody: Encodable {
         case tools
         case toolChoice = "tool_choice"
         case include
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(model, forKey: .model)
+        // nil 时不增加 instructions 字段，保持历史请求体兼容。
+        try container.encodeIfPresent(instructions, forKey: .instructions)
+        try container.encode(input, forKey: .input)
+        try container.encode(stream, forKey: .stream)
+        try container.encode(store, forKey: .store)
+        try container.encode(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(tools, forKey: .tools)
+        try container.encodeIfPresent(toolChoice, forKey: .toolChoice)
+        try container.encodeIfPresent(include, forKey: .include)
     }
 }
 
@@ -273,50 +321,6 @@ private struct ReasoningConfig: Encodable {
 private struct InputMessage: Encodable {
     let role: String
     let content: String
-}
-
-private struct ServerSentEventDecoder {
-    private var lineBytes: [UInt8] = []
-    private var dataLines: [String] = []
-
-    mutating func append(_ byte: UInt8) -> String? {
-        guard byte == 0x0A else {
-            lineBytes.append(byte)
-            return nil
-        }
-
-        var line = String(decoding: lineBytes, as: UTF8.self)
-        lineBytes.removeAll(keepingCapacity: true)
-        if line.last == "\r" {
-            line.removeLast()
-        }
-
-        if line.isEmpty {
-            return flushDataLines()
-        }
-        guard line.hasPrefix("data:") else { return nil }
-
-        var value = String(line.dropFirst(5))
-        if value.first == " " {
-            value.removeFirst()
-        }
-        dataLines.append(value)
-        return nil
-    }
-
-    mutating func finish() -> String? {
-        if !lineBytes.isEmpty {
-            _ = append(0x0A)
-        }
-        return flushDataLines()
-    }
-
-    private mutating func flushDataLines() -> String? {
-        guard !dataLines.isEmpty else { return nil }
-        let payload = dataLines.joined(separator: "\n")
-        dataLines.removeAll(keepingCapacity: true)
-        return payload
-    }
 }
 
 private struct OpenAICompatibleStreamParser {
@@ -351,7 +355,11 @@ private struct OpenAICompatibleStreamParser {
     }
 
     mutating func parseCompleteResponse(_ response: APIResponse) -> [ModelEvent] {
-        events(from: response, includeText: true)
+        var events = events(from: response, includeText: true)
+        if let usage = response.usage?.snapshot() {
+            events.append(.usage(usage))
+        }
+        return events
     }
 
     private mutating func parse(_ event: StreamEvent) throws -> Batch {
@@ -442,18 +450,35 @@ private struct OpenAICompatibleStreamParser {
                 )
             )
         case "response.completed":
-            let events = event.response.map {
+            var events = event.response.map {
                 self.events(from: $0, includeText: !hasText)
             } ?? []
+            // usage 不计作文本输出，也不改变终止判断（计划《上下文压缩 v1》§4）。
+            if let usage = event.response?.usage?.snapshot() {
+                events.append(.usage(usage))
+            }
             return Batch(events: events, isCompleted: true)
         case "response.failed", "response.incomplete":
-            throw OpenAIProviderError.responseFailed(
-                event.response?.error?.message ?? "响应生成失败。"
-            )
+            let payload = event.response?.error
+            let message = payload?.message ?? "响应生成失败。"
+            if ContextOverflowMatcher.matches(
+                code: payload?.code,
+                type: payload?.type,
+                message: payload?.message
+            ) {
+                throw OpenAIProviderError.contextOverflow(message: message)
+            }
+            throw OpenAIProviderError.responseFailed(message)
         case "error":
-            throw OpenAIProviderError.responseFailed(
-                event.message ?? event.error?.message ?? "服务返回了未知错误。"
-            )
+            let message = event.message ?? event.error?.message ?? "服务返回了未知错误。"
+            if ContextOverflowMatcher.matches(
+                code: event.error?.code,
+                type: event.error?.type,
+                message: event.error?.message ?? event.message
+            ) {
+                throw OpenAIProviderError.contextOverflow(message: message)
+            }
+            throw OpenAIProviderError.responseFailed(message)
         default:
             return .ignored
         }
@@ -623,6 +648,59 @@ private struct StreamEvent: Decodable {
 private struct APIResponse: Decodable {
     let error: APIErrorPayload?
     let output: [ResponseOutputItem]?
+    let usage: ResponseUsage?
+}
+
+/// Responses `usage` 对象（计划《上下文压缩 v1》§4）。
+/// 兼容方言可能直接给扁平 `cached_tokens` / `reasoning_tokens`，两种形态都接受；
+/// 缺失明细保持 nil，total 缺失时由 input + output 推导。
+private struct ResponseUsage: Decodable {
+    let inputTokens: Int?
+    let cachedTokens: Int?
+    let inputTokensDetails: InputDetails?
+    let outputTokens: Int?
+    let reasoningTokens: Int?
+    let outputTokensDetails: OutputDetails?
+    let totalTokens: Int?
+
+    struct InputDetails: Decodable {
+        let cachedTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case cachedTokens = "cached_tokens"
+        }
+    }
+
+    struct OutputDetails: Decodable {
+        let reasoningTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case reasoningTokens = "reasoning_tokens"
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case cachedTokens = "cached_tokens"
+        case inputTokensDetails = "input_tokens_details"
+        case outputTokens = "output_tokens"
+        case reasoningTokens = "reasoning_tokens"
+        case outputTokensDetails = "output_tokens_details"
+        case totalTokens = "total_tokens"
+    }
+
+    /// 缺少 input/output 任一字段时返回 nil（不伪造用量）；
+    /// total 缺失时按 input + output 推导。
+    func snapshot() -> TokenUsageSnapshot? {
+        guard let inputTokens, let outputTokens else { return nil }
+        return TokenUsageSnapshot(
+            inputTokens: inputTokens,
+            cachedInputTokens: inputTokensDetails?.cachedTokens ?? cachedTokens,
+            outputTokens: outputTokens,
+            reasoningOutputTokens: outputTokensDetails?.reasoningTokens ?? reasoningTokens,
+            totalTokens: totalTokens ?? inputTokens + outputTokens
+        )
+    }
 }
 
 private struct ResponseOutputItem: Decodable {
@@ -757,6 +835,9 @@ enum OpenAIProviderError: LocalizedError {
     case noTextOutput
     case http(statusCode: Int, message: String?)
     case responseFailed(String)
+    /// 服务端明确报告输入超出模型上下文窗口（计划《上下文压缩 v1》§3）。
+    /// message 保持服务端原文，与归类前展示的错误信息一致。
+    case contextOverflow(message: String)
 
     var errorDescription: String? {
         switch self {
@@ -781,6 +862,66 @@ enum OpenAIProviderError: LocalizedError {
             }
         case let .responseFailed(message):
             message
+        case let .contextOverflow(message):
+            message
         }
+    }
+}
+
+extension OpenAIProviderError: ModelFailureClassifying {
+    /// 稳定分类（计划《上下文压缩 v1》§3）；只有明确识别为上下文溢出才返回 contextOverflow。
+    var failureKind: ModelFailureKind {
+        if case .contextOverflow = self {
+            return .contextOverflow
+        }
+        return .other
+    }
+}
+
+/// 上下文溢出判定（计划《上下文压缩 v1》§3）。
+/// 优先识别服务端结构化 code/type；缺少结构化字段时才匹配保守的已知错误文本白名单。
+/// HTTP 400/413 单独不构成溢出——调用方不得只凭状态码归类。
+enum ContextOverflowMatcher {
+    /// 已知结构化信号（code 或 type，小写包含匹配）。
+    private static let structuredSignals = [
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "max_context_length_exceeded",
+        "context_overflow",
+    ]
+
+    /// 已知错误文本（message 小写后直接包含即可判定的完整短语）。
+    private static let messageSignals = [
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "maximum context length",
+        "prompt is too long",
+    ]
+
+    /// 文本白名单的上下文词与超限词：两类同时出现才判定，避免误伤普通错误。
+    private static let contextPhrases = [
+        "context length",
+        "context window",
+    ]
+    private static let exceededPhrases = [
+        "exceed",
+        "too long",
+        "too large",
+        "overflow",
+    ]
+
+    static func matches(code: String?, type: String?, message: String?) -> Bool {
+        let structured = [code, type].compactMap { $0?.lowercased() }
+        if structured.contains(where: { value in
+            structuredSignals.contains { value.contains($0) }
+        }) {
+            return true
+        }
+        guard let message = message?.lowercased() else { return false }
+        if messageSignals.contains(where: { message.contains($0) }) {
+            return true
+        }
+        return contextPhrases.contains(where: { message.contains($0) })
+            && exceededPhrases.contains(where: { message.contains($0) })
     }
 }

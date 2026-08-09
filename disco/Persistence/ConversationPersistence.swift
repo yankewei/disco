@@ -9,6 +9,8 @@ struct ConversationSnapshot {
     /// 订阅服务商（ChatGPT/Codex）的会话线程 id；重启后用于 thread/resume。
     /// API Key 服务商不使用，始终为 nil。
     let threadID: String?
+    /// Generic 压缩 checkpoint 与最近压缩记录（派生缓存，消息才是事实来源）。
+    var contextState: ConversationContextState? = nil
 }
 
 @MainActor
@@ -108,7 +110,9 @@ final class ConversationPersistence: ConversationPersisting {
                 createdAt: conversation.createdAt,
                 updatedAt: conversation.updatedAt,
                 messages: messages,
-                threadID: conversation.threadID
+                threadID: conversation.threadID,
+                // 解码/版本/校验失败时丢弃 checkpoint，不删除消息（计划 §2）
+                contextState: PersistedConversationContextState.decode(conversation.contextStateData)
             )
         }
     }
@@ -132,6 +136,8 @@ final class ConversationPersistence: ConversationPersisting {
 
         persistedConversation.updatedAt = conversation.updatedAt
         persistedConversation.threadID = conversation.threadID
+        persistedConversation.contextStateData = try PersistedConversationContextState
+            .encode(conversation.contextState)
 
         let existingMessages = Dictionary(
             uniqueKeysWithValues: persistedConversation.messages.map { ($0.id, $0) }
@@ -216,6 +222,8 @@ private final class PersistedConversation {
     var updatedAt: Date
     /// 订阅服务商的会话线程 id（其余服务商为 nil）
     var threadID: String?
+    /// 版本化 JSON（PersistedConversationContextState）；旧库记录为 nil。
+    var contextStateData: Data? = nil
     @Relationship(deleteRule: .cascade, inverse: \PersistedMessage.conversation)
     var messages: [PersistedMessage] = []
 
@@ -224,6 +232,41 @@ private final class PersistedConversation {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.threadID = threadID
+    }
+}
+
+/// 会话上下文状态的持久化线格式（计划《上下文压缩 v1》§2）。
+/// 显式 version 避免依赖合成编码格式；解码失败统一返回 nil（丢弃 checkpoint，不动消息）。
+struct PersistedConversationContextState: Codable {
+    static let currentVersion = 1
+
+    let version: Int
+    let checkpoint: ContextCheckpoint?
+    let lastSuccessfulCompaction: ContextCompactionSnapshot?
+
+    static func encode(_ state: ConversationContextState?) throws -> Data? {
+        guard let state, state.checkpoint != nil || state.lastSuccessfulCompaction != nil else {
+            return nil
+        }
+        return try JSONEncoder().encode(
+            PersistedConversationContextState(
+                version: currentVersion,
+                checkpoint: state.checkpoint,
+                lastSuccessfulCompaction: state.lastSuccessfulCompaction
+            )
+        )
+    }
+
+    static func decode(_ data: Data?) -> ConversationContextState? {
+        guard let data,
+              let decoded = try? JSONDecoder().decode(PersistedConversationContextState.self, from: data),
+              decoded.version == currentVersion else {
+            return nil
+        }
+        return ConversationContextState(
+            checkpoint: decoded.checkpoint,
+            lastSuccessfulCompaction: decoded.lastSuccessfulCompaction
+        )
     }
 }
 
@@ -292,7 +335,7 @@ private struct PersistedPart: Codable {
     let hostedTool: HostedToolSnapshot?
     let toolCall: ChatMessage.ToolCallSnapshot?
 
-    init(_ part: ChatMessage.Part) {
+    nonisolated init(_ part: ChatMessage.Part) {
         switch part {
         case let .text(content):
             type = .text

@@ -3,6 +3,15 @@ import XCTest
 
 @MainActor
 final class ConversationStoreTests: XCTestCase {
+    func testEstimatedContextTokenCountIncludesHistoryAndDraft() {
+        let store = ConversationStore(messages: [
+            ChatMessage(role: .user, text: "你好"),
+        ])
+        store.draft = "hello"
+
+        XCTAssertEqual(store.estimatedContextTokenCount, 4)
+    }
+
     func testSendTrimsDraftPassesHistoryAndPersistsFinalMessages() async throws {
         let recorder = StreamRecorder()
         let persisted = StreamRecorder()
@@ -289,7 +298,9 @@ private struct RecordingProvider: ModelProvider {
 
     let descriptor = ProviderDescriptor(id: "recording", displayName: "Recording")
 
-    func models() async throws -> [String] { ["test-model"] }
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
 
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -312,7 +323,9 @@ private struct RecordingProvider: ModelProvider {
 private struct NeverEndingProvider: ModelProvider {
     let descriptor = ProviderDescriptor(id: "never-ending", displayName: "NeverEnding")
 
-    func models() async throws -> [String] { ["test-model"] }
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { _ in }
     }

@@ -139,8 +139,54 @@ enum CodexTurnEvent: Sendable, Equatable {
     case itemStarted(itemID: String, itemType: String?)
     case agentMessageDelta(String)
     case reasoningSummaryDelta(String)
+    /// 服务端真实 token 用量（thread/tokenUsage/updated）。
+    case contextUsageUpdated(CodexContextUsage)
+    /// 自动/手动压缩 item 生命周期（contextCompaction ThreadItem）。
+    case contextCompactionStarted(itemID: String)
+    case contextCompactionCompleted(itemID: String)
     case itemCompleted(itemID: String, itemType: String?)
     case completed(CodexTurnStatus)
+}
+
+/// `thread/tokenUsage/updated` 消化后的领域快照（wire DTO 不离开本层）。
+/// schema 缺字段时整条快照丢弃，不伪造数值。
+struct CodexContextUsage: Sendable, Equatable {
+    struct Breakdown: Sendable, Equatable {
+        let inputTokens: Int
+        let cachedInputTokens: Int?
+        let outputTokens: Int
+        let reasoningOutputTokens: Int?
+        let totalTokens: Int
+
+        /// 由 wire DTO 转换；必需字段（input/output/total）缺失时返回 nil。
+        init?(_ dto: CodexTokenUsageBreakdown?) {
+            guard let dto,
+                  let inputTokens = dto.inputTokens,
+                  let outputTokens = dto.outputTokens,
+                  let totalTokens = dto.totalTokens else { return nil }
+            self.inputTokens = inputTokens
+            self.cachedInputTokens = dto.cachedInputTokens
+            self.outputTokens = outputTokens
+            self.reasoningOutputTokens = dto.reasoningOutputTokens
+            self.totalTokens = totalTokens
+        }
+    }
+
+    /// 最近一次模型调用的用量（schema: last）。
+    let last: Breakdown
+    /// 线程累计用量（schema: total）。
+    let total: Breakdown
+    /// 模型上下文窗口；服务端未提供时为 nil。
+    let modelContextWindow: Int?
+
+    init?(_ dto: CodexThreadTokenUsage?) {
+        guard let dto,
+              let last = Breakdown(dto.last),
+              let total = Breakdown(dto.total) else { return nil }
+        self.last = last
+        self.total = total
+        self.modelContextWindow = dto.modelContextWindow
+    }
 }
 
 enum CodexTurnStatus: Sendable, Equatable {
@@ -199,6 +245,8 @@ enum CodexAppServerError: LocalizedError, Equatable {
     case noActiveThread
     case turnAlreadyInProgress
     case noActiveTurn
+    case compactionAlreadyInProgress
+    case manualCompactionUnsupported
     case stopped
     case processExited
     case requestTimedOut(String)
@@ -217,6 +265,8 @@ enum CodexAppServerError: LocalizedError, Equatable {
         case .noActiveThread: "尚未创建会话线程（thread/start）。"
         case .turnAlreadyInProgress: "该会话线程已有进行中的 turn。"
         case .noActiveTurn: "当前没有进行中的 turn。"
+        case .compactionAlreadyInProgress: "该会话线程已有进行中的压缩。"
+        case .manualCompactionUnsupported: "当前 codex app-server 版本不支持手动压缩。请升级 codex CLI 后重试。"
         case .stopped: "codex app-server 已停止。"
         case .processExited: "codex app-server 进程已退出。"
         case let .requestTimedOut(method): "codex app-server 请求超时：\(method)"
@@ -248,17 +298,21 @@ final class CodexAppServerTransport {
         let arguments: [String]
         let clientInfo: ClientInfo
         let requestTimeout: Duration
+        /// 手动压缩等待 `contextCompaction` item 完成的超时（压缩大线程可能较慢）。
+        let compactionTimeout: Duration
 
         init(
             executableURL: URL,
             arguments: [String],
             clientInfo: ClientInfo,
-            requestTimeout: Duration = .seconds(30)
+            requestTimeout: Duration = .seconds(30),
+            compactionTimeout: Duration = .seconds(180)
         ) {
             self.executableURL = executableURL
             self.arguments = arguments
             self.clientInfo = clientInfo
             self.requestTimeout = requestTimeout
+            self.compactionTimeout = compactionTimeout
         }
 
         static func standard() -> Configuration {
@@ -297,6 +351,12 @@ final class CodexAppServerTransport {
         var timeoutTask: Task<Void, Never>?
     }
 
+    /// 一次进行中的手动压缩：等待对应 thread 的 `contextCompaction` item 完成。
+    private struct PendingCompaction {
+        let continuation: CheckedContinuation<String, Error>
+        var timeoutTask: Task<Void, Never>?
+    }
+
     private let configuration: Configuration
     private let processFactory: () -> LineProcess
     private var process: LineProcess?
@@ -308,6 +368,10 @@ final class CodexAppServerTransport {
     private var activeTurns: [String: ActiveTurn] = [:]
     private var loadedThreadIDs: Set<String> = []
     private var defaultThreadID: String?
+    private var pendingCompactions: [String: PendingCompaction] = [:]
+    /// 旧版本 app-server 对 thread/compact/start 返回 method-not-found 后置位；
+    /// 当前连接内后续手动压缩直接失败，不影响自动对话。连接重建时复位。
+    private var manualCompactionUnsupported = false
 
     /// 每次成功握手递增。Runtime 用它判断连接重启后是否需要重新 resume thread。
     private(set) var connectionGeneration: UInt64 = 0
@@ -369,12 +433,14 @@ final class CodexAppServerTransport {
         isStopping = true
         finishActiveTurns(with: CodexAppServerError.stopped)
         finishPending(with: CodexAppServerError.stopped)
+        finishPendingCompactions(with: CodexAppServerError.stopped)
         process?.terminate()
         process = nil
         readTask?.cancel()
         readTask = nil
         loadedThreadIDs.removeAll()
         defaultThreadID = nil
+        manualCompactionUnsupported = false
         isInitialized = false
     }
 
@@ -489,6 +555,60 @@ final class CodexAppServerTransport {
         try await interruptTurn(threadID: threadID)
     }
 
+    /// 该线程当前是否有活动 turn（手动压缩的互斥条件之一）。
+    func hasActiveTurn(threadID: String) -> Bool {
+        activeTurns[threadID] != nil
+    }
+
+    /// 手动压缩（计划《上下文压缩 v1》§4）：发送 `thread/compact/start`，
+    /// 并等待对应 thread 的 `contextCompaction` item 完成，返回该 item 的 id。
+    /// 仅无线程内活动 turn 时可用；旧版本返回 method-not-found 时在当前连接内
+    /// 标记不支持并抛出 `manualCompactionUnsupported`。
+    func compactThread(threadID: String) async throws -> String {
+        guard isInitialized else { throw CodexAppServerError.notInitialized }
+        guard loadedThreadIDs.contains(threadID) else { throw CodexAppServerError.noActiveThread }
+        guard !manualCompactionUnsupported else { throw CodexAppServerError.manualCompactionUnsupported }
+        guard activeTurns[threadID] == nil else { throw CodexAppServerError.turnAlreadyInProgress }
+        guard pendingCompactions[threadID] == nil else { throw CodexAppServerError.compactionAlreadyInProgress }
+
+        // 先注册完成等待，再发请求：item 通知可能紧随响应到达
+        let itemID: String = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<String, Error>) in
+            pendingCompactions[threadID] = PendingCompaction(continuation: continuation, timeoutTask: nil)
+            let timeoutTask = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: self?.configuration.compactionTimeout ?? .seconds(180))
+                } catch {
+                    return
+                }
+                guard let pending = self?.pendingCompactions.removeValue(forKey: threadID) else { return }
+                pending.continuation.resume(throwing: CodexAppServerError.requestTimedOut("thread/compact/start"))
+            }
+            pendingCompactions[threadID]?.timeoutTask = timeoutTask
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await self.request(
+                        method: "thread/compact/start",
+                        params: CodexThreadCompactStartParams(threadId: threadID),
+                        result: CodexEmptyResponse.self
+                    )
+                } catch {
+                    guard let pending = self.pendingCompactions.removeValue(forKey: threadID) else { return }
+                    pending.timeoutTask?.cancel()
+                    if case let CodexAppServerError.rpcError(code, _) = error, code == -32601 {
+                        // 旧版本 app-server 无此方法：本连接内禁用，自动对话不受影响
+                        self.manualCompactionUnsupported = true
+                        pending.continuation.resume(throwing: CodexAppServerError.manualCompactionUnsupported)
+                    } else {
+                        pending.continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+        return itemID
+    }
+
     // MARK: 读循环与路由
 
     private func beginTurn(
@@ -598,10 +718,22 @@ final class CodexAppServerTransport {
         case "turn/started":
             guard let notification = decode(params, as: CodexTurnStartedNotification.self) else { return }
             handleTurnStarted(notification)
+        case "thread/tokenUsage/updated":
+            guard let notification = decode(
+                params,
+                as: CodexThreadTokenUsageUpdatedNotification.self
+            ), let usage = CodexContextUsage(notification.tokenUsage) else { return }
+            activeTurns[notification.threadId]?.continuation.yield(.contextUsageUpdated(usage))
         case "item/started":
             guard let lifecycle = decode(params, as: CodexItemLifecycleNotification.self),
-                  let active = activeTurns[lifecycle.threadId],
                   let itemID = lifecycle.itemID else { return }
+            if lifecycle.itemType == "contextCompaction"
+                || lifecycle.itemType == "context_compaction" {
+                activeTurns[lifecycle.threadId]?.continuation.yield(
+                    .contextCompactionStarted(itemID: itemID)
+                )
+            }
+            guard let active = activeTurns[lifecycle.threadId] else { return }
             active.continuation.yield(.itemStarted(itemID: itemID, itemType: lifecycle.itemType))
         case "item/agentMessage/delta":
             if let delta = decode(params, as: CodexAgentMessageDeltaNotification.self) {
@@ -613,8 +745,18 @@ final class CodexAppServerTransport {
             }
         case "item/completed":
             guard let lifecycle = decode(params, as: CodexItemLifecycleNotification.self),
-                  let active = activeTurns[lifecycle.threadId],
                   let itemID = lifecycle.itemID else { return }
+            if lifecycle.itemType == "contextCompaction"
+                || lifecycle.itemType == "context_compaction" {
+                activeTurns[lifecycle.threadId]?.continuation.yield(
+                    .contextCompactionCompleted(itemID: itemID)
+                )
+                if let pending = pendingCompactions.removeValue(forKey: lifecycle.threadId) {
+                    pending.timeoutTask?.cancel()
+                    pending.continuation.resume(returning: itemID)
+                }
+            }
+            guard let active = activeTurns[lifecycle.threadId] else { return }
             active.continuation.yield(.itemCompleted(itemID: itemID, itemType: lifecycle.itemType))
         case "turn/completed":
             guard let notification = decode(params, as: CodexTurnCompletedNotification.self) else { return }
@@ -657,6 +799,7 @@ final class CodexAppServerTransport {
         isStopping = true
         finishActiveTurns(with: error)
         finishPending(with: error)
+        finishPendingCompactions(with: error)
         process?.terminate()
         process = nil
         readTask?.cancel()
@@ -675,6 +818,15 @@ final class CodexAppServerTransport {
     private func finishPending(with error: Error) {
         let requests = pending.values
         pending.removeAll()
+        for request in requests {
+            request.timeoutTask?.cancel()
+            request.continuation.resume(throwing: error)
+        }
+    }
+
+    private func finishPendingCompactions(with error: Error) {
+        let requests = pendingCompactions.values
+        pendingCompactions.removeAll()
         for request in requests {
             request.timeoutTask?.cancel()
             request.continuation.resume(throwing: error)

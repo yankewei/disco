@@ -40,8 +40,10 @@ final class AppState: ObservableObject {
     private let codexTransportFactory: @MainActor () -> CodexAppServerTransport
     /// ChatGPT/Codex 使用一条应用级长连接；连接内按 threadId 隔离各会话。
     private var codexTransport: CodexAppServerTransport?
-    /// 设置页验证前可能还没有 ProviderConfig，先暂存本次 model/list 的能力目录。
-    private var discoveredModelReasoningCapabilities: [ProviderVendor: [String: ModelReasoningCapability]] = [:]
+    /// 设置页验证前可能还没有 ProviderConfig，先暂存本次完整模型目录。
+    private var discoveredModelCatalogs: [ProviderVendor: [ModelCatalogEntry]] = [:]
+    /// 用户按模型填写的上下文窗口覆盖值，不随模型目录刷新删除。
+    private var contextWindowOverrides: [ProviderVendor: [String: Int]] = [:]
 
     var selectedConversation: ConversationSession? {
         guard let selectedConversationID else { return conversations.first }
@@ -78,6 +80,11 @@ final class AppState: ObservableObject {
                 ($0, baseKeyStore.forAccount($0.keychainAccount))
             }
         )
+        for vendor in ProviderVendor.allCases {
+            contextWindowOverrides[vendor] = defaults.data(
+                forKey: vendor.contextWindowOverridesDefaultsKey
+            ).flatMap { try? JSONDecoder().decode([String: Int].self, from: $0) } ?? [:]
+        }
         // 旧版全局思考模式开关：升级后迁移为各服务商的默认值，并移除旧键
         let legacyThinking = defaults.object(forKey: LegacyProviderKeys.thinkingEnabled) as? Bool
         storageError = startupStorageError
@@ -91,16 +98,56 @@ final class AppState: ObservableObject {
         for vendor in ProviderVendor.allCases {
             guard let baseURL = defaults.string(forKey: vendor.baseURLDefaultsKey) else { continue }
             let storedKey = (try? self.keyStores[vendor]?.load()).flatMap { $0 }
-            let capabilities = defaults.data(forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
-                .flatMap { try? JSONDecoder().decode([String: ModelReasoningCapability].self, from: $0) }
-                ?? [:]
+            let modelCatalog: [ModelCatalogEntry]
+            if let data = defaults.data(forKey: vendor.modelCatalogDefaultsKey),
+               let decoded = try? JSONDecoder().decode([ModelCatalogEntry].self, from: data) {
+                modelCatalog = decoded
+                defaults.removeObject(forKey: vendor.modelsDefaultsKey)
+                defaults.removeObject(forKey: vendor.modelContextWindowsDefaultsKey)
+                defaults.removeObject(forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
+            } else {
+                let contextWindows = defaults.data(forKey: vendor.modelContextWindowsDefaultsKey)
+                    .flatMap { try? JSONDecoder().decode([String: Int].self, from: $0) }
+                    ?? [:]
+                let reasoningCapabilities = defaults.data(forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
+                    .flatMap {
+                        try? JSONDecoder().decode(
+                            [String: LegacyModelReasoningCapability].self,
+                            from: $0
+                        )
+                    }
+                    ?? [:]
+                var modelIDs = defaults.stringArray(forKey: vendor.modelsDefaultsKey) ?? []
+                let selectedModel = defaults.string(forKey: vendor.modelDefaultsKey) ?? ""
+                let additionalIDs = contextWindows.keys.sorted()
+                    + reasoningCapabilities.keys.sorted()
+                    + (selectedModel.isEmpty ? [] : [selectedModel])
+                for modelID in additionalIDs where !modelIDs.contains(modelID) {
+                    modelIDs.append(modelID)
+                }
+                modelCatalog = modelIDs.map { modelID in
+                    let reasoning = reasoningCapabilities[modelID]
+                    return vendor.enrichingCatalogEntry(ModelCatalogEntry(
+                        id: modelID,
+                        contextWindow: contextWindows[modelID],
+                        supportedReasoningEfforts: reasoning?.supportedEfforts,
+                        defaultReasoningEffort: reasoning?.defaultEffort
+                    ))
+                }
+                if !modelCatalog.isEmpty,
+                   let data = try? JSONEncoder().encode(modelCatalog) {
+                    defaults.set(data, forKey: vendor.modelCatalogDefaultsKey)
+                    defaults.removeObject(forKey: vendor.modelsDefaultsKey)
+                    defaults.removeObject(forKey: vendor.modelContextWindowsDefaultsKey)
+                    defaults.removeObject(forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
+                }
+            }
             loaded[vendor] = ProviderConfig(
                 baseURL: baseURL,
                 model: defaults.string(forKey: vendor.modelDefaultsKey) ?? "",
                 hasAPIKey: vendor.requiresAPIKey && (storedKey.map { !$0.isEmpty } ?? false),
-                models: defaults.stringArray(forKey: vendor.modelsDefaultsKey) ?? [],
+                modelCatalog: modelCatalog,
                 thinkingEnabled: defaults.object(forKey: vendor.thinkingEnabledDefaultsKey) as? Bool ?? legacyThinking ?? true,
-                modelReasoningCapabilities: capabilities,
                 reasoningEffort: defaults.string(forKey: vendor.reasoningEffortDefaultsKey),
                 lastVerifiedAt: (defaults.object(forKey: vendor.verifiedAtDefaultsKey) as? TimeInterval)
                     .map(Date.init(timeIntervalSince1970:))
@@ -127,7 +174,8 @@ final class AppState: ObservableObject {
                     createdAt: $0.createdAt,
                     updatedAt: $0.updatedAt,
                     messages: $0.messages,
-                    threadID: $0.threadID
+                    threadID: $0.threadID,
+                    contextState: $0.contextState ?? ConversationContextState()
                 )
             }
         } catch {
@@ -188,27 +236,34 @@ final class AppState: ObservableObject {
 
         var updated = providerConfigs
         let thinkingEnabled = providerConfigs[vendor]?.thinkingEnabled ?? true
-        let capabilities = discoveredModelReasoningCapabilities[vendor]
-            ?? providerConfigs[vendor]?.modelReasoningCapabilities
-            ?? [:]
+        let discoveredByID = Dictionary(
+            uniqueKeysWithValues: (discoveredModelCatalogs[vendor] ?? []).map { ($0.id, $0) }
+        )
+        let existingByID = Dictionary(
+            uniqueKeysWithValues: (providerConfigs[vendor]?.modelCatalog ?? []).map { ($0.id, $0) }
+        )
+        let catalogIDs = models.isEmpty ? [trimmedModel] : models
+        let modelCatalog = catalogIDs.map { modelID in
+            discoveredByID[modelID]
+                ?? existingByID[modelID]
+                ?? vendor.enrichingCatalogEntry(ModelCatalogEntry(id: modelID))
+        }
         let reasoningEffort = providerConfigs[vendor]?.reasoningEffort
         let verifiedAt = Date.now
         updated[vendor] = ProviderConfig(
             baseURL: providerBaseURL,
             model: trimmedModel,
             hasAPIKey: vendor.requiresAPIKey,
-            models: models,
+            modelCatalog: modelCatalog,
             thinkingEnabled: thinkingEnabled,
-            modelReasoningCapabilities: capabilities,
             reasoningEffort: reasoningEffort,
             lastVerifiedAt: verifiedAt
         )
         providerConfigs = updated
         defaults.set(providerBaseURL, forKey: vendor.baseURLDefaultsKey)
         defaults.set(trimmedModel, forKey: vendor.modelDefaultsKey)
-        defaults.set(models, forKey: vendor.modelsDefaultsKey)
         defaults.set(thinkingEnabled, forKey: vendor.thinkingEnabledDefaultsKey)
-        persistModelReasoningCapabilities(capabilities, for: vendor)
+        persistModelCatalog(modelCatalog, for: vendor)
         persistReasoningEffort(reasoningEffort, for: vendor)
         defaults.set(verifiedAt.timeIntervalSince1970, forKey: vendor.verifiedAtDefaultsKey)
         authError = nil
@@ -230,8 +285,7 @@ final class AppState: ObservableObject {
         if var config = updated[vendor] {
             config.hasAPIKey = false
             config.model = ""
-            config.models = []
-            config.modelReasoningCapabilities = [:]
+            config.modelCatalog = []
             config.reasoningEffort = nil
             config.lastVerifiedAt = nil
             updated[vendor] = config
@@ -239,14 +293,19 @@ final class AppState: ObservableObject {
         providerConfigs = updated
         defaults.removeObject(forKey: vendor.baseURLDefaultsKey)
         defaults.removeObject(forKey: vendor.modelDefaultsKey)
+        defaults.removeObject(forKey: vendor.modelCatalogDefaultsKey)
         defaults.removeObject(forKey: vendor.modelsDefaultsKey)
         defaults.removeObject(forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
+        defaults.removeObject(forKey: vendor.modelContextWindowsDefaultsKey)
+        defaults.removeObject(forKey: vendor.contextWindowOverridesDefaultsKey)
         defaults.removeObject(forKey: vendor.reasoningEffortDefaultsKey)
         defaults.removeObject(forKey: vendor.verifiedAtDefaultsKey)
         if vendor == activeVendor {
             refreshRuntimes(stopActiveStreams: true)
             syncLegacyKeys()
         }
+        discoveredModelCatalogs[vendor] = nil
+        contextWindowOverrides[vendor] = [:]
         authError = nil
     }
 
@@ -257,20 +316,20 @@ final class AppState: ObservableObject {
             defer { transport.stop() }
             try await transport.start()
             let catalog = try await transport.listModels()
-            let models = catalog.map(\.id)
-            let capabilities = Dictionary(uniqueKeysWithValues: catalog.map {
-                ($0.id, ModelReasoningCapability(
-                    supportedEfforts: $0.supportedReasoningEfforts,
-                    defaultEffort: $0.defaultReasoningEffort
+            let modelCatalog = catalog.map {
+                vendor.enrichingCatalogEntry(ModelCatalogEntry(
+                    id: $0.id,
+                    displayName: $0.displayName,
+                    supportedReasoningEfforts: $0.supportedReasoningEfforts,
+                    defaultReasoningEffort: $0.defaultReasoningEffort
                 ))
-            })
-            discoveredModelReasoningCapabilities[vendor] = capabilities
+            }
+            let models = modelCatalog.map(\.id)
+            discoveredModelCatalogs[vendor] = modelCatalog
             if var config = providerConfigs[vendor] {
-                config.models = models
-                config.modelReasoningCapabilities = capabilities
+                config.modelCatalog = modelCatalog
                 providerConfigs[vendor] = config
-                defaults.set(models, forKey: vendor.modelsDefaultsKey)
-                persistModelReasoningCapabilities(capabilities, for: vendor)
+                persistModelCatalog(modelCatalog, for: vendor)
             }
             codexModelCatalogError = nil
             return models
@@ -279,10 +338,27 @@ final class AppState: ObservableObject {
         let providerBaseURL = try Self.validatedBaseURL(baseURL)
         let resolvedKey = try resolvedAPIKey(vendor: vendor, apiKey: apiKey)
 
-        return try await OpenAIResponsesProvider(
-            apiKey: resolvedKey,
-            baseURL: providerBaseURL
-        ).models()
+        let catalog: [ModelCatalogEntry]
+        if vendor == .kimiCode {
+            catalog = try await OpenAIChatCompletionsProvider(
+                apiKey: resolvedKey,
+                baseURL: providerBaseURL,
+                dialect: .kimi
+            ).modelCatalog()
+        } else {
+            catalog = try await OpenAIResponsesProvider(
+                apiKey: resolvedKey,
+                baseURL: providerBaseURL
+            ).modelCatalog()
+        }
+        let enrichedCatalog = catalog.map(vendor.enrichingCatalogEntry)
+        discoveredModelCatalogs[vendor] = enrichedCatalog
+        if var config = providerConfigs[vendor] {
+            config.modelCatalog = enrichedCatalog
+            providerConfigs[vendor] = config
+            persistModelCatalog(enrichedCatalog, for: vendor)
+        }
+        return enrichedCatalog.map(\.id)
     }
 
     /// 已保存的 Codex 配置可能来自旧版本；聊天页进入时按需补齐模型推理能力目录。
@@ -290,7 +366,7 @@ final class AppState: ObservableObject {
         guard activeVendor == .chatgpt,
               let config = providerConfigs[.chatgpt],
               ProviderVendor.chatgpt.isConfigured(config),
-              config.modelReasoningCapabilities[config.model] == nil,
+              config.catalogEntry(for: config.model)?.supportedReasoningEfforts == nil,
               !isRefreshingCodexModelCatalog else { return }
 
         isRefreshingCodexModelCatalog = true
@@ -400,10 +476,8 @@ final class AppState: ObservableObject {
     /// 当前服务商可用的推理档位；DeepSeek 支持四档，其他 API Key 服务商保持二态语义。
     func reasoningEfforts(for vendor: ProviderVendor) -> [String] {
         guard let config = providerConfigs[vendor] else { return [] }
-        if vendor == .chatgpt {
-            return config.modelReasoningCapabilities[config.model]?.supportedEfforts ?? []
-        }
-        return vendor.supportedReasoningEfforts
+        return config.catalogEntry(for: config.model)?.supportedReasoningEfforts
+            ?? vendor.supportedReasoningEfforts
     }
 
     /// 当前推理档位；nil 表示 Codex 省略 effort，使用服务端默认值。
@@ -421,9 +495,46 @@ final class AppState: ObservableObject {
         return config.thinkingEnabled ? "high" : "none"
     }
 
+    func contextWindow(for vendor: ProviderVendor, model: String) -> Int? {
+        contextWindowOverrides[vendor]?[model]
+            ?? providerConfigs[vendor]?.catalogEntry(for: model)?.contextWindow
+            ?? discoveredModelCatalogs[vendor]?.first { $0.id == model }?.contextWindow
+            ?? vendor.contextWindow(for: model)
+    }
+
+    /// 设置或清除某个模型的上下文窗口覆盖值。合法范围为 4,096～16,777,216。
+    func setContextWindowOverride(_ value: Int?, for model: String, vendor: ProviderVendor) {
+        guard !model.isEmpty else { return }
+        if let value, !(4_096...16_777_216).contains(value) {
+            return
+        }
+        var overrides = contextWindowOverrides[vendor] ?? [:]
+        if let value {
+            overrides[model] = value
+        } else {
+            overrides.removeValue(forKey: model)
+        }
+        contextWindowOverrides[vendor] = overrides
+        if let data = try? JSONEncoder().encode(overrides) {
+            defaults.set(data, forKey: vendor.contextWindowOverridesDefaultsKey)
+        }
+        if vendor == activeVendor {
+            refreshRuntimes(stopActiveStreams: false)
+        }
+    }
+
+    func contextWindowOverride(for vendor: ProviderVendor, model: String) -> Int? {
+        contextWindowOverrides[vendor]?[model]
+    }
+
     func defaultReasoningEffort(for vendor: ProviderVendor) -> String? {
-        guard let config = providerConfigs[vendor], vendor == .chatgpt else { return nil }
-        return config.modelReasoningCapabilities[config.model]?.defaultEffort
+        guard let config = providerConfigs[vendor] else { return nil }
+        return config.catalogEntry(for: config.model)?.defaultReasoningEffort
+    }
+
+    func modelCatalogEntry(for vendor: ProviderVendor, model: String) -> ModelCatalogEntry? {
+        providerConfigs[vendor]?.catalogEntry(for: model)
+            ?? discoveredModelCatalogs[vendor]?.first { $0.id == model }
     }
 
     func setReasoningEffort(_ effort: String?, for vendor: ProviderVendor) {
@@ -448,7 +559,7 @@ final class AppState: ObservableObject {
 
     func resetReasoningSettings(for vendor: ProviderVendor) {
         if vendor.requiresAPIKey {
-            if vendor.supportedReasoningEfforts.count > 2 {
+            if reasoningEfforts(for: vendor).count > 2 {
                 setReasoningEffort("high", for: vendor)
             } else {
                 setThinkingEnabled(true, for: vendor)
@@ -504,20 +615,23 @@ final class AppState: ObservableObject {
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         messages: [ChatMessage] = [],
-        threadID: String? = nil
+        threadID: String? = nil,
+        contextState: ConversationContextState = ConversationContextState()
     ) -> ConversationSession {
         ConversationSession(
             id: id,
             createdAt: createdAt,
             updatedAt: updatedAt,
             messages: messages,
-            threadID: threadID
-        ) { [weak self] messages, threadID in
+            threadID: threadID,
+            contextState: contextState
+        ) { [weak self] messages, threadID, contextState in
             self?.persistConversation(
                 id: id,
                 createdAt: createdAt,
                 messages: messages,
-                threadID: threadID
+                threadID: threadID,
+                contextState: contextState
             )
         }
     }
@@ -526,7 +640,8 @@ final class AppState: ObservableObject {
         id: UUID,
         createdAt: Date,
         messages: [ChatMessage],
-        threadID: String?
+        threadID: String?,
+        contextState: ConversationContextState
     ) {
         let updatedAt = Date.now
         markConversationAsRecent(id: id, updatedAt: updatedAt)
@@ -540,7 +655,8 @@ final class AppState: ObservableObject {
                         createdAt: createdAt,
                         updatedAt: updatedAt,
                         messages: messages,
-                        threadID: threadID
+                        threadID: threadID,
+                        contextState: contextState
                     )
                 )
             }
@@ -582,7 +698,7 @@ final class AppState: ObservableObject {
     /// 按当前服务商装配运行时（运行时按会话独立，Codex transport 共享）：
     /// - 订阅类（ChatGPT/Codex）：`CodexRuntime`（ADR-003，经 codex app-server）；
     ///   一条应用级长连接承载多个线程，续接已持久化的 thread id；
-    /// - API Key 类：`GenericAgentRuntime` + `OpenAIResponsesProvider`。
+    /// - API Key 类：`GenericAgentRuntime` + 对应的 Responses/Chat Completions Provider。
     /// 会话配置在运行时创建时固定（计划 §6.3）。
     private func makeRuntime(for conversation: ConversationSession) -> AgentRuntime? {
         let vendor = activeVendor
@@ -611,7 +727,9 @@ final class AppState: ObservableObject {
                 model: config.model,
                 reasoningEnabled: config.thinkingEnabled,
                 reasoningEffort: selectedReasoningEffort(for: vendor),
-                hostedTools: vendor.hostedTools(for: config.model)
+                hostedTools: config.catalogEntry(for: config.model)?.hostedTools
+                    ?? vendor.hostedTools(for: config.model),
+                contextWindow: contextWindow(for: vendor, model: config.model)
             )
         )
     }
@@ -623,7 +741,7 @@ final class AppState: ObservableObject {
         return transport
     }
 
-    private func makeProvider(vendor: ProviderVendor) -> OpenAIResponsesProvider? {
+    private func makeProvider(vendor: ProviderVendor) -> (any ModelProvider)? {
         guard let config = providerConfigs[vendor],
               config.hasAPIKey,
               let providerBaseURL = try? Self.validatedBaseURL(config.baseURL),
@@ -631,6 +749,14 @@ final class AppState: ObservableObject {
               !storedKey.isEmpty else {
             return nil
         }
+        if vendor == .kimiCode {
+            return OpenAIChatCompletionsProvider(
+                apiKey: storedKey,
+                baseURL: providerBaseURL,
+                dialect: .kimi
+            )
+        }
+
         let dialect: OpenAIResponsesProvider.Dialect
         switch vendor {
         case .openai:
@@ -647,12 +773,12 @@ final class AppState: ObservableObject {
         )
     }
 
-    private func persistModelReasoningCapabilities(
-        _ capabilities: [String: ModelReasoningCapability],
+    private func persistModelCatalog(
+        _ catalog: [ModelCatalogEntry],
         for vendor: ProviderVendor
     ) {
-        guard let data = try? JSONEncoder().encode(capabilities) else { return }
-        defaults.set(data, forKey: vendor.modelReasoningCapabilitiesDefaultsKey)
+        guard let data = try? JSONEncoder().encode(catalog) else { return }
+        defaults.set(data, forKey: vendor.modelCatalogDefaultsKey)
     }
 
     private func persistReasoningEffort(_ effort: String?, for vendor: ProviderVendor) {
@@ -710,6 +836,12 @@ final class AppState: ObservableObject {
         }
         return url
     }
+}
+
+/// 旧版按模型单独保存的推理能力，仅用于迁移到统一 ModelCatalogEntry。
+private struct LegacyModelReasoningCapability: Codable {
+    let supportedEfforts: [String]
+    let defaultEffort: String?
 }
 
 enum APIConfigurationError: LocalizedError {

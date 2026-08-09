@@ -496,6 +496,7 @@ private struct VendorDetailPanel: View {
     @State private var revealedKey: String?
     /// 是否处于"更换 Key"的输入状态
     @State private var isEditingKey = false
+    @State private var contextWindowText = ""
     /// 订阅服务商（ChatGPT/Codex）的登录检测状态
     @State private var codexLoginState: CodexLoginState = .checking
     @FocusState private var focusedField: CredentialField?
@@ -1082,7 +1083,62 @@ private struct VendorDetailPanel: View {
             }
             .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
             .frame(maxHeight: .infinity)
+
+            contextWindowEditor
+                .onAppear(perform: syncContextWindowText)
+                .onChange(of: draft.selectedModel) { _, _ in syncContextWindowText() }
         }
+    }
+
+    private var contextWindowEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("上下文窗口")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text(contextWindowSource)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                TextField("未知（填写覆盖值）", text: $contextWindowText)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(saveContextWindowOverride)
+                Text("tokens")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("可填 4,096～16,777,216 的整数；清空后恢复服务商或客户端值。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+
+    private var contextWindowSource: String {
+        if appState.contextWindowOverride(for: vendor, model: draft.selectedModel) != nil {
+            return "用户覆盖"
+        }
+        if appState.contextWindow(for: vendor, model: draft.selectedModel) != nil {
+            return "服务商或客户端"
+        }
+        return "未知"
+    }
+
+    private func syncContextWindowText() {
+        let value = appState.contextWindowOverride(for: vendor, model: draft.selectedModel)
+        contextWindowText = value.map(String.init) ?? ""
+    }
+
+    private func saveContextWindowOverride() {
+        let text = contextWindowText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty || (Int(text) != nil) else { return }
+        appState.setContextWindowOverride(
+            text.isEmpty ? nil : Int(text),
+            for: draft.selectedModel,
+            vendor: vendor
+        )
     }
 
     // MARK: 选项

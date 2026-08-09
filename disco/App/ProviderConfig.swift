@@ -7,6 +7,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     case deepseek
     case openai
     case moonshot
+    case kimiCode
     case zhipu
     case chatgpt
     case anthropic
@@ -19,6 +20,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: "DeepSeek"
         case .openai: "OpenAI"
         case .moonshot: "Moonshot Kimi"
+        case .kimiCode: "Kimi Code"
         case .zhipu: "智谱 GLM"
         case .chatgpt: "Codex (OpenAI)"
         case .anthropic: "Anthropic Claude"
@@ -31,6 +33,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: "深度求索 DeepSeek API，兼容 OpenAI 接口"
         case .openai: "OpenAI 官方 API"
         case .moonshot: "月之暗面 Kimi API，兼容 OpenAI 接口"
+        case .kimiCode: "Kimi Code 订阅 API，使用 Chat Completions 接口"
         case .zhipu: "智谱清言 GLM API，兼容 OpenAI 接口"
         case .chatgpt: "使用 Codex (OpenAI) 订阅额度（codex app-server）"
         case .anthropic: "Anthropic 官方 Claude API"
@@ -43,6 +46,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: "wave.3.right"
         case .openai: "circle.hexagongrid.fill"
         case .moonshot: "moon.stars.fill"
+        case .kimiCode: "chevron.left.forwardslash.chevron.right"
         case .zhipu: "brain.head.profile"
         case .chatgpt: "bubble.left.and.bubble.right.fill"
         case .anthropic: "rays"
@@ -54,6 +58,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     var brandIcon: String? {
         switch self {
         case .deepseek: "brand.deepseek"
+        case .kimiCode: "brand.kimiCode"
         case .chatgpt: "brand.codex"
         default: nil
         }
@@ -65,6 +70,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: "https://api.deepseek.com/v1"
         case .openai: "https://api.openai.com/v1"
         case .moonshot: "https://api.moonshot.cn/v1"
+        case .kimiCode: "https://api.kimi.com/coding/v1"
         case .zhipu: "https://open.bigmodel.cn/api/paas/v4"
         case .chatgpt: ""
         case .anthropic: ""
@@ -84,7 +90,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     /// 当前是否已实现接入（OpenAI 兼容接口与 ChatGPT 订阅已可用，其余待实现）
     var isAvailable: Bool {
         switch self {
-        case .deepseek, .openai, .moonshot, .zhipu, .chatgpt: true
+        case .deepseek, .openai, .moonshot, .kimiCode, .zhipu, .chatgpt: true
         case .anthropic, .gemini: false
         }
     }
@@ -93,6 +99,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     var supportedReasoningEfforts: [String] {
         switch self {
         case .deepseek: ["none", "low", "high", "max"]
+        case .kimiCode: ["none", "low", "high", "max"]
         case .openai, .moonshot, .zhipu: ["none", "high"]
         default: []
         }
@@ -109,6 +116,34 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         default:
             []
         }
+    }
+
+    /// 当前客户端已知的模型上下文上限。未知模型返回 nil，避免把估算值伪装成服务端能力。
+    func contextWindow(for model: String) -> Int? {
+        let normalizedModel = model.lowercased()
+        switch self {
+        case .deepseek where normalizedModel.contains("deepseek-v4"):
+            return 1_000_000
+        case .kimiCode where normalizedModel == "kimi-for-coding":
+            return 262_144
+        default:
+            return nil
+        }
+    }
+
+    /// 用客户端已知的服务商能力补齐目录中未声明的字段；服务端显式值始终优先。
+    func enrichingCatalogEntry(_ entry: ModelCatalogEntry) -> ModelCatalogEntry {
+        let reasoningEfforts = supportedReasoningEfforts
+        return ModelCatalogEntry(
+            id: entry.id,
+            displayName: entry.displayName,
+            contextWindow: entry.contextWindow ?? contextWindow(for: entry.id),
+            supportedReasoningEfforts: entry.supportedReasoningEfforts
+                ?? (reasoningEfforts.isEmpty ? nil : reasoningEfforts),
+            defaultReasoningEffort: entry.defaultReasoningEffort,
+            hostedTools: entry.hostedTools ?? hostedTools(for: entry.id),
+            supportsToolCalling: entry.supportsToolCalling
+        )
     }
 
     static func reasoningEffortTitle(_ effort: String) -> String {
@@ -132,10 +167,19 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     /// 该服务商配置在 UserDefaults 中的 key
     var baseURLDefaultsKey: String { "provider.\(rawValue).baseURL" }
     var modelDefaultsKey: String { "provider.\(rawValue).model" }
+    var modelCatalogDefaultsKey: String { "provider.\(rawValue).modelCatalog" }
+    /// 旧版分散模型目录键，仅用于启动迁移和配置清理。
     var modelsDefaultsKey: String { "provider.\(rawValue).models" }
     var thinkingEnabledDefaultsKey: String { "provider.\(rawValue).thinkingEnabled" }
     var modelReasoningCapabilitiesDefaultsKey: String {
         "provider.\(rawValue).modelReasoningCapabilities"
+    }
+    var modelContextWindowsDefaultsKey: String {
+        "provider.\(rawValue).modelContextWindows"
+    }
+    /// 用户按模型填写的上下文窗口覆盖值，独立于服务端模型目录缓存。
+    var contextWindowOverridesDefaultsKey: String {
+        "provider.\(rawValue).contextWindowOverrides"
     }
     var reasoningEffortDefaultsKey: String {
         "provider.\(rawValue).reasoningEffort"
@@ -161,23 +205,21 @@ struct ProviderConfig: Equatable {
     var baseURL: String
     var model: String
     var hasAPIKey: Bool
-    /// 该服务商最近一次从服务端加载的可用模型列表（供聊天页快速切换，不实时刷新）
-    var models: [String]
+    /// 最近一次从服务端加载并由 Adapter 补齐的统一模型目录。
+    var modelCatalog: [ModelCatalogEntry]
     /// 该服务商是否开启思考模式（reasoning）
     var thinkingEnabled: Bool
-    /// 最近一次 model/list 返回的模型推理能力；仅 Codex 当前使用，其他服务商为空。
-    var modelReasoningCapabilities: [String: ModelReasoningCapability] = [:]
     /// Codex 当前选中的推理档位；nil 表示使用 app-server 的模型默认值。
     var reasoningEffort: String? = nil
     /// 最近一次连接验证通过的时间；nil 表示从未验证（保存配置即视为验证通过）
     var lastVerifiedAt: Date? = nil
 
-}
+    /// 供只需要 ID 列表的设置页和模型切换 UI 使用。
+    var models: [String] { modelCatalog.map(\.id) }
 
-/// 模型级推理能力。保留服务端原始字符串，便于 Codex 新增档位时无需升级客户端。
-struct ModelReasoningCapability: Codable, Equatable, Sendable {
-    let supportedEfforts: [String]
-    let defaultEffort: String?
+    func catalogEntry(for modelID: String) -> ModelCatalogEntry? {
+        modelCatalog.first { $0.id == modelID }
+    }
 }
 
 /// 旧版单服务商配置使用的 account 与 UserDefaults key（用于迁移）

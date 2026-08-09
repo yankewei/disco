@@ -125,7 +125,9 @@ private struct ImmediateProvider: ModelProvider {
 
     let descriptor = ProviderDescriptor(id: "immediate", displayName: "Immediate")
 
-    func models() async throws -> [String] { ["test-model"] }
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
 
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in

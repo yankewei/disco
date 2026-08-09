@@ -8,8 +8,101 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(ProviderVendor.deepseek.hostedTools(for: "deepseek-v4-flash"), [.webSearch])
         XCTAssertTrue(ProviderVendor.deepseek.hostedTools(for: "deepseek-v4-pro").isEmpty)
         XCTAssertTrue(ProviderVendor.moonshot.hostedTools(for: "kimi-latest").isEmpty)
+        XCTAssertTrue(ProviderVendor.kimiCode.hostedTools(for: "kimi-for-coding").isEmpty)
         XCTAssertTrue(ProviderVendor.zhipu.hostedTools(for: "glm-5").isEmpty)
         XCTAssertTrue(ProviderVendor.chatgpt.hostedTools(for: "gpt-5.6-codex").isEmpty)
+    }
+
+    func testKimiCodeUsesItsSubscriptionEndpointAndThinkingEfforts() {
+        XCTAssertEqual(
+            ProviderVendor.kimiCode.defaultBaseURL,
+            "https://api.kimi.com/coding/v1"
+        )
+        XCTAssertEqual(
+            ProviderVendor.kimiCode.supportedReasoningEfforts,
+            ["none", "low", "high", "max"]
+        )
+        XCTAssertTrue(ProviderVendor.kimiCode.isAvailable)
+        XCTAssertTrue(ProviderVendor.kimiCode.requiresAPIKey)
+    }
+
+    func testKimiCodeContextWindowPrefersPersistedModelMetadata() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            try JSONEncoder().encode([
+                ModelCatalogEntry(id: "kimi-for-coding", contextWindow: 1_048_576),
+            ]),
+            forKey: ProviderVendor.kimiCode.modelCatalogDefaultsKey
+        )
+        defaults.set(
+            ProviderVendor.kimiCode.defaultBaseURL,
+            forKey: ProviderVendor.kimiCode.baseURLDefaultsKey
+        )
+
+        let appState = try makeAppState(defaults: defaults)
+
+        XCTAssertEqual(
+            appState.contextWindow(for: .kimiCode, model: "kimi-for-coding"),
+            1_048_576
+        )
+        XCTAssertNil(appState.contextWindow(for: .kimiCode, model: "unknown-kimi-model"))
+    }
+
+    func testKnownContextWindowIsModelSpecific() {
+        XCTAssertEqual(
+            ProviderVendor.deepseek.contextWindow(for: "deepseek-v4-flash"),
+            1_000_000
+        )
+        XCTAssertEqual(
+            ProviderVendor.deepseek.contextWindow(for: "deepseek-v4-pro"),
+            1_000_000
+        )
+        XCTAssertNil(ProviderVendor.deepseek.contextWindow(for: "deepseek-chat"))
+        XCTAssertNil(ProviderVendor.openai.contextWindow(for: "gpt-5"))
+        XCTAssertEqual(
+            ProviderVendor.kimiCode.contextWindow(for: "kimi-for-coding"),
+            262_144
+        )
+        XCTAssertNil(ProviderVendor.kimiCode.contextWindow(for: "unknown-kimi-model"))
+    }
+
+    func testLegacyModelMetadataMigratesIntoUnifiedCatalog() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let vendor = ProviderVendor.kimiCode
+        defaults.set(vendor.defaultBaseURL, forKey: vendor.baseURLDefaultsKey)
+        defaults.set("kimi-for-coding", forKey: vendor.modelDefaultsKey)
+        defaults.set(["kimi-for-coding"], forKey: vendor.modelsDefaultsKey)
+        defaults.set(
+            try JSONEncoder().encode(["kimi-for-coding": 1_048_576]),
+            forKey: vendor.modelContextWindowsDefaultsKey
+        )
+        defaults.set(
+            try JSONSerialization.data(withJSONObject: [
+                "kimi-for-coding": [
+                    "supportedEfforts": ["none", "low", "high", "max"],
+                    "defaultEffort": "high",
+                ],
+            ]),
+            forKey: vendor.modelReasoningCapabilitiesDefaultsKey
+        )
+
+        let appState = try makeAppState(defaults: defaults)
+        let entry = try XCTUnwrap(
+            appState.modelCatalogEntry(for: vendor, model: "kimi-for-coding")
+        )
+
+        XCTAssertEqual(entry.contextWindow, 1_048_576)
+        XCTAssertEqual(entry.supportedReasoningEfforts, ["none", "low", "high", "max"])
+        XCTAssertEqual(entry.defaultReasoningEffort, "high")
+        XCTAssertEqual(entry.hostedTools, [])
+        XCTAssertNotNil(defaults.data(forKey: vendor.modelCatalogDefaultsKey))
+        XCTAssertNil(defaults.object(forKey: vendor.modelsDefaultsKey))
+        XCTAssertNil(defaults.object(forKey: vendor.modelContextWindowsDefaultsKey))
+        XCTAssertNil(defaults.object(forKey: vendor.modelReasoningCapabilitiesDefaultsKey))
     }
 
     func testSaveConfigurationTrimsValuesPersistsThemAndUsesStoredKey() throws {
@@ -481,15 +574,16 @@ extension AppStateTests {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let capabilities = [
-            "gpt-5.6": ModelReasoningCapability(
-                supportedEfforts: ["low", "medium", "high"],
-                defaultEffort: "medium"
+        let catalog = [
+            ModelCatalogEntry(
+                id: "gpt-5.6",
+                supportedReasoningEfforts: ["low", "medium", "high"],
+                defaultReasoningEffort: "medium"
             ),
         ]
         defaults.set(
-            try JSONEncoder().encode(capabilities),
-            forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey
+            try JSONEncoder().encode(catalog),
+            forKey: ProviderVendor.chatgpt.modelCatalogDefaultsKey
         )
         defaults.set("", forKey: ProviderVendor.chatgpt.baseURLDefaultsKey)
 
@@ -559,13 +653,16 @@ extension AppStateTests {
         XCTAssertEqual(appState.reasoningEfforts(for: .chatgpt), ["low", "medium", "high"])
         XCTAssertEqual(appState.defaultReasoningEffort(for: .chatgpt), "medium")
         let data = try XCTUnwrap(
-            defaults.data(forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey)
+            defaults.data(forKey: ProviderVendor.chatgpt.modelCatalogDefaultsKey)
         )
         let persisted = try JSONDecoder().decode(
-            [String: ModelReasoningCapability].self,
+            [ModelCatalogEntry].self,
             from: data
         )
-        XCTAssertEqual(persisted["gpt-5.6"]?.supportedEfforts, ["low", "medium", "high"])
+        XCTAssertEqual(
+            persisted.first { $0.id == "gpt-5.6" }?.supportedReasoningEfforts,
+            ["low", "medium", "high"]
+        )
     }
 
     /// 能力目录已明确记录空档位时，表示模型不支持调整，不应反复请求 model/list。
@@ -573,12 +670,12 @@ extension AppStateTests {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
-        let capabilities = [
-            "gpt-4o": ModelReasoningCapability(supportedEfforts: [], defaultEffort: nil),
+        let catalog = [
+            ModelCatalogEntry(id: "gpt-4o", supportedReasoningEfforts: []),
         ]
         defaults.set(
-            try JSONEncoder().encode(capabilities),
-            forKey: ProviderVendor.chatgpt.modelReasoningCapabilitiesDefaultsKey
+            try JSONEncoder().encode(catalog),
+            forKey: ProviderVendor.chatgpt.modelCatalogDefaultsKey
         )
         defaults.set("", forKey: ProviderVendor.chatgpt.baseURLDefaultsKey)
 

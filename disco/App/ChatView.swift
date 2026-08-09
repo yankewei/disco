@@ -518,7 +518,7 @@ private struct HostedWebSearchRow: View {
                 }
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "globe.badge.magnifyingglass")
+                    Image(systemName: "globe")
                         .font(.system(size: 11, weight: .medium))
                     if let statusTitle {
                         Text(statusTitle)
@@ -709,6 +709,7 @@ private struct ComposerView: View {
 
     @State private var isModelDrawerPresented = false
     @State private var isReasoningSettingsPresented = false
+    @State private var isContextUsagePresented = false
     @State private var isModelTriggerHovered = false
     @State private var isReasoningTriggerHovered = false
     @FocusState private var isFocused: Bool
@@ -761,6 +762,9 @@ private struct ComposerView: View {
                     .buttonStyle(.plain)
                 }
 
+                if isConfigured {
+                    contextUsageTrigger
+                }
                 composerActionButton
             }
             .font(.caption)
@@ -847,7 +851,8 @@ private struct ComposerView: View {
         let vendor = appState.activeVendor
         let efforts = appState.reasoningEfforts(for: vendor)
         let capabilityIsMissing = vendor == .chatgpt
-            && appState.config(for: vendor)?.modelReasoningCapabilities[appState.model] == nil
+            && appState.modelCatalogEntry(for: vendor, model: appState.model)?
+                .supportedReasoningEfforts == nil
         let title = reasoningSelectionTitle(appState: appState, vendor: vendor)
         let isDisabled = store.isStreaming || (efforts.isEmpty && vendor != .chatgpt)
         let backgroundOpacity: Double
@@ -899,6 +904,45 @@ private struct ComposerView: View {
         }
     }
 
+    private var contextUsageTrigger: some View {
+        let estimate = store.estimatedContextTokenCount
+        let usage = store.contextUsage
+        let configuredLimit = appState.contextWindow(
+            for: appState.activeVendor,
+            model: appState.model
+        )
+        let limit = configuredLimit ?? usage?.contextWindow
+        let current = usage?.current.inputTokens ?? estimate
+        let usageColor = contextUsageColor(estimate: current, limit: limit)
+
+        return Button {
+            isContextUsagePresented = true
+        } label: {
+            ContextUsageRing(estimate: current, limit: limit, color: usageColor)
+        }
+        .buttonStyle(DiscoPressButtonStyle())
+        .help("查看上下文占用")
+        .accessibilityLabel("查看上下文占用")
+        .popover(isPresented: $isContextUsagePresented, arrowEdge: .bottom) {
+            ContextUsagePopover(
+                store: store,
+                vendor: appState.activeVendor,
+                model: appState.model,
+                estimate: estimate,
+                usage: usage,
+                limit: limit
+            )
+        }
+    }
+
+    private func contextUsageColor(estimate: Int, limit: Int?) -> Color {
+        guard let limit, limit > 0 else { return .secondary }
+        let ratio = Double(estimate) / Double(limit)
+        if ratio >= 0.85 { return .red }
+        if ratio >= 0.70 { return .orange }
+        return .secondary
+    }
+
     /// 当前选择文案：服务商 · 模型（未选模型时只显示服务商）
     private var modelLabel: String {
         appState.model.isEmpty ? appState.activeVendor.title : "\(appState.activeVendor.title) · \(appState.model)"
@@ -933,6 +977,153 @@ private struct ComposerView: View {
     }
 }
 
+private struct ContextUsageRing: View {
+    let estimate: Int
+    let limit: Int?
+    let color: Color
+
+    private var progress: Double? {
+        guard let limit, limit > 0 else { return nil }
+        return min(1, max(0, Double(estimate) / Double(limit)))
+    }
+
+    private var percentage: String {
+        guard let progress else { return "?" }
+        if progress < 0.01 { return "<1%" }
+        return "\(Int((progress * 100).rounded()))%"
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.13), lineWidth: 2)
+            if let progress {
+                Circle()
+                    .trim(from: 0, to: progress)
+                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+            }
+            Text(percentage)
+                .font(.system(size: 7, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(width: 30, height: 30)
+        .contentShape(Circle())
+        .help("查看上下文占用")
+    }
+}
+
+private struct ContextUsagePopover: View {
+    @ObservedObject var store: ConversationStore
+    let vendor: ProviderVendor
+    let model: String
+    let estimate: Int
+    let usage: ContextUsageSnapshot?
+    let limit: Int?
+
+    private var isCodex: Bool { vendor == .chatgpt }
+    private var current: Int { usage?.current.inputTokens ?? estimate }
+    private var sourceTitle: String {
+        switch usage?.source {
+        case .provider: "服务商返回"
+        case .codex: "Codex 服务端返回"
+        default: "本地估算"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("上下文占用")
+                    .font(.headline)
+                Text("\(vendor.title) · \(model)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            usageRow(label: "当前占用（\(sourceTitle)）", value: "约 \(formatCompactTokenCount(current)) tokens")
+            usageRow(
+                label: "模型窗口",
+                value: limit.map { "\(formatCompactTokenCount($0)) tokens" } ?? "未知"
+            )
+            if let limit {
+                usageRow(
+                    label: "剩余",
+                    value: "约 \(formatCompactTokenCount(max(0, limit - current)) ) tokens"
+                )
+            }
+
+            if store.activeCompaction != nil {
+                Label("正在压缩上下文…", systemImage: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+            } else if let compaction = store.lastSuccessfulCompaction {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("最近一次压缩")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                    Text("\(compaction.trigger == .manual ? "手动" : "自动") · \(compaction.startedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                    if let before = compaction.beforeTokens, let after = compaction.afterTokens {
+                        Text("约 \(formatCompactTokenCount(before)) → \(formatCompactTokenCount(after)) tokens")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Button {
+                store.compactContext()
+            } label: {
+                Label("立即压缩", systemImage: "arrow.triangle.2.circlepath")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!store.canCompactContext || store.isStreaming)
+
+            Text(isCodex
+                ? "Codex 由服务端维护历史上下文和自动压缩。"
+                : "本地估算只用于阈值决策；原始聊天记录不会被删除。")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 300, alignment: .leading)
+    }
+
+    private func usageRow(label: String, value: String) -> some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.callout.monospacedDigit())
+        }
+    }
+}
+
+private func formatCompactTokenCount(_ count: Int) -> String {
+    let value = Double(max(0, count))
+    if value >= 1_000_000 {
+        return formatCompactUnit(value / 1_000_000, suffix: "M")
+    }
+    if value >= 1_000 {
+        return formatCompactUnit(value / 1_000, suffix: "K")
+    }
+    return String(Int(value))
+}
+
+private func formatCompactUnit(_ value: Double, suffix: String) -> String {
+    let rounded = (value * 10).rounded() / 10
+    if rounded == rounded.rounded() {
+        return "\(Int(rounded))\(suffix)"
+    }
+    return "\(String(format: "%.1f", rounded))\(suffix)"
+}
+
 /// 独立推理设置菜单，模型切换不再经过这里。
 private struct ReasoningSettingsPopover: View {
     @EnvironmentObject private var appState: AppState
@@ -944,7 +1135,8 @@ private struct ReasoningSettingsPopover: View {
     private var selectedEffort: String? { appState.selectedReasoningEffort(for: vendor) }
     private var codexCapabilityIsMissing: Bool {
         vendor == .chatgpt
-            && appState.config(for: vendor)?.modelReasoningCapabilities[appState.model] == nil
+            && appState.modelCatalogEntry(for: vendor, model: appState.model)?
+                .supportedReasoningEfforts == nil
     }
 
     var body: some View {
@@ -1066,8 +1258,8 @@ private struct ReasoningSettingsPopover: View {
 private func reasoningSelectionTitle(appState: AppState, vendor: ProviderVendor) -> String {
     let efforts = appState.reasoningEfforts(for: vendor)
     if vendor == .chatgpt {
-        let capabilityIsMissing = appState.config(for: vendor)?
-            .modelReasoningCapabilities[appState.model] == nil
+        let capabilityIsMissing = appState.modelCatalogEntry(for: vendor, model: appState.model)?
+            .supportedReasoningEfforts == nil
         if capabilityIsMissing && appState.isRefreshingCodexModelCatalog {
             return "正在加载"
         }
@@ -1213,7 +1405,7 @@ private struct ModelDrawer: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                if vendor.supportedReasoningEfforts.count > 2 {
+                if appState.reasoningEfforts(for: vendor).count > 2 {
                     Label("支持推理强度", systemImage: "brain")
                         .font(.caption2)
                         .foregroundStyle(DiscoTheme.accent)

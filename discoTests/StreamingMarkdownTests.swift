@@ -38,7 +38,9 @@ private struct ChunkedMarkdownProvider: ModelProvider {
 
     let descriptor = ProviderDescriptor(id: "chunked", displayName: "Chunked")
 
-    func models() async throws -> [String] { ["test-model"] }
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
 
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { continuation in

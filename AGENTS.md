@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-**disco** 是一款 macOS 原生应用，用 SwiftUI + AppKit 编写。当前形态是一个多模型 AI 聊天客户端，并已接入初步的 ChatGPT/Codex 订阅运行时：用户可以配置多家 OpenAI 兼容服务商（DeepSeek、OpenAI、Moonshot Kimi、智谱 GLM）或复用本机 Codex 登录，然后在会话中流式对话，支持推理（reasoning）展示与本地会话持久化。
+**disco** 是一款 macOS 原生应用，用 SwiftUI + AppKit 编写。当前形态是一个多模型 AI 聊天客户端，并已接入初步的 ChatGPT/Codex 订阅运行时：用户可以配置多家 OpenAI 兼容服务商（DeepSeek、OpenAI、Moonshot Kimi、Kimi Code、智谱 GLM）或复用本机 Codex 登录，然后在会话中流式对话，支持推理（reasoning）展示与本地会话持久化。
 
 项目的长期目标是演进为完整的多模型 coding agent。总体蓝图见仓库根目录的 `macos-multi-model-agent-plan.md`（中文，含 ADR-001~006 架构决策）。**当前代码仍属于聊天 MVP，但已实现 Codex Runtime 的第一段链路**：能启动 `codex app-server`、读取登录/模型信息、start/resume thread、start/interrupt turn，并映射文本、推理和终止事件；尚无 Project/Workspace、命令与文件 item、审批、diff、Generic 工具循环或 Tool Host。`ChatMessage.Part.toolCall` 仍只是展示预留。
 
@@ -63,7 +63,8 @@ disco/
 │   ├── CodexAppServerTransport.swift   # app-server 子进程、JSONL/JSON-RPC 与 thread/turn 路由
 │   └── CodexRuntime.swift              # Codex 事件 → AgentEvent、取消与 thread 恢复
 ├── Providers/
-│   └── OpenAIResponsesProvider.swift  # OpenAI Responses API + 兼容服务商；含 SSE 解码与错误转换
+│   ├── OpenAIResponsesProvider.swift         # OpenAI Responses API + 兼容服务商
+│   └── OpenAIChatCompletionsProvider.swift   # Chat Completions API；当前用于 Kimi Code
 ├── Persistence/
 │   ├── ConversationPersistence.swift  # SwiftData 会话持久化 + 内存替身 VolatileConversationPersistence
 │   └── AuthFileStore.swift            # API Key 存储（Application Support/disco/config/auth.json）+ 内存替身
@@ -79,9 +80,9 @@ discoTests/                   # XCTest 单元测试，@testable import disco
 - **Codex wire 与领域隔离**：`CodexAppServerTransport`/`CodexRuntime` 消化 JSON-RPC method、request ID、thread/turn/item ID 与审批 decision；SwiftUI 不解析 Codex payload。协议 DTO 固定对应 `codex-cli 0.144.5`，升级 CLI 时先生成并 diff schema，再更新 DTO 与合约测试。
 - **Codex 当前能力边界**：只支持 thread/turn、文本、推理和终止事件；`handleServerRequest` 会明确拒绝审批/工具请求。接入审批前不得声明对应 app-server capability，也不得把需要审批的请求当作已执行。
 - **配置在运行时创建时固定**：`GenericAgentRuntime.Configuration` 创建后不可变；切换模型/推理开关时 `AppState` 重建 Runtime（计划 §6.3）。
-- **所有已接入服务商共用 Responses API**：`OpenAIResponsesProvider` 同时服务 OpenAI 官方与 DeepSeek/Kimi/GLM 等 OpenAI 兼容端点，请求体走 `/responses` 且 `store: false`。
+- **两套 API 并列**：OpenAI、DeepSeek、Moonshot Kimi 与 GLM 由 `OpenAIResponsesProvider` 走 `/responses`（`store: false`）；Kimi Code 由 `OpenAIChatCompletionsProvider` 走 `/chat/completions`，使用 Kimi 原生 `thinking` 与 `reasoning_content` 字段。
 - **Base URL 校验**：仅允许 HTTPS，无 user/password/query/fragment，尾部斜杠归一化（`AppState.validatedBaseURL`）。
-- **UserDefaults 键**：按服务商隔离，形如 `provider.<vendor>.baseURL|model|models|thinkingEnabled|verifiedAt`；旧版单服务商键（`apiBaseURL` 等）在启动时迁移，勿新增对 legacy 键的依赖。
+- **UserDefaults 键**：按服务商隔离，形如 `provider.<vendor>.baseURL|model|models|modelContextWindows|thinkingEnabled|verifiedAt`；旧版单服务商键（`apiBaseURL` 等）在启动时迁移，勿新增对 legacy 键的依赖。
 
 ## 代码风格
 

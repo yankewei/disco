@@ -6,9 +6,6 @@ enum DiscoTheme {
     static let accent = Color(red: 0.32, green: 0.44, blue: 0.58)
     /// 推理功能的低饱和梅紫色，与模型入口形成稳定区分，并随系统明暗模式适配。
     static let reasoningAccent = Color("ReasoningAccent")
-    /// 强调色的同色系明/暗变体，仅用于 DiscoMark 的渐变，避免多色噪声
-    static let accentLight = Color(red: 0.55, green: 0.65, blue: 0.76)
-    static let accentDark = Color(red: 0.20, green: 0.29, blue: 0.42)
     static let canvas = Color(nsColor: .windowBackgroundColor)
     static let surface = Color(nsColor: .controlBackgroundColor)
     static let elevatedSurface = Color(nsColor: .textBackgroundColor)
@@ -39,24 +36,12 @@ struct DiscoMark: View {
             let phase = context.date.timeIntervalSinceReferenceDate
             let pulse = isActive && !reduceMotion ? 1 + sin(phase * 4.2) * 0.045 : 1
 
-            Circle()
-                .fill(
-                    AngularGradient(
-                        colors: [
-                            DiscoTheme.accentLight,
-                            DiscoTheme.accent,
-                            DiscoTheme.accentDark,
-                            DiscoTheme.accentLight,
-                        ],
-                        center: .center
-                    )
-                )
-                .overlay {
-                    Circle()
-                        .stroke(.white.opacity(0.42), lineWidth: max(1, size * 0.035))
-                        .padding(max(1, size * 0.07))
-                }
-                .shadow(color: DiscoTheme.accent.opacity(isActive ? 0.34 : 0.18), radius: size * 0.22)
+            // 使用独立图片资源，避免调试运行时回退成 macOS 通用应用图标。
+            Image("AppLogo")
+                .resizable()
+                .renderingMode(.original)
+                .interpolation(.high)
+                .scaledToFit()
                 .scaleEffect(pulse)
         }
         .frame(width: size, height: size)

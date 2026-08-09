@@ -2,12 +2,15 @@ import Foundation
 
 /// Codex app-server 的版本化 wire 契约。
 ///
-/// 这些 DTO 对应本机 `codex-cli 0.144.5` 执行
+/// 这些 DTO 对应本机 `codex-cli 0.147.0` 执行
 /// `codex app-server generate-json-schema` 生成的 v2 核心 schema。
-/// 这里只收敛当前产品需要的 thread/turn/text 事件；审批、工具调用等
-/// server request 不在本契约范围内，由 transport 返回明确的“不支持”错误。
+/// 这里只收敛当前产品需要的 thread/turn/text/tokenUsage/contextCompaction
+/// 事件与 thread/compact/start；审批、工具调用等 server request 不在本契约
+/// 范围内，由 transport 返回明确的“不支持”错误。
+/// 旧版本 app-server 可能缺少 tokenUsage/contextCompaction 通知或
+/// thread/compact/start 方法：相关 DTO 一律可选解码，缺失时静默降级。
 enum CodexAppServerProtocol {
-    static let cliVersion = "0.144.5"
+    static let cliVersion = "0.147.0"
     static let version = "v2"
 }
 
@@ -324,4 +327,35 @@ struct CodexItemLifecycleNotification: Decodable, Sendable {
 
     var itemID: String? { item.objectValue?["id"]?.stringValue }
     var itemType: String? { item.objectValue?["type"]?.stringValue }
+}
+
+// MARK: - 上下文压缩 v1（计划《上下文压缩 v1》§4 Codex app-server）
+
+/// `thread/tokenUsage/updated` 的用量明细（schema: TokenUsageBreakdown）。
+/// 全部字段可选解码：旧版本缺字段时保持 nil，由 transport 决定取舍，不得伪造。
+struct CodexTokenUsageBreakdown: Decodable, Sendable, Equatable {
+    let inputTokens: Int?
+    let cachedInputTokens: Int?
+    let outputTokens: Int?
+    let reasoningOutputTokens: Int?
+    let totalTokens: Int?
+}
+
+/// `thread/tokenUsage/updated` 的 tokenUsage 载荷（schema: ThreadTokenUsage）。
+struct CodexThreadTokenUsage: Decodable, Sendable, Equatable {
+    let last: CodexTokenUsageBreakdown?
+    let total: CodexTokenUsageBreakdown?
+    let modelContextWindow: Int?
+}
+
+/// `thread/tokenUsage/updated` 通知（schema: ThreadTokenUsageUpdatedNotification）。
+struct CodexThreadTokenUsageUpdatedNotification: Decodable, Sendable {
+    let threadId: String
+    let turnId: String?
+    let tokenUsage: CodexThreadTokenUsage?
+}
+
+/// `thread/compact/start` 请求参数（schema: ThreadCompactStartParams）。
+struct CodexThreadCompactStartParams: Encodable {
+    let threadId: String
 }

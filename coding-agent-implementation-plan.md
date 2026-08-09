@@ -44,6 +44,7 @@
 | 多服务商配置 | OpenAI 兼容服务商与 ChatGPT/Codex 订阅配置 | `ProviderConfig.swift`、`SettingsView.swift` |
 | Generic 文本 Runtime | 消费 `ModelProvider` 文本/推理流，保证单一终止事件 | `GenericAgentRuntime.swift` |
 | Responses Provider | URLSession + SSE，发送历史消息，解析文本和推理 | `OpenAIResponsesProvider.swift` |
+| Chat Completions Provider | URLSession + SSE，解析 `content` / `reasoning_content`；当前接入 Kimi Code | `OpenAIChatCompletionsProvider.swift` |
 | Codex 子进程与握手 | 启动 `codex app-server`，完成 initialize/initialized | `CodexAppServerTransport.swift` |
 | Codex thread/turn | thread start/resume、turn start/interrupt | `CodexAppServerTransport.swift` |
 | Codex 文本事件 | agent message delta、reasoning summary delta、turn completed | `CodexRuntime.swift` |
@@ -59,7 +60,7 @@
 | Codex thread 配置 | `thread/start` 只传 `model` | 没有 `cwd`、sandbox、approval policy |
 | 丰富 Agent 事件 | `AgentEvent` 只有文本、推理、完成/失败/取消 | UI 无法表达计划、命令、diff、审批和用量 |
 | Codex item 解码 | `item/started` / `item/completed` 只取 id/type | 命令、文件修改等内容被丢弃 |
-| Server request | 审批和工具请求一律返回 `-32601` | 需要审批的 coding task 会中断或被拒绝 |
+| Server request | 审批、`requestUserInput` 和工具请求一律返回 `-32601` | 需要审批或用户补充信息的 coding task 会中断或被拒绝 |
 | Diff 与命令输出 | 未订阅或映射对应增量事件 | 用户看不到模型实际做了什么 |
 | Run 状态 | 只有 `isStreaming` 和消息占位 | 无法表示等待审批、等待工具和取消中状态 |
 | 丰富持久化 | 只保存 message/reasoning | 重启后丢失命令、审批、diff 和失败上下文 |
@@ -237,6 +238,7 @@ enum AgentRunState: String, Sendable, Codable {
     case connecting
     case running
     case waitingForApproval
+    case waitingForUserInput
     case waitingForTool
     case cancelling
     case completed
@@ -312,7 +314,52 @@ struct ApprovalRequest: Sendable, Equatable {
 
 `ApprovalImpact` 使用类型化数据表达 command、cwd、paths、diff、network host/protocol/port 等信息。UI 不从一段自由文本重新解析影响范围。
 
-### 6.5 Runtime 接口
+### 6.5 用户输入请求模型
+
+`requestUserInput` 是 Codex 在 turn 内主动请求业务澄清的交互，不属于权限审批。领域层使用独立类型，不能复用 `ApprovalRequest`，也不能把答案伪装成一条新的聊天消息。
+
+```swift
+struct UserInputRequestID: Hashable, Sendable, Codable {
+    let rawValue: UUID
+}
+
+struct UserInputOption: Sendable, Equatable {
+    let label: String
+    let description: String
+}
+
+struct UserInputQuestion: Sendable, Equatable, Identifiable {
+    let id: String
+    let header: String
+    let prompt: String
+    let options: [UserInputOption]
+    let allowsOther: Bool
+    let isSecret: Bool
+}
+
+struct UserInputRequest: Sendable, Equatable, Identifiable {
+    let id: UserInputRequestID
+    let runID: RunID
+    let itemID: String
+    let questions: [UserInputQuestion]
+    let isBlocking: Bool
+}
+
+struct UserInputAnswer: Sendable, Equatable {
+    let questionID: String
+    let values: [String]
+}
+```
+
+约束：
+
+- `UserInputRequestID` 是 Disco 生成的稳定领域 ID；Codex JSON-RPC request ID 只保留在 Adapter 的 pending map 中。
+- question id 在一次请求内必须唯一；空问题、重复 id 或非法 payload 返回 JSON-RPC invalid params，不进入 UI。
+- `isSecret` 只控制输入与数据处理，不改变 wire response；UI 使用安全输入控件，答案不进入日志、聊天消息或持久化。
+- `options` 为空时收集自由文本；非空时默认单选，`allowsOther` 决定是否额外显示自由输入。
+- 第一版按 schema 保留 `[String]` 答案形态，但 UI 不提前实现多选；未来只有 schema 和产品语义同时要求时再开放。
+
+### 6.6 Runtime 接口
 
 ```swift
 protocol AgentRuntime: Sendable {
@@ -325,6 +372,11 @@ protocol AgentRuntime: Sendable {
         decision: ApprovalDecision
     ) async throws
 
+    func submitUserInput(
+        requestID: UserInputRequestID,
+        answers: [UserInputAnswer]
+    ) async throws
+
     func cancel(runID: RunID) async
     func shutdown() async
 }
@@ -334,10 +386,12 @@ protocol AgentRuntime: Sendable {
 
 - 同一 Runtime 同时只运行一个 turn，除非以后显式设计并发能力。
 - 未知或已经 resolved 的 `approvalID` 返回领域错误，不静默成功。
+- 未知、已经 resolved 或不属于当前 run 的 `requestID` 返回领域错误；同一请求最多发送一次 response。
+- `submitUserInput` 校验每个 question id、必答值和候选项；不能让 SwiftUI 直接拼 Codex wire payload。
 - `cancelRun` 先响应当前审批，再触发运行取消，避免服务端永久等待。
 - `shutdown()` 必须解除悬挂 continuation；Codex 共享 transport 由 `AppState` 统一拥有和关闭。
 
-### 6.6 Agent 事件
+### 6.7 Agent 事件
 
 ```swift
 enum AgentEvent: Sendable, Equatable {
@@ -350,6 +404,8 @@ enum AgentEvent: Sendable, Equatable {
     case diffUpdated(FileDiffSnapshot)
     case approvalRequested(ApprovalRequest)
     case approvalResolved(ApprovalID, ApprovalResolution)
+    case userInputRequested(UserInputRequest)
+    case userInputResolved(UserInputRequestID)
     case usageUpdated(UsageSnapshot)
     case runCompleted(RunID)
     case runFailed(RunID, AgentFailure)
@@ -466,7 +522,25 @@ codex app-server generate-json-schema --out /tmp/disco-codex-schema
 - `developerInstructions` 只承载用户明确配置的附加指令；第一条纵向切片保持 nil，优先验证 `cwd` 和 `instructionSources`。
 - 当前版本的 command approval params 没有 `availableDecisions` 字段；领域 `availableDecisions` 由 Adapter 根据请求类型和锁定 schema 填充。未来 wire 新增该字段时取两者交集。
 
-#### 8.1.2 JSON-RPC request ID
+#### 8.1.2 `requestUserInput` 版本基线
+
+`item/tool/requestUserInput` 属于 experimental API，不在本文原始 `codex-cli 0.144.5` 稳定基线内。接入前必须把项目锁定版本升级到实际捆绑/支持的 Codex CLI，重新生成带 `--experimental` 的 schema 并提交 DTO/fixture diff；不能仅依据在线文档猜测字段。
+
+已使用 `codex-cli 0.147.0` schema 确认的目标 wire 形态：
+
+| 位置 | 字段或取值 |
+|---|---|
+| server request method | `item/tool/requestUserInput` |
+| request id | string 或 64 位整数，response 必须原样回显 |
+| params | 必需 `threadId`、`turnId`、`itemId`、`isBlocking`、`questions`；兼容可选 `autoResolutionMs` |
+| question | 必需 `id`、`header`、`question`；可选 `options`、`isOther`、`isSecret` |
+| option | 必需 `label`、`description` |
+| response | `{ "answers": { "<question-id>": { "answers": ["..."] } } }` |
+| resolution | `serverRequest/resolved`，携带原始 `requestId` 与 `threadId` |
+
+只有 transport、Runtime、Store、UI、清理和测试全部实现后，initialize 才声明 `capabilities.experimentalApi = true`。启用该能力后，其他未知 experimental server request 仍必须返回明确错误，不能静默成功。
+
+#### 8.1.3 JSON-RPC request ID
 
 先把 envelope ID 改为稳定联合类型：
 
@@ -493,6 +567,7 @@ enum CodexRequestID: Codable, Hashable, Sendable {
 - `clientInfo` 明确标识 Disco 和版本。
 - 稳定 API 能完成的功能不启用 experimental capability。
 - 只有实现了对应 server request 响应后才声明相关 capability。
+- 为 `requestUserInput` 启用 `experimentalApi` 时，把 capability 与锁定 CLI/schema 版本纳入合约测试；旧版本不支持时应明确降级为“不提供该工具”，不能让 turn 永久等待。
 
 ### 8.3 Thread 生命周期
 
@@ -526,7 +601,7 @@ enum CodexRequestID: Codable, Hashable, Sendable {
 3. Runtime 确保 thread ready。
 4. `turn/start` 只发送本轮新增输入，并传允许的 per-turn override。
 5. 收到 `turn/started` 后进入 running。
-6. 持续映射 item、delta、diff、approval 和 usage。
+6. 持续映射 item、delta、diff、approval、user input 和 usage。
 7. 收到 `turn/completed` 后发射唯一终止事件。
 
 取消：
@@ -552,7 +627,8 @@ enum CodexRequestID: Codable, Hashable, Sendable {
 | `turn/diff/updated` | `.diffUpdated` | `.diffUpdated` | 聚合 diff |
 | command approval request | `.approvalRequested` | `.approvalRequested` | 审批 Sheet |
 | file approval request | `.approvalRequested` | `.approvalRequested` | 审批 Sheet |
-| `serverRequest/resolved` | `.approvalResolved` | `.approvalResolved` | 关闭 Sheet |
+| `item/tool/requestUserInput` | `.userInputRequested` | `.userInputRequested` | 原生问答 Sheet/卡片 |
+| `serverRequest/resolved` | `.serverRequestResolved` | `.approvalResolved` / `.userInputResolved` | 按 request ID 关闭对应交互 |
 | token usage updated | `.usageUpdated` | `.usageUpdated` | Inspector |
 | `turn/completed` | `.completed` | 唯一终止事件 | Run 终态 |
 
@@ -584,7 +660,7 @@ enum CodexRequestID: Codable, Hashable, Sendable {
 
 不需要的字段可以保留在 Codex DTO 层但不进入领域层。字段缺失必须按 schema 的 optional 语义处理，不能用空字符串伪造有效值。
 
-### 8.7 Server request 与审批
+### 8.7 Server request、审批与用户输入
 
 当前 `handleServerRequest(id:method:)` 必须改为接收 `params`：
 
@@ -602,7 +678,7 @@ Transport 内维护：
 RPC request id
     → method
     → thread id / turn id / item id
-    → domain approval id
+    → domain approval id / user input request id
     → resolution state
 ```
 
@@ -630,6 +706,23 @@ RPC request id
 - transport 断线：以失败完成 continuation，并清空 pending。
 - App shutdown：尽力回复 cancel，随后终止进程。
 - approval Sheet 消失不能等价于默认批准；默认按 cancel 或保持待处理并提示用户。
+
+收到 `item/tool/requestUserInput`：
+
+1. 解码并校验 params，确认 thread/turn 与当前 active turn 一致。
+2. 生成不可预测的 `UserInputRequestID`，保存原始 RPC request ID、item ID、问题集合和 resolution state。
+3. 向 turn stream 发出 `.userInputRequested`；不立即回复 JSON-RPC。
+4. `isBlocking == true` 时 Store 进入等待用户输入状态，禁止开启第二个 turn；非阻塞请求可以继续接收流事件，但仍需维持独立 pending 生命周期。
+5. 用户提交后，Runtime 校验问题 id、答案非空、选项范围和请求归属，再按锁定 schema 编码 response。
+6. 发送 response 后标记为 responding，防止重复提交；收到 `serverRequest/resolved` 后移除并发出 `.userInputResolved`。
+
+特殊语义：
+
+- `isSecret` 的答案只在内存中保留到 response 成功写出，随后立即释放；不得进入 SwiftData、诊断日志、错误描述或聊天 transcript。
+- `autoResolutionMs` 仅作旧字段兼容。超时不得替用户选择某个候选项；若锁定 schema/真实 smoke 证明客户端负责自动解决，只能发送空 `answers`，并等待 `serverRequest/resolved`。
+- blocking Sheet 不支持滑动/点击背景静默关闭；用户若不回答，应明确选择“停止本轮”，由 turn interrupt 清理 request。
+- `serverRequest/resolved` 可能先于或晚于本地 response 回调，状态机必须幂等。
+- turn completed/interrupted、transport 断线、App shutdown 时移除对应 pending request；重启后不恢复旧问题，更不能重放 secret answer。
 
 ### 8.8 审批决策映射
 
@@ -674,6 +767,7 @@ RPC request id
 | Command | 命令、cwd、状态、duration、exit code | 展开输出、复制 |
 | File change | 文件路径、kind、diff、状态 | 展开 diff、在 Finder/Xcode 打开 |
 | Approval | 原因与精确影响 | 允许一次、会话允许、拒绝、取消 |
+| User input | Codex 的问题、候选项或安全文本输入 | 提交答案、停止本轮 |
 | Error | 层级化错误和恢复建议 | 重试、复制诊断 |
 
 ### 9.3 命令输出
@@ -707,13 +801,24 @@ Sheet 必须在不展开原始 JSON 的情况下回答：
 
 网络审批单独展示 host/protocol/port，不能只展示一段 shell 字符串。
 
-### 9.6 Run 状态与输入框
+### 9.6 用户输入 Sheet
+
+- 标题、问题正文与候选项来自类型化领域模型，不读取 Codex raw JSON。
+- 一次请求按顺序展示 1～3 个问题；全部通过本地校验后才允许提交。
+- 有候选项时使用单选控件；`allowsOther` 为 true 时增加“其他”自由输入；无候选项时直接显示文本输入。
+- `isSecret` 使用 `SecureField`，禁用复制/自动保存等不必要行为，不在答案摘要中回显明文。
+- blocking request 使用不可交互关闭的 Sheet，主操作为“提交”，次操作为“停止本轮”；不存在 wire cancel response 时不能伪造“取消答案”。
+- non-blocking request 可以使用不遮挡时间线的卡片或可稍后返回的 Sheet，但切换会话后只能操作所属会话的 pending request。
+- 提交期间禁用重复点击；响应失败时保留用户输入并显示可恢复错误，成功写出后立即清空 secret 字段。
+
+### 9.7 Run 状态与输入框
 
 | 状态 | 输入框 | 主操作 |
 |---|---|---|
 | idle/completed/failed/cancelled | 可输入 | 发送 |
 | connecting/running/waitingForTool | 可选支持 steer；第一版禁用新 turn | 停止 |
 | waitingForApproval | 禁止开启第二个 turn | 审批或停止 |
+| waitingForUserInput | 禁止开启第二个 turn | 回答问题或停止 |
 | cancelling | 禁用 | 显示取消中 |
 
 ## 10. 持久化与恢复
@@ -728,6 +833,7 @@ Sheet 必须在不展开原始 JSON 的情况下回答：
 | Message | id、run id、role、ordered parts |
 | AgentItem | id、run id、kind、status、serialized typed payload、position |
 | Approval | id、run/item id、kind、decision、requested/resolved time |
+| UserInputRequest | 只保存非敏感请求元数据和 resolved/expired 状态；不保存答案 |
 | OutputArtifact | id、item id、file path、size、hash、truncated |
 | UsageRecord | run id、provider/model、input/output units、source |
 
@@ -765,6 +871,7 @@ Sheet 必须在不展开原始 JSON 的情况下回答：
 
 - queued/connecting/running/waitingForTool → `failed(interruptedByAppExit)`。
 - waitingForApproval → `cancelled` 或 `failed(pendingApprovalLost)`，不得假定批准。
+- waitingForUserInput → `failed(pendingUserInputLost)` 或 `cancelled`；旧请求不恢复、不自动重答。
 - cancelling → `cancelled`。
 - 如果 Codex thread 可恢复，新 turn 从 thread 继续，但不声称崩溃前命令仍在运行。
 
@@ -1008,6 +1115,7 @@ allow → 在精确 scope 内自动执行
 | Transport | app-server 退出、JSONL 损坏、网络断开 | 重连/重试 |
 | Protocol | schema 不兼容、未知必需字段 | 升级或降级 Codex |
 | Approval | 请求过期、重复响应 | 重新运行步骤 |
+| User input | 问题无效、请求已解决、答案校验失败 | 修正答案或重新运行步骤 |
 | Tool | exit nonzero、超时、路径拒绝 | 模型可恢复或用户调整 |
 | Model | usage limit、context overflow | 切换模型/压缩上下文 |
 | Persistence | store 无法打开、migration 失败 | 只读恢复/导出诊断 |
@@ -1032,6 +1140,7 @@ UI stop
   → AgentRuntime.cancel(runID)
   → Codex turn/interrupt 或 Generic active Task cancel
   → active approval cancel/decline
+  → pending user input 由 serverRequest/resolved/turn completion 清理
   → ToolExecutor.cancel(callID)
   → 子进程树结束
   → 唯一 runCancelled
@@ -1048,6 +1157,7 @@ UI stop
 - 状态转换
 - tool name、耗时、exit code、截断状态
 - approval kind、decision、响应耗时
+- user input request id、问题数量、blocking/resolved 状态和响应耗时；不记录问题答案
 - error code 和恢复路径
 
 默认不记录：
@@ -1071,7 +1181,9 @@ UI stop
 - command/file item 的 started → delta → completed 归并正确。
 - completed 快照覆盖增量临时状态。
 - approval request 使状态进入 waitingForApproval。
+- blocking user input request 使状态进入 waitingForUserInput；non-blocking request 不阻塞事件流。
 - accept/decline/cancel 只响应一次。
+- user input 只响应一次，答案校验在 Runtime 边界完成。
 - cancel 传播到 turn/tool。
 - transport 断线完成所有 continuation。
 
@@ -1085,6 +1197,10 @@ UI stop
 - file change 与 turn diff。
 - command approval 四种决策。
 - file approval 四种决策。
+- `item/tool/requestUserInput` 的 integer/string request ID、完整 question 字段与 response 编码。
+- `isSecret` 不改变 wire，但答案不会进入持久化或日志。
+- `serverRequest/resolved` 在 response 之前/之后到达均只 resolve 一次。
+- turn complete/interrupt、进程退出和 timeout 会清理 pending user input。
 - server request ID 为整数和字符串时都能路由并原样回显。
 - `serverRequest/resolved` 先于/晚于本地 response 的容错。
 - approval 后 turn interrupt。
@@ -1097,6 +1213,9 @@ UI stop
 
 - 事件按 item ID upsert，不重复追加。
 - 等待审批时不能启动第二个 turn。
+- blocking user input 时不能启动第二个 turn；切换会话不会响应到其他会话。
+- 用户输入校验失败时保持 pending；提交成功或 resolved 后清空 UI 状态。
+- secret answer 不进入 messages 和 persistence callback。
 - 大输出截断状态可见。
 - retry 不复用旧 run ID。
 - assistant 空占位在失败/取消时正确清理或转为失败记录。
@@ -1104,7 +1223,8 @@ UI stop
 
 ### 17.4 Persistence 测试
 
-- Project/Conversation/Run/Item/Approval 往返。
+- Project/Conversation/Run/Item/Approval/UserInputRequest 非敏感元数据往返。
+- UserInputAnswer（尤其 secret）永不写入持久化。
 - legacy Conversation/Message migration。
 - thread ID 与 project ID 保留。
 - 大输出引用丢失时可降级展示。
@@ -1143,8 +1263,9 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 3. thread/start with cwd。
 4. read-only turn。
 5. 一个需要审批的 command 或 file change。
-6. interrupt。
-7. process restart + thread/resume。
+6. 一个 blocking `requestUserInput`，提交答案后继续同一 turn。
+7. interrupt。
+8. process restart + thread/resume。
 
 ## 18. 分阶段实施
 
@@ -1188,20 +1309,25 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 - Codex 不能静默操作另一个项目。
 - 取消 read-only turn 后恰好一个 cancelled 事件。
 
-### Phase B：文件修改、diff 与原生审批
+### Phase B：文件修改、diff 与原生交互
 
-目标：用户能审查并批准/拒绝实际代码修改。
+目标：用户能审查并批准/拒绝实际代码修改，也能回答 Codex 在 turn 内提出的澄清问题。
 
 主要改动：
 
 - Codex command/file approval DTO。
+- Codex `item/tool/requestUserInput` DTO、response 与 `serverRequest/resolved` 路由。
 - pending server request 路由。
 - `AgentRuntime.respond`。
+- `AgentRuntime.submitUserInput`。
 - ApprovalRequest/Decision 领域模型。
+- UserInputRequest/Question/Answer 领域模型。
 - 命令与文件审批 Sheet。
+- 原生用户问答 Sheet（含 options、other 和 secret 输入）。
 - fileChange item 和 turn diff。
 - waitingForApproval 状态。
-- 审批记录持久化。
+- waitingForUserInput 状态。
+- 审批与非敏感 user-input request 元数据持久化；答案不持久化。
 
 完成标准：
 
@@ -1211,6 +1337,9 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 - decline 后没有对应写入，并显示 declined。
 - cancel 停止 turn，不遗留 pending request。
 - 重复点击不发送重复 JSON-RPC response。
+- blocking 问题出现后可提交合法答案并继续同一 turn。
+- 停止本轮或 request resolved 后问答 Sheet 消失，不遗留或重放答案。
+- secret answer 不进入消息历史、日志或持久化。
 
 ### Phase C：恢复、历史与稳定性
 
@@ -1233,6 +1362,7 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 - app-server 进程崩溃不会让 UI 永久 streaming。
 - 旧聊天记录不丢失。
 - pending approval 在崩溃后不会被误判为已批准。
+- pending user input 在崩溃后不会被重放，secret answer 不可恢复且不落盘。
 
 ### Phase D：Generic Provider tool call
 
@@ -1303,8 +1433,8 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 2. `Codex cwd and sandbox configuration`：生成 schema、扩展 thread/turn 参数和合约测试。
 3. `Agent item domain + command timeline`：命令 item/output 映射和 UI。
 4. `File changes + diff timeline`：file item、turn diff 和 UI。
-5. `Approval domain + Codex server requests`：wire request、respond 接口和 transport 测试。
-6. `Native approval sheet`：用户决策、状态和竞态测试。
+5. `Approval + requestUserInput domain`：wire request、respond/submit 接口、pending map 和 transport 测试。
+6. `Native interaction sheets`：审批与用户问答、状态隔离和竞态测试。
 7. `Run/item persistence`：schema migration、恢复和大输出。
 8. `Generic ModelEvent tool calls`：Provider 解析与 fixture。
 9. `Generic single-tool loop`：Runtime + fake ToolExecutor。
@@ -1381,25 +1511,28 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 
 验收：修改测试文件时，UI 展示正确路径和 unified diff。
 
-### 21.6 Approval transport
+### 21.6 Server interaction transport
 
 - 把 `CodexRPCEnvelope.id` 和 pending key 迁移为 `CodexRequestID`。
 - `CodexRPCEnvelope` server request 路由保留 params。
-- 定义 command/file approval DTO。
-- pending map 保存 RPC id 与 domain approval ID。
+- 定义 command/file approval 与 `requestUserInput` DTO。
+- pending map 保存 RPC id、method 与 domain approval/user-input ID。
 - 提供 respond 方法。
+- 提供 `submitUserInput`，按 question id 编码答案。
 - 清理 resolved/interrupted/completed/disconnected。
 
-验收：fixture 证明 accept、decline、cancel 的 JSON-RPC response 正确且仅发送一次。
+验收：fixture 证明 accept、decline、cancel 与 user-input answers 的 JSON-RPC response 正确且仅发送一次；integer/string request ID 均原样回显。
 
-### 21.7 Approval UI
+### 21.7 Approval 与 User Input UI
 
 - Store 保存 pending approval。
+- Store 保存所属当前 run 的 pending user input；blocking 请求进入 waitingForUserInput。
 - ChatView/根视图展示 Sheet。
 - 决策按钮来自 `availableDecisions`。
+- 问答 UI 支持 options、other、free text 和 secret；答案只存在内存中。
 - 关闭窗口、切换会话和删除会话有明确处理。
 
-验收：切换会话不会把 A 会话的审批响应给 B 会话。
+验收：切换会话不会把 A 会话的审批或答案响应给 B 会话；重复提交、resolved 竞态和停止 turn 均不会留下 pending request。
 
 ### 21.8 纵向验收
 
@@ -1441,6 +1574,7 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 - [ ] Agent 能执行命令并流式展示输出。
 - [ ] Agent 能提出并应用文件修改。
 - [ ] 用户在写入和高风险命令前看到精确审批信息。
+- [ ] Codex 请求业务澄清时，用户能在原生 UI 回答并继续同一 turn。
 - [ ] UI 展示命令、状态、exit code 和 diff。
 - [ ] 用户可取消模型和运行中的工具。
 - [ ] 工作区逃逸、symlink 和参数替换测试通过。
