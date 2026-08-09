@@ -36,9 +36,19 @@ struct DiscoApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Button("新建对话") {
-                    appState.createConversation()
+                    appState.createConversationInCurrentContext()
                 }
                 .keyboardShortcut("n", modifiers: .command)
+
+                Button("打开项目…") {
+                    NotificationCenter.default.post(name: .discoRequestOpenProject, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: .command)
+
+                Button("新建临时对话") {
+                    appState.createConversation(projectID: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
             }
 
             CommandMenu("对话") {

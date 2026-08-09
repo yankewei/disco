@@ -1,9 +1,25 @@
 import Combine
 import Foundation
 
+enum AppStateProjectError: Error, LocalizedError {
+    case directoryAlreadyUsed
+    case projectNotFound
+
+    var errorDescription: String? {
+        switch self {
+        case .directoryAlreadyUsed:
+            return "该目录已经关联到另一个项目。"
+        case .projectNotFound:
+            return "找不到要操作的项目。"
+        }
+    }
+}
+
 extension Notification.Name {
     /// 菜单栏“对话 > 清空当前对话”发出的请求，由 ChatView 弹出确认
     static let discoRequestClearConversation = Notification.Name("discoRequestClearConversation")
+    /// 菜单栏“打开项目”发出的请求，由 ContentView 展示目录选择器
+    static let discoRequestOpenProject = Notification.Name("discoRequestOpenProject")
 }
 
 @MainActor
@@ -14,6 +30,8 @@ final class AppState: ObservableObject {
     @Published private(set) var storageError: String?
     @Published private(set) var isRefreshingCodexModelCatalog = false
     @Published private(set) var codexModelCatalogError: String?
+    @Published private(set) var projects: [ProjectSnapshot]
+    @Published private(set) var projectAvailability: [UUID: ProjectAvailability]
     @Published private(set) var conversations: [ConversationSession]
     @Published var selectedConversationID: ConversationSession.ID? {
         didSet {
@@ -36,8 +54,10 @@ final class AppState: ObservableObject {
 
     private let keyStores: [ProviderVendor: APIKeyStoring]
     private let defaults: UserDefaults
-    private let persistence: ConversationPersisting
+    private let persistence: any ConversationPersisting
+    private let projectPersistence: any ProjectPersisting
     private let codexTransportFactory: @MainActor () -> CodexAppServerTransport
+    private let workspaceResolver = WorkspaceResolver()
     /// ChatGPT/Codex 使用一条应用级长连接；连接内按 threadId 隔离各会话。
     private var codexTransport: CodexAppServerTransport?
     /// 设置页验证前可能还没有 ProviderConfig，先暂存本次完整模型目录。
@@ -53,14 +73,14 @@ final class AppState: ObservableObject {
     init(
         keychain: APIKeyStoring? = nil,
         defaults: UserDefaults? = nil,
-        persistence: ConversationPersisting? = nil,
+        persistence: (any ConversationPersisting & ProjectPersisting)? = nil,
         codexTransportFactory: @MainActor @escaping () -> CodexAppServerTransport = {
             CodexAppServerTransport()
         }
     ) {
         let baseKeyStore = keychain ?? AuthFileStore()
         let defaults = defaults ?? .standard
-        let resolvedPersistence: ConversationPersisting
+        let resolvedPersistence: any ConversationPersisting & ProjectPersisting
         var startupStorageError: String?
         if let persistence {
             resolvedPersistence = persistence
@@ -74,6 +94,7 @@ final class AppState: ObservableObject {
         }
         self.defaults = defaults
         self.persistence = resolvedPersistence
+        self.projectPersistence = resolvedPersistence
         self.codexTransportFactory = codexTransportFactory
         self.keyStores = Dictionary(
             uniqueKeysWithValues: ProviderVendor.allCases.map {
@@ -88,6 +109,8 @@ final class AppState: ObservableObject {
         // 旧版全局思考模式开关：升级后迁移为各服务商的默认值，并移除旧键
         let legacyThinking = defaults.object(forKey: LegacyProviderKeys.thinkingEnabled) as? Bool
         storageError = startupStorageError
+        projects = []
+        projectAvailability = [:]
         conversations = []
         selectedConversationID = nil
 
@@ -168,11 +191,19 @@ final class AppState: ObservableObject {
         activeVendor = persistedActive ?? firstConfiguredVendor ?? .deepseek
 
         do {
+            projects = try resolvedPersistence.loadProjects()
+            refreshProjectAvailability(persistChanges: true)
+        } catch {
+            storageError = "无法读取本地项目：\(error.localizedDescription)"
+        }
+
+        do {
             conversations = try resolvedPersistence.loadConversations().map {
                 makeConversation(
                     id: $0.id,
                     createdAt: $0.createdAt,
                     updatedAt: $0.updatedAt,
+                    projectID: $0.projectID,
                     messages: $0.messages,
                     threadID: $0.threadID,
                     contextState: $0.contextState ?? ConversationContextState()
@@ -569,20 +600,147 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Project / Workspace
+
+    @discardableResult
+    func openProject(at url: URL) throws -> ProjectSnapshot.ID {
+        let resolved = try workspaceResolver.resolve(directory: url)
+        if let existingIndex = projects.firstIndex(where: {
+            $0.workspaceRoot.resolvingSymlinksInPath() == resolved.context.rootURL
+        }) {
+            var project = projects[existingIndex]
+            project.workspaceRoot = resolved.context.rootURL
+            project.bookmarkData = resolved.bookmarkData
+            project.lastOpenedAt = .now
+            try projectPersistence.saveProject(project)
+            projects[existingIndex] = project
+            projectAvailability[project.id] = .available(resolved.context)
+            sortProjects()
+            return project.id
+        }
+
+        let project = ProjectSnapshot(
+            id: UUID(),
+            name: resolved.projectName,
+            workspaceRoot: resolved.context.rootURL,
+            bookmarkData: resolved.bookmarkData,
+            createdAt: .now,
+            lastOpenedAt: .now
+        )
+        try projectPersistence.saveProject(project)
+        projects.insert(project, at: 0)
+        projectAvailability[project.id] = .available(resolved.context)
+        _ = createConversation(projectID: project.id)
+        return project.id
+    }
+
+    func reconnectProject(id: UUID, to url: URL) throws {
+        guard let index = projects.firstIndex(where: { $0.id == id }) else {
+            throw AppStateProjectError.projectNotFound
+        }
+        let resolved = try workspaceResolver.resolve(directory: url)
+        if projects.contains(where: {
+            $0.id != id && $0.workspaceRoot.resolvingSymlinksInPath() == resolved.context.rootURL
+        }) {
+            throw AppStateProjectError.directoryAlreadyUsed
+        }
+
+        var project = projects[index]
+        project.workspaceRoot = resolved.context.rootURL
+        project.name = resolved.projectName
+        project.bookmarkData = resolved.bookmarkData
+        project.lastOpenedAt = .now
+        try projectPersistence.saveProject(project)
+        projects[index] = project
+        projectAvailability[id] = .available(resolved.context)
+        sortProjects()
+        refreshProjectRuntimes()
+    }
+
+    func refreshProjectAvailability(persistChanges: Bool = true) {
+        for index in projects.indices {
+            let project = projects[index]
+            let resolution = workspaceResolver.resolve(project: project)
+            projectAvailability[project.id] = resolution.availability
+            guard case .available = resolution.availability,
+                  let canonicalURL = resolution.canonicalURL else { continue }
+
+            var updatedProject = project
+            updatedProject.workspaceRoot = canonicalURL
+            if let bookmarkData = resolution.bookmarkData {
+                updatedProject.bookmarkData = bookmarkData
+            }
+            guard updatedProject.workspaceRoot != project.workspaceRoot
+                    || updatedProject.bookmarkData != project.bookmarkData else { continue }
+            projects[index] = updatedProject
+            if persistChanges {
+                do {
+                    try projectPersistence.saveProject(updatedProject)
+                } catch {
+                    storageError = "无法保存项目状态：\(error.localizedDescription)"
+                }
+            }
+        }
+        sortProjects()
+        refreshProjectRuntimes()
+    }
+
+    private func refreshProjectRuntimes() {
+        for conversation in conversations {
+            guard let projectID = conversation.projectID else { continue }
+
+            if !isProjectAvailable(projectID) {
+                guard conversation.store.hasRuntime else { continue }
+                conversation.store.stop()
+                let oldRuntime = conversation.store.configure(runtime: nil)
+                if let oldRuntime {
+                    Task { await oldRuntime.shutdown() }
+                }
+            } else if !conversation.store.hasRuntime {
+                conversation.store.configure(runtime: makeRuntime(for: conversation))
+            }
+        }
+    }
+
+    func projectAvailability(for projectID: UUID) -> ProjectAvailability? {
+        projectAvailability[projectID]
+    }
+
+    private func isProjectAvailable(_ projectID: UUID) -> Bool {
+        guard let availability = projectAvailability[projectID] else { return false }
+        if case .available = availability { return true }
+        return false
+    }
+
+    private func sortProjects() {
+        projects.sort { $0.lastOpenedAt > $1.lastOpenedAt }
+    }
+
     // MARK: - 会话管理
 
     @discardableResult
-    func createConversation() -> ConversationSession.ID {
-        if let emptyConversation = conversations.first(where: { $0.store.messages.isEmpty }) {
+    func createConversation(projectID: UUID? = nil) -> ConversationSession.ID {
+        if let emptyConversation = conversations.first(where: {
+            $0.projectID == projectID && $0.store.messages.isEmpty
+        }) {
             selectedConversationID = emptyConversation.id
             return emptyConversation.id
         }
 
-        let conversation = makeConversation()
+        let conversation = makeConversation(projectID: projectID)
         conversation.store.configure(runtime: makeRuntime(for: conversation))
         conversations.insert(conversation, at: 0)
         selectedConversationID = conversation.id
+        persistEmptyProjectConversation(conversation)
         return conversation.id
+    }
+
+    @discardableResult
+    func createConversationInCurrentContext() -> ConversationSession.ID {
+        let projectID = selectedConversation?.projectID.flatMap { candidate in
+            projects.contains(where: { $0.id == candidate }) ? candidate : nil
+        }
+        return createConversation(projectID: projectID)
     }
 
     func deleteConversation(id: ConversationSession.ID) {
@@ -614,6 +772,7 @@ final class AppState: ObservableObject {
         id: UUID = UUID(),
         createdAt: Date = .now,
         updatedAt: Date? = nil,
+        projectID: UUID? = nil,
         messages: [ChatMessage] = [],
         threadID: String? = nil,
         contextState: ConversationContextState = ConversationContextState()
@@ -622,6 +781,7 @@ final class AppState: ObservableObject {
             id: id,
             createdAt: createdAt,
             updatedAt: updatedAt,
+            projectID: projectID,
             messages: messages,
             threadID: threadID,
             contextState: contextState
@@ -629,6 +789,7 @@ final class AppState: ObservableObject {
             self?.persistConversation(
                 id: id,
                 createdAt: createdAt,
+                projectID: projectID,
                 messages: messages,
                 threadID: threadID,
                 contextState: contextState
@@ -636,9 +797,22 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func persistEmptyProjectConversation(_ conversation: ConversationSession) {
+        guard conversation.projectID != nil else { return }
+        persistConversation(
+            id: conversation.id,
+            createdAt: conversation.createdAt,
+            projectID: conversation.projectID,
+            messages: conversation.store.messages,
+            threadID: conversation.store.threadID,
+            contextState: conversation.store.contextState
+        )
+    }
+
     private func persistConversation(
         id: UUID,
         createdAt: Date,
+        projectID: UUID?,
         messages: [ChatMessage],
         threadID: String?,
         contextState: ConversationContextState
@@ -646,7 +820,7 @@ final class AppState: ObservableObject {
         let updatedAt = Date.now
         markConversationAsRecent(id: id, updatedAt: updatedAt)
         do {
-            if messages.isEmpty {
+            if messages.isEmpty, projectID == nil {
                 try persistence.deleteConversation(id: id)
             } else {
                 try persistence.saveConversation(
@@ -656,6 +830,7 @@ final class AppState: ObservableObject {
                         updatedAt: updatedAt,
                         messages: messages,
                         threadID: threadID,
+                        projectID: projectID,
                         contextState: contextState
                     )
                 )
@@ -701,6 +876,9 @@ final class AppState: ObservableObject {
     /// - API Key 类：`GenericAgentRuntime` + 对应的 Responses/Chat Completions Provider。
     /// 会话配置在运行时创建时固定（计划 §6.3）。
     private func makeRuntime(for conversation: ConversationSession) -> AgentRuntime? {
+        if let projectID = conversation.projectID {
+            guard isProjectAvailable(projectID) else { return nil }
+        }
         let vendor = activeVendor
         guard let config = providerConfigs[vendor], vendor.isConfigured(config) else {
             return nil

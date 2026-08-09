@@ -42,6 +42,7 @@
 |---|---|---|
 | macOS 原生聊天界面 | SwiftUI + AppKit，支持会话侧栏、流式消息和推理展示 | `disco/App/` |
 | 多服务商配置 | OpenAI 兼容服务商与 ChatGPT/Codex 订阅配置 | `ProviderConfig.swift`、`SettingsView.swift` |
+| Project / Workspace 身份切片 | 可读目录选择、bookmark、Project/Conversation 分组、不可用状态与重新关联；本阶段不传给 Codex | `Workspace.swift`、`AppState.swift`、`ContentView.swift` |
 | Generic 文本 Runtime | 消费 `ModelProvider` 文本/推理流，负责指令、上下文压缩、overflow recovery，并保证单一终止事件 | `GenericAgentRuntime.swift`、`ContextCompactor.swift` |
 | Token usage 与上下文状态 | Provider/Codex usage、checkpoint、上下文估算和压缩记录 | `ModelContract.swift`、`RuntimeContract.swift`、`ConversationPersistence.swift` |
 | Responses Provider | URLSession + SSE，发送历史消息，解析文本、推理、usage 和 context overflow | `OpenAIResponsesProvider.swift` |
@@ -58,7 +59,7 @@
 
 | 缺口 | 当前表现 | 直接后果 |
 |---|---|---|
-| Project / Workspace | 会话没有绑定仓库根目录 | Codex 不能可靠地知道应操作哪个项目 |
+| Codex workspace 配置 | 当前 Project 的 `WorkspaceContext` 尚未注入 Runtime | Codex 仍不能可靠地知道应操作哪个项目 |
 | Codex thread 配置 | `thread/start` 只传 `model` | 没有 `cwd`、sandbox、approval policy |
 | 丰富 Agent 事件 | 仍缺少计划、通用 tool item、命令、diff 和审批领域事件 | UI 无法表达 coding-agent 活动 |
 | Codex item 解码 | `item/started` / `item/completed` 仍主要只取 id/type | 命令、文件修改等内容被丢弃 |
@@ -72,11 +73,12 @@
 ### 3.3 当前最关键的技术债
 
 1. `AgentRunRequest.resumeThreadID` 暴露了 Codex 专有概念，而 `CodexRuntime.Configuration` 已经持有同一信息。最终应把 Runtime 专有恢复状态收回 Adapter 内部。
-2. `ChatMessage.Part.toolCall` 是展示占位，不足以承载命令状态、输出、文件变化、审批和恢复。
-3. `ConversationStore` 同时承担用户输入、运行协调、事件归并和展示状态；随着事件增加，需要把“事件归并为会话快照”的复杂逻辑集中起来，但不要为简单字段转发创建浅模块。
-4. 协议 DTO 当前手工收敛在一个文件中。扩展前必须继续保持版本化，不得把 Codex 原始 payload 泄漏到 UI 或持久化层。
-5. `CodexRPCEnvelope.id` 当前只有 `Int?`，而 0.147.0 schema 的 request ID 允许字符串或整数；审批请求和 `serverRequest/resolved` 接入前必须改为可哈希的联合类型。
-6. 当前能力已经拆分到 `AGENTS.md`、上下文压缩实现记录和 Kimi 接入决策记录；修改架构边界时需要同步维护这些文档。
+2. Project/Workspace 当前只提供身份和目录可用性；下一阶段接入 `cwd`、sandbox policy 前，必须重新评估已有 thread resume 的路径安全语义。
+3. `ChatMessage.Part.toolCall` 是展示占位，不足以承载命令状态、输出、文件变化、审批和恢复。
+4. `ConversationStore` 同时承担用户输入、运行协调、事件归并和展示状态；随着事件增加，需要把“事件归并为会话快照”的复杂逻辑集中起来，但不要为简单字段转发创建浅模块。
+5. 协议 DTO 当前手工收敛在一个文件中。扩展前必须继续保持版本化，不得把 Codex 原始 payload 泄漏到 UI 或持久化层。
+6. `CodexRPCEnvelope.id` 当前只有 `Int?`，而 0.147.0 schema 的 request ID 允许字符串或整数；审批请求和 `serverRequest/resolved` 接入前必须改为可哈希的联合类型。
+7. 当前能力已经拆分到 `AGENTS.md`、上下文压缩实现记录、Project/Workspace 实施计划和 Kimi 接入决策记录；修改架构边界时需要同步维护这些文档。
 
 ## 4. 设计原则
 

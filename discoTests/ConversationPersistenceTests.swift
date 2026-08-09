@@ -133,6 +133,37 @@ final class ConversationPersistenceTests: XCTestCase {
         ])
     }
 
+    func testProjectAndConversationProjectIDPersistAcrossSaveAndLoad() throws {
+        let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
+        let project = ProjectSnapshot(
+            id: UUID(),
+            name: "Disco",
+            workspaceRoot: URL(fileURLWithPath: "/tmp/disco"),
+            bookmarkData: Data("bookmark".utf8),
+            createdAt: .now,
+            lastOpenedAt: .now
+        )
+        let conversationID = UUID()
+
+        try persistence.saveProject(project)
+        try persistence.saveConversation(
+            ConversationSnapshot(
+                id: conversationID,
+                createdAt: .now,
+                updatedAt: .now,
+                messages: [],
+                threadID: nil,
+                projectID: project.id
+            )
+        )
+
+        let restoredProject = try XCTUnwrap(persistence.loadProjects().first)
+        let restoredConversation = try XCTUnwrap(persistence.loadConversations().first)
+        XCTAssertEqual(restoredProject, project)
+        XCTAssertEqual(restoredConversation.projectID, project.id)
+        XCTAssertTrue(restoredConversation.messages.isEmpty)
+    }
+
     /// 订阅服务商：会话线程 id 持久化往返（重启后用于 thread/resume）
     func testThreadIDPersistsAcrossSaveAndLoad() throws {
         let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)

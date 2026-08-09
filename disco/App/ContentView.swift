@@ -1,37 +1,106 @@
-//
-//  ContentView.swift
-//  disco
-//
-//  Created by 闫柯玮 on 2026/8/4.
-//
-
+import AppKit
 import SwiftUI
+
+private struct ProjectUIError: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+}
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var expandedProjectIDs: Set<UUID> = []
+    @State private var projectError: ProjectUIError?
 
     var body: some View {
         NavigationSplitView {
-            ConversationSidebar()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
+            ConversationSidebar(
+                expandedProjectIDs: $expandedProjectIDs,
+                reconnectProject: reconnectProject
+            )
+            .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
         } detail: {
             if let conversation = appState.selectedConversation {
-                ChatView(store: conversation.store)
-                    .id(conversation.id)
+                ChatView(
+                    store: conversation.store,
+                    projectID: conversation.projectID,
+                    reconnectProject: reconnectHandler(for: conversation.projectID)
+                )
+                .id(conversation.id)
             } else {
                 ContentUnavailableView(
                     "选择一段对话",
                     systemImage: "bubble.left.and.bubble.right",
-                    description: Text("从左侧选择会话，或创建一段新对话。")
+                    description: Text("从左侧选择会话，或创建一段新的临时对话。")
                 )
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .onAppear {
+            expandSelectedProject()
+        }
+        .onChange(of: appState.selectedConversationID) { _, _ in
+            expandSelectedProject()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            appState.refreshProjectAvailability()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .discoRequestOpenProject)) { _ in
+            openProjectFromPicker()
+        }
+        .alert(item: $projectError) { error in
+            Alert(
+                title: Text(error.title),
+                message: Text(error.message),
+                dismissButton: .default(Text("好"))
+            )
+        }
+    }
+
+    private func expandSelectedProject() {
+        guard let projectID = appState.selectedConversation?.projectID else { return }
+        expandedProjectIDs.insert(projectID)
+    }
+
+    private func openProjectFromPicker() {
+        guard let url = ProjectDirectoryPicker.chooseDirectory(mode: .openProject) else { return }
+        do {
+            let projectID = try appState.openProject(at: url)
+            expandedProjectIDs.insert(projectID)
+        } catch {
+            showProjectError(title: "无法打开项目", error: error)
+        }
+    }
+
+    private func reconnectHandler(for projectID: UUID?) -> (() -> Void)? {
+        guard let projectID else { return nil }
+        return { reconnectProject(id: projectID) }
+    }
+
+    private func reconnectProject(id: UUID) {
+        guard let project = appState.projects.first(where: { $0.id == id }) else { return }
+        let initialDirectory = project.workspaceRoot.deletingLastPathComponent()
+        guard let url = ProjectDirectoryPicker.chooseDirectory(
+            mode: .reconnect(initialDirectory: initialDirectory)
+        ) else { return }
+        do {
+            try appState.reconnectProject(id: id, to: url)
+        } catch {
+            showProjectError(title: "无法重新关联项目", error: error)
+        }
+    }
+
+    private func showProjectError(title: String, error: Error) {
+        projectError = ProjectUIError(title: title, message: error.localizedDescription)
     }
 }
 
 private struct ConversationSidebar: View {
     @EnvironmentObject private var appState: AppState
+    @Binding var expandedProjectIDs: Set<UUID>
+    let reconnectProject: (UUID) -> Void
 
     /// 当前服务商已保存 Key 但从未验证过连接时，提示用户去设置页验证
     private var needsVerificationAttention: Bool {
@@ -41,20 +110,47 @@ private struct ConversationSidebar: View {
             && config.lastVerifiedAt == nil
     }
 
+    private var temporaryConversations: [ConversationSession] {
+        let projectIDs = Set(appState.projects.map(\.id))
+        return appState.conversations.filter {
+            guard let projectID = $0.projectID else { return true }
+            return !projectIDs.contains(projectID)
+        }
+    }
+
+    private var visibleTemporaryConversations: [ConversationSession] {
+        temporaryConversations.filter {
+            !$0.store.messages.isEmpty || $0.id == appState.selectedConversationID
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sidebarHeader
 
             List(selection: $appState.selectedConversationID) {
-                Section("最近对话") {
-                    ForEach(appState.conversations) { conversation in
-                        ConversationRow(conversation: conversation)
-                            .tag(conversation.id)
-                            .contextMenu {
-                                Button("删除对话", role: .destructive) {
-                                    appState.deleteConversation(id: conversation.id)
-                                }
-                            }
+                ForEach(appState.projects) { project in
+                    ProjectConversationSection(
+                        project: project,
+                        conversations: appState.conversations.filter { $0.projectID == project.id },
+                        isExpanded: expandedProjectIDs.contains(project.id),
+                        toggle: { toggleProject(project.id) },
+                        createConversation: {
+                            expandedProjectIDs.insert(project.id)
+                            appState.createConversation(projectID: project.id)
+                        },
+                        showFinder: {
+                            NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
+                        },
+                        reconnect: { reconnectProject(project.id) }
+                    )
+                }
+
+                if !visibleTemporaryConversations.isEmpty {
+                    Section("临时对话") {
+                        ForEach(visibleTemporaryConversations) { conversation in
+                            ConversationListRow(conversation: conversation)
+                        }
                     }
                 }
             }
@@ -91,7 +187,6 @@ private struct ConversationSidebar: View {
 
                     Spacer(minLength: 4)
 
-                    // 正常（已验证）时不显示圆点；仅未验证这种状态需要引起注意
                     if needsVerificationAttention {
                         Circle()
                             .fill(Color.orange)
@@ -122,20 +217,146 @@ private struct ConversationSidebar: View {
 
             Spacer()
 
-            Button {
-                appState.createConversation()
+            Menu {
+                Button("新建对话") {
+                    appState.createConversationInCurrentContext()
+                }
+                .keyboardShortcut("n", modifiers: .command)
+
+                Button("打开项目…") {
+                    NotificationCenter.default.post(name: .discoRequestOpenProject, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: .command)
+
+                Divider()
+
+                Button("新建临时对话") {
+                    appState.createConversation(projectID: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
             } label: {
-                Image(systemName: "square.and.pencil")
+                Image(systemName: "plus")
                     .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 32, height: 32)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
             }
+            .menuStyle(.borderlessButton)
             .buttonStyle(DiscoPressButtonStyle())
-            .help("新建对话（⌘N）")
+            .accessibilityLabel("新建或打开")
+            .help("新建或打开（⌘N）")
         }
         .padding(.horizontal, 14)
         .padding(.top, 13)
         .padding(.bottom, 12)
+    }
+
+    private func toggleProject(_ id: UUID) {
+        if expandedProjectIDs.contains(id) {
+            expandedProjectIDs.remove(id)
+        } else {
+            expandedProjectIDs.insert(id)
+        }
+    }
+}
+
+private struct ConversationListRow: View {
+    @EnvironmentObject private var appState: AppState
+    let conversation: ConversationSession
+
+    var body: some View {
+        ConversationRow(conversation: conversation)
+            .tag(conversation.id)
+            .contextMenu {
+                Button("删除对话", role: .destructive) {
+                    appState.deleteConversation(id: conversation.id)
+                }
+            }
+    }
+}
+
+private struct ProjectConversationSection: View {
+    @EnvironmentObject private var appState: AppState
+    let project: ProjectSnapshot
+    let conversations: [ConversationSession]
+    let isExpanded: Bool
+    let toggle: () -> Void
+    let createConversation: () -> Void
+    let showFinder: () -> Void
+    let reconnect: () -> Void
+
+    private var unavailable: Bool {
+        guard let availability = appState.projectAvailability[project.id] else { return true }
+        if case .unavailable = availability { return true }
+        return false
+    }
+
+    var body: some View {
+        Section {
+            if isExpanded {
+                if conversations.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("尚无对话")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        Button(action: createConversation) {
+                            Label("新建对话", systemImage: "plus")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.leading, 42)
+                    .padding(.vertical, 4)
+                } else {
+                    ForEach(conversations) { conversation in
+                        ConversationListRow(conversation: conversation)
+                    }
+                }
+            }
+        } header: {
+            HStack(spacing: 2) {
+                Button(action: toggle) {
+                    HStack(spacing: 6) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .frame(width: 18, height: 40)
+                        Image(systemName: unavailable ? "folder.badge.questionmark" : "folder")
+                            .foregroundStyle(unavailable ? .orange : DiscoTheme.accent)
+                        Text(project.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 0)
+                    }
+                }
+                .buttonStyle(.plain)
+                .frame(minHeight: 40)
+                .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目 \(project.name)")
+                .help(isExpanded ? "收起项目" : "展开项目")
+
+                Button(action: createConversation) {
+                    Image(systemName: "plus")
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(DiscoPressButtonStyle())
+                .accessibilityLabel("新建项目对话")
+                .help("新建项目对话")
+
+                Menu {
+                    Button("在 Finder 中显示", action: showFinder)
+                        .disabled(unavailable)
+                    Button("重新关联目录…", action: reconnect)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 40, height: 40)
+                }
+                .menuStyle(.borderlessButton)
+                .buttonStyle(DiscoPressButtonStyle())
+                .accessibilityLabel("项目操作")
+                .help("项目操作")
+            }
+            .textCase(nil)
+        }
     }
 }
 
@@ -187,9 +408,4 @@ private struct ConversationRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
-}
-
-#Preview {
-    ContentView()
-        .environmentObject(AppState(keychain: InMemoryAuthStore()))
 }

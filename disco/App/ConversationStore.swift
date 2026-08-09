@@ -26,6 +26,8 @@ final class ConversationStore: ObservableObject {
     /// Generic 压缩 checkpoint 与最近一次成功压缩；随每次持久化回调落盘。
     private(set) var contextState: ConversationContextState
 
+    var hasRuntime: Bool { runtime != nil }
+
     init(
         messages: [ChatMessage] = [],
         threadID: String? = nil,

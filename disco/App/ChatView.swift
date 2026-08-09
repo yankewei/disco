@@ -6,12 +6,40 @@ struct ChatView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var store: ConversationStore
+    let projectID: UUID?
+    let reconnectProject: (() -> Void)?
     @State private var isConfirmingClear = false
     @State private var isAtLatestMessage = true
     @State private var shouldFollowLatestMessage = true
     @State private var isUserScrolling = false
 
     private static let latestMessageAnchor = "latest-message-anchor"
+
+    init(
+        store: ConversationStore,
+        projectID: UUID? = nil,
+        reconnectProject: (() -> Void)? = nil
+    ) {
+        self.store = store
+        self.projectID = projectID
+        self.reconnectProject = reconnectProject
+    }
+
+    private var project: ProjectSnapshot? {
+        guard let projectID else { return nil }
+        return appState.projects.first { $0.id == projectID }
+    }
+
+    private var projectUnavailable: Bool {
+        guard let projectID else { return false }
+        guard let availability = appState.projectAvailability[projectID] else { return true }
+        if case .unavailable = availability { return true }
+        return false
+    }
+
+    private var canUseConversation: Bool {
+        appState.isActiveVendorConfigured && !projectUnavailable
+    }
 
     private var providerHost: String {
         // 订阅服务商没有 Base URL，展示服务商名
@@ -120,7 +148,8 @@ struct ChatView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             ComposerView(
                 store: store,
-                isConfigured: appState.isActiveVendorConfigured
+                isConfigured: canUseConversation,
+                projectUnavailable: projectUnavailable
             )
             .frame(maxWidth: 760)
             .padding(.horizontal, 20)
@@ -128,8 +157,23 @@ struct ChatView: View {
             .frame(maxWidth: .infinity)
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: shouldFollowLatestMessage)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if projectUnavailable {
+                ProjectUnavailableBanner(reconnect: reconnectProject)
+            }
+        }
         .navigationTitle(conversationTitle)
         .toolbar {
+            if let project {
+                ToolbarItem(placement: .navigation) {
+                    WorkspaceMenu(
+                        project: project,
+                        unavailable: projectUnavailable,
+                        reconnect: reconnectProject
+                    )
+                }
+            }
+
             ToolbarSpacer(.flexible)
 
             ToolbarItem(placement: .primaryAction) {
@@ -167,17 +211,79 @@ struct ChatView: View {
     }
 }
 
+private struct WorkspaceMenu: View {
+    let project: ProjectSnapshot
+    let unavailable: Bool
+    let reconnect: (() -> Void)?
+
+    var body: some View {
+        Menu {
+            Button("在 Finder 中显示") {
+                NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
+            }
+            .disabled(unavailable)
+
+            if let reconnect {
+                Button("重新关联目录…", action: reconnect)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: unavailable ? "folder.badge.questionmark" : "folder")
+                    .foregroundStyle(unavailable ? .orange : DiscoTheme.accent)
+                Text(project.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .font(.caption.weight(.medium))
+        }
+        .menuStyle(.borderlessButton)
+        .help(project.workspaceRoot.path)
+        .accessibilityLabel("Workspace：\(project.name)")
+    }
+}
+
+private struct ProjectUnavailableBanner: View {
+    let reconnect: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("项目目录不可用，重新关联后才能继续对话。")
+                .font(.caption)
+            Spacer(minLength: 8)
+            if let reconnect {
+                Button("重新关联目录", action: reconnect)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+}
+
 private struct EmptyConversationView: View {
     let isConfigured: Bool
     let model: String
     let providerHost: String
+
+    private var title: String {
+        isConfigured ? "开始一段对话" : "连接你的模型"
+    }
 
     var body: some View {
         HStack(spacing: 26) {
             DiscoMark(size: 76)
 
             VStack(alignment: .leading, spacing: 11) {
-                Text(isConfigured ? "开始一段对话" : "连接你的模型")
+                Text(title)
                     .font(.system(size: 28, weight: .semibold, design: .rounded))
 
                 if isConfigured {
@@ -703,6 +809,7 @@ private struct ChatInlineError: View {
 private struct ComposerView: View {
     @ObservedObject var store: ConversationStore
     let isConfigured: Bool
+    let projectUnavailable: Bool
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -738,6 +845,9 @@ private struct ComposerView: View {
                 if isConfigured {
                     modelDrawerTrigger
                     reasoningSettingsTrigger
+                } else if projectUnavailable {
+                    Image(systemName: "folder.badge.questionmark")
+                    Text("项目目录不可用")
                 } else {
                     Image(systemName: "lock.fill")
                     Text("API Key 仅保存在本机")
@@ -752,6 +862,9 @@ private struct ComposerView: View {
                 } else if isConfigured {
                     Text("⌘↩︎ 发送")
                         .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                } else if projectUnavailable {
+                    Text("重新关联后继续")
                         .foregroundStyle(.tertiary)
                 } else {
                     SettingsLink {
@@ -794,6 +907,7 @@ private struct ComposerView: View {
     // MARK: - 配置行控件
 
     private var composerPlaceholder: String {
+        if projectUnavailable { return "项目目录不可用，重新关联后继续" }
         if !isConfigured { return "连接模型后开始对话" }
         return store.isStreaming ? "可继续输入下一条消息" : "输入消息"
     }

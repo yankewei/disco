@@ -9,8 +9,28 @@ struct ConversationSnapshot {
     /// 订阅服务商（ChatGPT/Codex）的会话线程 id；重启后用于 thread/resume。
     /// API Key 服务商不使用，始终为 nil。
     let threadID: String?
+    /// Project UUID；nil 表示普通对话。
+    let projectID: UUID?
     /// Generic 压缩 checkpoint 与最近压缩记录（派生缓存，消息才是事实来源）。
     var contextState: ConversationContextState? = nil
+
+    init(
+        id: UUID,
+        createdAt: Date,
+        updatedAt: Date,
+        messages: [ChatMessage],
+        threadID: String?,
+        projectID: UUID? = nil,
+        contextState: ConversationContextState? = nil
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.messages = messages
+        self.threadID = threadID
+        self.projectID = projectID
+        self.contextState = contextState
+    }
 }
 
 @MainActor
@@ -21,68 +41,57 @@ protocol ConversationPersisting: AnyObject {
 }
 
 @MainActor
-final class ConversationPersistence: ConversationPersisting {
+protocol ProjectPersisting: AnyObject {
+    func loadProjects() throws -> [ProjectSnapshot]
+    func saveProject(_ project: ProjectSnapshot) throws
+}
+
+@MainActor
+final class ConversationPersistence: ConversationPersisting, ProjectPersisting {
     private let container: ModelContainer
     private let context: ModelContext
 
-    init(isStoredInMemoryOnly: Bool = false) throws {
+    init(storeURL: URL? = nil, isStoredInMemoryOnly: Bool = false) throws {
         let configuration: ModelConfiguration
         if isStoredInMemoryOnly {
             configuration = ModelConfiguration(
                 for: PersistedConversation.self,
                 PersistedMessage.self,
+                PersistedProject.self,
                 isStoredInMemoryOnly: true
             )
         } else {
-            // 显式指定存储位置：~/Library/Application Support/disco/conversations.store
-            // （本应用曾启用 App Sandbox，数据在容器内；关闭沙盒后迁移旧存储，见 migrateFromContainer）
-            let directory = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-                .first
-                ?? FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent("Library/Application Support")
-            let storeURL = directory
-                .appendingPathComponent("disco", isDirectory: true)
-                .appendingPathComponent("conversations.store")
-            try Self.migrateContainerStoreIfNeeded(to: storeURL)
+            // 显式指定存储位置：~/Library/Application Support/disco/conversations.store。
+            // Project/Workspace 开发基线已明确放弃旧会话，因此这里不再迁移旧 store。
+            let resolvedStoreURL = storeURL ?? Self.defaultStoreURL
+            try FileManager.default.createDirectory(
+                at: resolvedStoreURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             configuration = ModelConfiguration(
                 "disco",
-                url: storeURL
+                url: resolvedStoreURL
             )
         }
         container = try ModelContainer(
             for: PersistedConversation.self,
             PersistedMessage.self,
+            PersistedProject.self,
             configurations: configuration
         )
         context = container.mainContext
         context.autosaveEnabled = false
     }
 
-    /// 沙盒容器内的旧 SwiftData 存储迁移到新位置（关闭 App Sandbox 后）。
-    /// 新位置已存在时不迁移；迁移失败不阻塞启动（空会话可接受）。
-    private static func migrateContainerStoreIfNeeded(to storeURL: URL) throws {
-        guard !FileManager.default.fileExists(atPath: storeURL.path) else { return }
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.yankewei.disco"
-        let containerStore = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Containers")
-            .appendingPathComponent(bundleID)
-            .appendingPathComponent("Data/Library/Application Support/default.store")
-        guard FileManager.default.fileExists(atPath: containerStore.path) else { return }
-
-        try FileManager.default.createDirectory(
-            at: storeURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        // SwiftData 采用 WAL：连带 -wal / -shm 一起迁移
-        for suffix in ["", "-wal", "-shm"] {
-            let source = URL(fileURLWithPath: containerStore.path + suffix)
-            guard FileManager.default.fileExists(atPath: source.path) else { continue }
-            try FileManager.default.moveItem(
-                at: source,
-                to: URL(fileURLWithPath: storeURL.path + suffix)
-            )
-        }
+    private static var defaultStoreURL: URL {
+        let directory = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support")
+        return directory
+            .appendingPathComponent("disco", isDirectory: true)
+            .appendingPathComponent("conversations.store")
     }
 
     func loadConversations() throws -> [ConversationSnapshot] {
@@ -111,10 +120,53 @@ final class ConversationPersistence: ConversationPersisting {
                 updatedAt: conversation.updatedAt,
                 messages: messages,
                 threadID: conversation.threadID,
+                projectID: conversation.projectID,
                 // 解码/版本/校验失败时丢弃 checkpoint，不删除消息（计划 §2）
                 contextState: PersistedConversationContextState.decode(conversation.contextStateData)
             )
         }
+    }
+
+    func loadProjects() throws -> [ProjectSnapshot] {
+        let descriptor = FetchDescriptor<PersistedProject>(
+            sortBy: [SortDescriptor(\.lastOpenedAt, order: .reverse)]
+        )
+        return try context.fetch(descriptor).map {
+            ProjectSnapshot(
+                id: $0.id,
+                name: $0.name,
+                workspaceRoot: URL(fileURLWithPath: $0.workspacePath),
+                bookmarkData: $0.bookmarkData,
+                createdAt: $0.createdAt,
+                lastOpenedAt: $0.lastOpenedAt
+            )
+        }
+    }
+
+    func saveProject(_ project: ProjectSnapshot) throws {
+        let projectID = project.id
+        let descriptor = FetchDescriptor<PersistedProject>(
+            predicate: #Predicate { $0.id == projectID }
+        )
+        let persistedProject: PersistedProject
+        if let existing = try context.fetch(descriptor).first {
+            persistedProject = existing
+        } else {
+            persistedProject = PersistedProject(
+                id: project.id,
+                name: project.name,
+                workspacePath: project.workspaceRoot.path,
+                bookmarkData: project.bookmarkData,
+                createdAt: project.createdAt,
+                lastOpenedAt: project.lastOpenedAt
+            )
+            context.insert(persistedProject)
+        }
+        persistedProject.name = project.name
+        persistedProject.workspacePath = project.workspaceRoot.path
+        persistedProject.bookmarkData = project.bookmarkData
+        persistedProject.lastOpenedAt = project.lastOpenedAt
+        try context.save()
     }
 
     func saveConversation(_ conversation: ConversationSnapshot) throws {
@@ -136,6 +188,7 @@ final class ConversationPersistence: ConversationPersisting {
 
         persistedConversation.updatedAt = conversation.updatedAt
         persistedConversation.threadID = conversation.threadID
+        persistedConversation.projectID = conversation.projectID
         persistedConversation.contextStateData = try PersistedConversationContextState
             .encode(conversation.contextState)
 
@@ -199,8 +252,9 @@ final class ConversationPersistence: ConversationPersisting {
 }
 
 @MainActor
-final class VolatileConversationPersistence: ConversationPersisting {
+final class VolatileConversationPersistence: ConversationPersisting, ProjectPersisting {
     private var conversations: [UUID: ConversationSnapshot] = [:]
+    private var projects: [UUID: ProjectSnapshot] = [:]
 
     func loadConversations() -> [ConversationSnapshot] {
         conversations.values.sorted { $0.updatedAt > $1.updatedAt }
@@ -213,6 +267,14 @@ final class VolatileConversationPersistence: ConversationPersisting {
     func deleteConversation(id: UUID) {
         conversations[id] = nil
     }
+
+    func loadProjects() -> [ProjectSnapshot] {
+        projects.values.sorted { $0.lastOpenedAt > $1.lastOpenedAt }
+    }
+
+    func saveProject(_ project: ProjectSnapshot) {
+        projects[project.id] = project
+    }
 }
 
 @Model
@@ -222,16 +284,51 @@ private final class PersistedConversation {
     var updatedAt: Date
     /// 订阅服务商的会话线程 id（其余服务商为 nil）
     var threadID: String?
+    /// Project UUID；nil 表示普通对话。
+    var projectID: UUID?
     /// 版本化 JSON（PersistedConversationContextState）；旧库记录为 nil。
     var contextStateData: Data? = nil
     @Relationship(deleteRule: .cascade, inverse: \PersistedMessage.conversation)
     var messages: [PersistedMessage] = []
 
-    init(id: UUID, createdAt: Date, updatedAt: Date, threadID: String? = nil) {
+    init(
+        id: UUID,
+        createdAt: Date,
+        updatedAt: Date,
+        threadID: String? = nil,
+        projectID: UUID? = nil
+    ) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.threadID = threadID
+        self.projectID = projectID
+    }
+}
+
+@Model
+private final class PersistedProject {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    var workspacePath: String
+    var bookmarkData: Data?
+    var createdAt: Date
+    var lastOpenedAt: Date
+
+    init(
+        id: UUID,
+        name: String,
+        workspacePath: String,
+        bookmarkData: Data?,
+        createdAt: Date,
+        lastOpenedAt: Date
+    ) {
+        self.id = id
+        self.name = name
+        self.workspacePath = workspacePath
+        self.bookmarkData = bookmarkData
+        self.createdAt = createdAt
+        self.lastOpenedAt = lastOpenedAt
     }
 }
 
