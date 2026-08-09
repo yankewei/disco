@@ -1,6 +1,6 @@
 # Project / Workspace 纵向切片实现计划
 
-> 状态：实现已落地；专项 XCTest 已通过，手工 UI 验收待进行
+> 状态：实现已落地；专项 XCTest 与 Project/Workspace 手工 UI 验收均已通过（2026-08-09）
 
 ## 目标
 
@@ -248,6 +248,14 @@ Project section header 包含：
 - 删除或移动目录后的 unavailable 状态。
 - 重启应用后的 Project、空对话和选中项恢复。
 - 普通聊天、服务商切换、清空/删除会话不回归。
+
+2026-08-09 已在独立 DerivedData 与隔离用户目录中完成 Project/Workspace 手工验收及聊天回归：
+
+- 打开 Project、侧栏分组、项目/临时对话切换与 Finder 定位正常。
+- Project 空对话、选中项与 workspace 路径跨重启恢复正常。
+- 目录丢失后正确进入 unavailable 状态，重新关联后保留 Project 与会话并持久化新路径。
+- 删除最后一个 Project 对话不会删除 Project；重新创建、清空和再次重启后仍保留 Project 归属。
+- Codex 订阅连接、项目对话发送、流式完成和清空流程正常。
 
 最终运行：
 

@@ -128,7 +128,7 @@ private struct ConversationSidebar: View {
         VStack(spacing: 0) {
             sidebarHeader
 
-            List(selection: $appState.selectedConversationID) {
+            List {
                 ForEach(appState.projects) { project in
                     ProjectConversationSection(
                         project: project,
@@ -263,14 +263,28 @@ private struct ConversationListRow: View {
     @EnvironmentObject private var appState: AppState
     let conversation: ConversationSession
 
+    @State private var isHovered = false
+
+    private var isSelected: Bool {
+        appState.selectedConversationID == conversation.id
+    }
+
     var body: some View {
-        ConversationRow(conversation: conversation)
-            .tag(conversation.id)
-            .contextMenu {
-                Button("删除对话", role: .destructive) {
-                    appState.deleteConversation(id: conversation.id)
-                }
+        Button {
+            appState.selectedConversationID = conversation.id
+        } label: {
+            ConversationRow(conversation: conversation)
+                .padding(.horizontal, 10)
+                .discoRowStyle(isSelected: isSelected, isHovered: isHovered)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .accessibilityValue(isSelected ? "当前会话" : "")
+        .contextMenu {
+            Button("删除对话", role: .destructive) {
+                appState.deleteConversation(id: conversation.id)
             }
+        }
     }
 }
 
