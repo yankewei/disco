@@ -876,8 +876,12 @@ final class AppState: ObservableObject {
     /// - API Key 类：`GenericAgentRuntime` + 对应的 Responses/Chat Completions Provider。
     /// 会话配置在运行时创建时固定（计划 §6.3）。
     private func makeRuntime(for conversation: ConversationSession) -> AgentRuntime? {
+        let workspace: WorkspaceContext?
         if let projectID = conversation.projectID {
-            guard isProjectAvailable(projectID) else { return nil }
+            guard case let .available(context) = projectAvailability[projectID] else { return nil }
+            workspace = context
+        } else {
+            workspace = nil
         }
         let vendor = activeVendor
         guard let config = providerConfigs[vendor], vendor.isConfigured(config) else {
@@ -910,6 +914,7 @@ final class AppState: ObservableObject {
                     ?? vendor.hostedTools(for: config.model),
                 userInputEnabled: vendor == .openai
                     && catalogEntry?.supportsToolCalling != false,
+                workspace: workspace,
                 contextWindow: contextWindow(for: vendor, model: config.model)
             )
         )

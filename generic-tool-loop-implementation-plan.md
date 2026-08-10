@@ -1,7 +1,8 @@
 # Generic tool call 与工具循环实施计划
 
-> 状态：G1 已完成；已落地 Provider 无关的用户交互合约、OpenAI Generic
-> `request_user_input` 暂停/续传和统一问答 UI。通用 ToolExecutor 与只读 Tool Host 尚未开始。
+> 状态：G1、G2-1 已完成；已落地 Provider 无关的用户交互合约、OpenAI Generic
+> `request_user_input` 暂停/续传、统一问答 UI，以及由脚本化 ToolExecutor 验证的
+> Generic 单工具循环。生产只读 Tool Host 尚未开始，因此 App 当前不广告本地文件工具。
 
 ## 目标
 
@@ -39,6 +40,8 @@ Codex cwd、command/file item 与审批接入延后；已完成的 Codex schema 
 
 给 `GenericAgentRuntime` 注入 `ToolExecutor`，先使用脚本化内存 Adapter 验证循环：
 
+#### G2-1. ToolExecutor seam 与单工具闭环（已完成）
+
 - 每轮最多接受一个 client-owned function call；请求显式关闭 parallel tool calls。
 - Runtime 校验调用属于已广告工具，arguments 是合法 JSON object 后才跨越 ToolExecutor seam。
 - 工具自己的 Adapter 在产生副作用前做严格参数校验；非法参数不得执行。
@@ -48,6 +51,15 @@ Codex cwd、command/file item 与审批接入延后；已完成的 Codex schema 
 - 达到限制时返回稳定中文失败，不伪造最终回答。
 - 取消在模型流和工具执行两处都生效，并保持一次 run 恰好一个终止事件。
 - 工具已经执行后若发生上下文溢出，不自动重放该工具；避免重复副作用。
+
+本片只注入脚本化内存 Executor；`WorkspaceContext` 已在 Runtime 创建时锁定并随执行请求
+跨越 seam，但没有生产工具实现，不改变用户可见能力。
+
+#### G2-2. 失败矩阵加固（下一批）
+
+- 覆盖 declined、cancelled 与 timed out 结果的续传断言；failure 与 truncated 已覆盖。
+- 覆盖 Provider/Executor 抛错、continuation 方言不匹配和工具执行后 context overflow。
+- 覆盖模型流中取消，并复核每条失败路径都只有一个终止事件。
 
 ### G2a. Client-owned 用户问答（已完成首片）
 

@@ -12,6 +12,12 @@ final class GenericAgentRuntime: AgentRuntime {
         /// 是否向模型广告客户端托管的 `request_user_input`。
         /// 首批只为 OpenAI 原生 Responses 方言开启。
         let userInputEnabled: Bool
+        /// 会话创建时锁定的 Workspace；临时对话为 nil，不能由工具参数覆盖。
+        let workspace: WorkspaceContext?
+        /// 单次运行允许发起的最大模型请求数，防止异常响应形成无限续传。
+        let maximumModelRounds: Int
+        /// 单次运行允许处理的最大客户端工具调用数。
+        let maximumToolCalls: Int
         /// nil 表示未知：不按本地阈值自动压缩，只在服务端明确溢出后恢复。
         let contextWindow: Int?
 
@@ -21,6 +27,9 @@ final class GenericAgentRuntime: AgentRuntime {
             reasoningEffort: String? = nil,
             hostedTools: Set<HostedToolKind> = [],
             userInputEnabled: Bool = false,
+            workspace: WorkspaceContext? = nil,
+            maximumModelRounds: Int = 8,
+            maximumToolCalls: Int = 16,
             contextWindow: Int? = nil
         ) {
             self.model = model
@@ -28,12 +37,16 @@ final class GenericAgentRuntime: AgentRuntime {
             self.reasoningEffort = reasoningEffort
             self.hostedTools = hostedTools
             self.userInputEnabled = userInputEnabled
+            self.workspace = workspace
+            self.maximumModelRounds = maximumModelRounds
+            self.maximumToolCalls = maximumToolCalls
             self.contextWindow = contextWindow
         }
     }
 
     private let provider: any ModelProvider
     private let configuration: Configuration
+    private let toolExecutor: (any ToolExecutor)?
     private var activeRunID: RunID?
     private var activeTask: Task<Void, Never>?
     private var pendingUserInput: PendingUserInput?
@@ -118,9 +131,14 @@ final class GenericAgentRuntime: AgentRuntime {
         ])
     )
 
-    init(provider: any ModelProvider, configuration: Configuration) {
+    init(
+        provider: any ModelProvider,
+        configuration: Configuration,
+        toolExecutor: (any ToolExecutor)? = nil
+    ) {
         self.provider = provider
         self.configuration = configuration
+        self.toolExecutor = toolExecutor
     }
 
     private func makeCompactor() -> ContextCompactor {
@@ -166,6 +184,7 @@ final class GenericAgentRuntime: AgentRuntime {
         guard activeRunID == runID else { return }
         activeTask?.cancel()
         cancelPendingUserInput()
+        await toolExecutor?.cancel(runID: runID)
     }
 
     func submitUserInput(
@@ -183,8 +202,12 @@ final class GenericAgentRuntime: AgentRuntime {
     }
 
     func shutdown() async {
+        let runID = activeRunID
         activeTask?.cancel()
         cancelPendingUserInput()
+        if let runID {
+            await toolExecutor?.cancel(runID: runID)
+        }
         activeRunID = nil
         activeTask = nil
     }
@@ -272,9 +295,17 @@ final class GenericAgentRuntime: AgentRuntime {
             var recoveryAttempted = false
             var toolFollowUp: ModelToolFollowUp?
             var userInputRoundCount = 0
+            var modelRoundCount = 0
+            var toolCallCount = 0
             var hasAnyText = false
             while true {
                 try Task.checkCancellation()
+                guard modelRoundCount < configuration.maximumModelRounds else {
+                    throw AgentFailure(
+                        message: "模型工具循环超过最大模型轮次（\(configuration.maximumModelRounds)），运行已停止。"
+                    )
+                }
+                modelRoundCount += 1
                 let input = contextCompactor.modelInput(
                     messages: request.messages,
                     checkpoint: checkpoint
@@ -304,7 +335,8 @@ final class GenericAgentRuntime: AgentRuntime {
                         reasoningEnabled: configuration.reasoningEnabled,
                         reasoningEffort: configuration.reasoningEffort,
                         hostedTools: configuration.hostedTools,
-                        functionTools: configuration.userInputEnabled ? [Self.userInputTool] : [],
+                        functionTools: (configuration.userInputEnabled ? [Self.userInputTool] : [])
+                            + (toolExecutor?.toolDefinitions ?? []),
                         toolFollowUp: toolFollowUp
                     ))
                     for try await modelEvent in stream {
@@ -341,37 +373,74 @@ final class GenericAgentRuntime: AgentRuntime {
                     }
 
                     if !toolCalls.isEmpty {
-                        guard configuration.userInputEnabled,
-                              toolCalls.count == 1,
-                              let call = toolCalls.first,
-                              call.name == Self.userInputTool.name else {
+                        guard toolCalls.count == 1, let call = toolCalls.first else {
+                            throw AgentFailure(
+                                message: "当前工具循环一次只支持一个客户端工具调用。"
+                            )
+                        }
+                        let isUserInputCall = configuration.userInputEnabled
+                            && call.name == Self.userInputTool.name
+                        if !isUserInputCall, toolExecutor == nil {
                             throw AgentFailure(
                                 message: "模型请求调用本地工具，但工具循环尚未启用。"
                             )
                         }
-                        guard userInputRoundCount < Self.maximumUserInputRounds else {
-                            throw AgentFailure(message: "模型连续请求用户输入的次数过多，运行已停止。")
-                        }
                         guard let modelContinuation = modelCompletion?.continuation else {
                             throw AgentFailure(message: "模型没有返回可续接的完整工具调用。")
                         }
+                        guard toolCallCount < configuration.maximumToolCalls else {
+                            throw AgentFailure(
+                                message: "模型工具循环超过最大工具调用次数（\(configuration.maximumToolCalls)），运行已停止。"
+                            )
+                        }
+                        toolCallCount += 1
 
-                        let userInputRequest = try Self.decodeUserInputRequest(
-                            call.arguments,
-                            runID: request.runID
-                        )
-                        userInputRoundCount += 1
-                        continuation.yield(.userInputRequested(userInputRequest))
-                        continuation.yield(.runStateChanged(request.runID, .waitingForUserInput))
-                        let answers = try await waitForUserInput(userInputRequest)
-                        continuation.yield(.userInputResolved(userInputRequest.id))
-                        continuation.yield(.runStateChanged(request.runID, .running))
+                        let output: String
+                        if isUserInputCall {
+                            guard userInputRoundCount < Self.maximumUserInputRounds else {
+                                throw AgentFailure(message: "模型连续请求用户输入的次数过多，运行已停止。")
+                            }
+                            let userInputRequest = try Self.decodeUserInputRequest(
+                                call.arguments,
+                                runID: request.runID
+                            )
+                            userInputRoundCount += 1
+                            continuation.yield(.userInputRequested(userInputRequest))
+                            continuation.yield(.runStateChanged(request.runID, .waitingForUserInput))
+                            let answers = try await waitForUserInput(userInputRequest)
+                            continuation.yield(.userInputResolved(userInputRequest.id))
+                            continuation.yield(.runStateChanged(request.runID, .running))
+                            output = try Self.encodeUserInputResult(answers)
+                        } else {
+                            guard let toolExecutor else {
+                                assertionFailure("本地工具能力检查与执行分支不一致。")
+                                throw AgentFailure(message: "本地工具执行器不可用。")
+                            }
+                            guard toolExecutor.toolDefinitions.contains(where: {
+                                $0.name == call.name
+                            }) else {
+                                throw AgentFailure(message: "模型调用了未广告的本地工具：\(call.name)")
+                            }
+                            guard let arguments = call.arguments.data(using: .utf8),
+                                  let object = try? JSONSerialization.jsonObject(with: arguments),
+                                  object is [String: Any] else {
+                                throw AgentFailure(message: "模型返回的工具参数不是有效的 JSON object。")
+                            }
+                            continuation.yield(.runStateChanged(request.runID, .waitingForTool))
+                            let result = try await toolExecutor.execute(ToolExecutionRequest(
+                                call: call,
+                                context: ToolExecutionContext(
+                                    runID: request.runID,
+                                    workspace: configuration.workspace
+                                )
+                            ))
+                            continuation.yield(.runStateChanged(request.runID, .running))
+                            output = try Self.encodeToolExecutionResult(result)
+                        }
+
                         toolFollowUp = ModelToolFollowUp(
                             continuation: modelContinuation,
-                            results: [ModelToolResult(
-                                callID: call.callID,
-                                output: try Self.encodeUserInputResult(answers)
-                            )]
+                            results: [ModelToolResult(callID: call.callID, output: output)]
                         )
                         continue
                     }
@@ -563,6 +632,17 @@ final class GenericAgentRuntime: AgentRuntime {
         let data = try encoder.encode(payload)
         guard let value = String(data: data, encoding: .utf8) else {
             throw AgentFailure(message: "无法编码用户答案。")
+        }
+        return value
+    }
+
+    private static func encodeToolExecutionResult(_ result: ToolExecutionResult) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(result)
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw AgentFailure(message: "无法编码工具执行结果。")
         }
         return value
     }
