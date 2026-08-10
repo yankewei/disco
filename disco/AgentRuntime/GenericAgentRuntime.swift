@@ -203,12 +203,20 @@ final class GenericAgentRuntime: AgentRuntime {
                         case let .citationAdded(citation):
                             emittedVisibleEvent = true
                             continuation.yield(.citationAdded(citation))
+                        case .toolCallDelta:
+                            break
+                        case .toolCallCompleted:
+                            throw AgentFailure(
+                                message: "模型请求调用本地工具，但工具循环尚未启用。"
+                            )
                         case let .usage(snapshot):
                             continuation.yield(.contextUsageUpdated(ContextUsageSnapshot(
                                 current: snapshot,
                                 contextWindow: configuration.contextWindow,
                                 source: .provider
                             )))
+                        case .completed:
+                            break
                         }
                     }
                     if hasText {

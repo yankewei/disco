@@ -94,6 +94,7 @@ struct OpenAIResponsesProvider: ModelProvider {
                             .localizedCaseInsensitiveContains("text/event-stream") != true {
                             let body = try await read(bytes: bytes, limit: 10_485_760)
                             let response = try JSONDecoder().decode(APIResponse.self, from: body)
+                            let rawResponse = try JSONDecoder().decode(JSONValue.self, from: body)
                             if let error = response.error,
                                let message = error.message, !message.isEmpty {
                                 if ContextOverflowMatcher.matches(
@@ -106,12 +107,15 @@ struct OpenAIResponsesProvider: ModelProvider {
                                 throw OpenAIProviderError.responseFailed(message)
                             }
                             var parser = OpenAICompatibleStreamParser()
-                            let events = parser.parseCompleteResponse(response)
+                            let events = try parser.parseCompleteResponse(
+                                response,
+                                rawResponse: rawResponse
+                            )
+                            guard parser.hasText || parser.hasToolCall else {
+                                throw OpenAIProviderError.noTextOutput
+                            }
                             for event in events {
                                 continuation.yield(event)
-                            }
-                            guard parser.hasText else {
-                                throw OpenAIProviderError.noTextOutput
                             }
                             continuation.finish()
                             return
@@ -124,13 +128,14 @@ struct OpenAIResponsesProvider: ModelProvider {
                             try Task.checkCancellation()
                             guard let payload = eventDecoder.append(byte) else { continue }
                             let batch = try parser.parse(payload)
+                            if batch.isCompleted,
+                               !parser.hasText, !parser.hasToolCall {
+                                throw OpenAIProviderError.noTextOutput
+                            }
                             for event in batch.events {
                                 continuation.yield(event)
                             }
                             if batch.isCompleted {
-                                guard parser.hasText else {
-                                    throw OpenAIProviderError.noTextOutput
-                                }
                                 continuation.finish()
                                 return
                             }
@@ -138,13 +143,25 @@ struct OpenAIResponsesProvider: ModelProvider {
 
                         if let payload = eventDecoder.finish() {
                             let batch = try parser.parse(payload)
+                            if batch.isCompleted,
+                               !parser.hasText, !parser.hasToolCall {
+                                throw OpenAIProviderError.noTextOutput
+                            }
                             for event in batch.events {
                                 continuation.yield(event)
                             }
+                            if batch.isCompleted {
+                                continuation.finish()
+                                return
+                            }
                         }
 
-                        guard parser.hasText else {
+                        guard parser.hasText || parser.hasToolCall else {
                             throw OpenAIProviderError.noTextOutput
+                        }
+                        let finalBatch = try parser.finish()
+                        for event in finalBatch.events {
+                            continuation.yield(event)
                         }
                         continuation.finish()
                         return
@@ -168,6 +185,11 @@ struct OpenAIResponsesProvider: ModelProvider {
         request: ModelRequest,
         usesWebSearch: Bool
     ) throws -> URLRequest {
+        if !request.functionTools.isEmpty || request.toolFollowUp != nil {
+            guard dialect == .openAI else {
+                throw OpenAIProviderError.localToolsUnsupported
+            }
+        }
         var urlRequest = URLRequest(url: baseURL.appendingPathComponent("responses"))
         urlRequest.httpMethod = "POST"
         urlRequest.timeoutInterval = 90
@@ -175,7 +197,7 @@ struct OpenAIResponsesProvider: ModelProvider {
         urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         var input = request.messages.map {
-            InputMessage(role: $0.role.rawValue, content: $0.text)
+            ResponseInputItem.message(InputMessage(role: $0.role.rawValue, content: $0.text))
         }
         // instructions 映射规则固定（计划《上下文压缩 v1》§2）：
         // 原生方言用顶层 instructions；兼容方言在 input 最前插入 system message；
@@ -186,8 +208,48 @@ struct OpenAIResponsesProvider: ModelProvider {
             case .openAI:
                 instructions = value
             case .deepSeek, .compatible:
-                input.insert(InputMessage(role: "system", content: value), at: 0)
+                input.insert(
+                    .message(InputMessage(role: "system", content: value)),
+                    at: 0
+                )
             }
+        }
+        if let followUp = request.toolFollowUp {
+            let payload = try Self.validatedContinuation(followUp, tools: request.functionTools)
+            input.append(contentsOf: payload.outputItems.map(ResponseInputItem.raw))
+            let resultsByCallID = Dictionary(
+                uniqueKeysWithValues: followUp.results.map { ($0.callID, $0) }
+            )
+            for callID in payload.callIDs {
+                guard let result = resultsByCallID[callID] else {
+                    throw OpenAIProviderError.invalidToolFollowUp
+                }
+                input.append(.functionOutput(FunctionCallOutput(
+                    type: "function_call_output",
+                    callID: callID,
+                    output: result.output
+                )))
+            }
+        }
+
+        guard Set(request.functionTools.map(\.name)).count == request.functionTools.count else {
+            throw OpenAIProviderError.invalidToolDefinition
+        }
+        let functionTools = try request.functionTools.map { definition -> ResponseToolRequest in
+            guard Self.isValidTool(definition) else {
+                throw OpenAIProviderError.invalidToolDefinition
+            }
+            return .function(FunctionToolRequest(
+                type: "function",
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.inputSchema,
+                strict: true
+            ))
+        }
+        var tools = functionTools
+        if usesWebSearch {
+            tools.insert(.hosted(HostedToolRequest(type: "web_search")), at: 0)
         }
         urlRequest.httpBody = try JSONEncoder().encode(
             ResponsesRequestBody(
@@ -200,14 +262,54 @@ struct OpenAIResponsesProvider: ModelProvider {
                     effort: request.reasoningEffort
                         ?? (request.reasoningEnabled ? "high" : "none")
                 ),
-                tools: usesWebSearch ? [HostedToolRequest(type: "web_search")] : nil,
-                toolChoice: usesWebSearch ? "auto" : nil,
+                tools: tools.isEmpty ? nil : tools,
+                toolChoice: tools.isEmpty ? nil : "auto",
+                parallelToolCalls: functionTools.isEmpty ? nil : false,
                 include: usesWebSearch && dialect == .openAI
                     ? ["web_search_call.action.sources"]
                     : nil
             )
         )
         return urlRequest
+    }
+
+    private static func isValidTool(_ definition: ModelToolDefinition) -> Bool {
+        guard !definition.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case let .object(schema) = definition.inputSchema,
+              schema["type"] == .string("object"),
+              schema["additionalProperties"] == .boolean(false) else {
+            return false
+        }
+        return true
+    }
+
+    private static func validatedContinuation(
+        _ followUp: ModelToolFollowUp,
+        tools: [ModelToolDefinition]
+    ) throws -> ResponsesContinuationPayload {
+        guard followUp.continuation.format == ResponsesContinuationPayload.format,
+              !tools.isEmpty,
+              let payload = try? JSONDecoder().decode(
+                  ResponsesContinuationPayload.self,
+                  from: followUp.continuation.payload
+              ) else {
+            throw OpenAIProviderError.invalidToolFollowUp
+        }
+        let outputCallIDs = payload.outputItems.compactMap { item -> String? in
+            guard item.objectValue?["type"] == .string("function_call"),
+                  case let .string(callID)? = item.objectValue?["call_id"] else {
+                return nil
+            }
+            return callID
+        }
+        guard !payload.callIDs.isEmpty,
+              Set(payload.callIDs).count == payload.callIDs.count,
+              outputCallIDs == payload.callIDs,
+              Set(followUp.results.map(\.callID)).count == followUp.results.count,
+              Set(payload.callIDs) == Set(followUp.results.map(\.callID)) else {
+            throw OpenAIProviderError.invalidToolFollowUp
+        }
+        return payload
     }
 
     private func read(
@@ -275,12 +377,13 @@ private struct ResponsesRequestBody: Encodable {
     let model: String
     /// 仅原生（openAI）方言使用的顶层 instructions（计划《上下文压缩 v1》§2）。
     let instructions: String?
-    let input: [InputMessage]
+    let input: [ResponseInputItem]
     let stream: Bool
     let store: Bool
     let reasoning: ReasoningConfig
-    let tools: [HostedToolRequest]?
+    let tools: [ResponseToolRequest]?
     let toolChoice: String?
+    let parallelToolCalls: Bool?
     let include: [String]?
 
     private enum CodingKeys: String, CodingKey {
@@ -292,6 +395,7 @@ private struct ResponsesRequestBody: Encodable {
         case reasoning
         case tools
         case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
         case include
     }
 
@@ -306,12 +410,83 @@ private struct ResponsesRequestBody: Encodable {
         try container.encode(reasoning, forKey: .reasoning)
         try container.encodeIfPresent(tools, forKey: .tools)
         try container.encodeIfPresent(toolChoice, forKey: .toolChoice)
+        try container.encodeIfPresent(parallelToolCalls, forKey: .parallelToolCalls)
         try container.encodeIfPresent(include, forKey: .include)
+    }
+}
+
+private enum ResponseInputItem: Encodable {
+    case message(InputMessage)
+    case raw(JSONValue)
+    case functionOutput(FunctionCallOutput)
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .message(value):
+            try value.encode(to: encoder)
+        case let .raw(value):
+            try value.encode(to: encoder)
+        case let .functionOutput(value):
+            try value.encode(to: encoder)
+        }
+    }
+}
+
+private struct FunctionCallOutput: Encodable {
+    let type: String
+    let callID: String
+    let output: String
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case callID = "call_id"
+        case output
+    }
+}
+
+private enum ResponseToolRequest: Encodable {
+    case hosted(HostedToolRequest)
+    case function(FunctionToolRequest)
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .hosted(value):
+            try value.encode(to: encoder)
+        case let .function(value):
+            try value.encode(to: encoder)
+        }
     }
 }
 
 private struct HostedToolRequest: Encodable {
     let type: String
+}
+
+private struct FunctionToolRequest: Encodable {
+    let type: String
+    let name: String
+    let description: String
+    let parameters: JSONValue
+    let strict: Bool
+}
+
+private struct ResponsesContinuationPayload: Codable {
+    static let format = "openai.responses.output-items.v1"
+
+    let outputItems: [JSONValue]
+    let callIDs: [String]
+}
+
+private extension JSONValue {
+    var objectValue: [String: JSONValue]? {
+        guard case let .object(value) = self else { return nil }
+        return value
+    }
+
+    var arrayValue: [JSONValue]? {
+        guard case let .array(value) = self else { return nil }
+        return value
+    }
 }
 
 private struct ReasoningConfig: Encodable {
@@ -326,7 +501,6 @@ private struct InputMessage: Encodable {
 private struct OpenAICompatibleStreamParser {
     struct Batch {
         static let ignored = Batch(events: [])
-        static let completed = Batch(events: [], isCompleted: true)
 
         let events: [ModelEvent]
         let isCompleted: Bool
@@ -338,31 +512,66 @@ private struct OpenAICompatibleStreamParser {
     }
 
     private(set) var hasText = false
+    private(set) var hasToolCall = false
     private var emittedCitations = Set<CitationKey>()
     private var tools: [String: HostedToolSnapshot] = [:]
     private var didReceiveTextDelta = false
     private var emittedTextItems = Set<String>()
     private var textBaseOffsets: [Int: Int] = [:]
     private var emittedTextUTF16Count = 0
+    private var pendingToolCalls: [String: PendingToolCall] = [:]
+    private var completedItemIDsByCallID: [String: String] = [:]
+    private var completedToolCalls: [ModelToolCall] = []
+    private var didEmitCompletion = false
+
+    private struct PendingToolCall {
+        let itemID: String
+        let outputIndex: Int?
+        let callID: String
+        let name: String
+        var arguments: String?
+    }
 
     mutating func parse(_ payload: String) throws -> Batch {
-        guard payload != "[DONE]" else { return .completed }
+        guard payload != "[DONE]" else { return try finish() }
         guard let data = payload.data(using: .utf8) else {
             return .ignored
         }
         let event = try JSONDecoder().decode(StreamEvent.self, from: data)
-        return try parse(event)
+        let rawEvent = try JSONDecoder().decode(JSONValue.self, from: data)
+        return try parse(event, rawEvent: rawEvent)
     }
 
-    mutating func parseCompleteResponse(_ response: APIResponse) -> [ModelEvent] {
-        var events = events(from: response, includeText: true)
+    mutating func parseCompleteResponse(
+        _ response: APIResponse,
+        rawResponse: JSONValue
+    ) throws -> [ModelEvent] {
+        var events = try events(from: response, includeText: true)
         if let usage = response.usage?.snapshot() {
             events.append(.usage(usage))
         }
+        events.append(try completion(rawResponse: rawResponse))
         return events
     }
 
-    private mutating func parse(_ event: StreamEvent) throws -> Batch {
+    mutating func finish() throws -> Batch {
+        guard !didEmitCompletion else {
+            return Batch(events: [], isCompleted: true)
+        }
+        guard !hasToolCall, pendingToolCalls.isEmpty else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        didEmitCompletion = true
+        return Batch(
+            events: [.completed(ModelCompletion(continuation: nil))],
+            isCompleted: true
+        )
+    }
+
+    private mutating func parse(
+        _ event: StreamEvent,
+        rawEvent: JSONValue
+    ) throws -> Batch {
         switch event.type {
         case "response.reasoning_text.delta":
             guard let delta = event.delta, !delta.isEmpty else {
@@ -396,9 +605,45 @@ private struct OpenAICompatibleStreamParser {
             emittedTextUTF16Count += text.utf16.count
             hasText = true
             return Batch(events: [.textDelta(text)])
-        case "response.output_item.added", "response.output_item.done":
+        case "response.output_item.added":
             guard let item = event.item else {
                 return .ignored
+            }
+            if item.type == "function_call" {
+                try registerToolCall(item, outputIndex: event.outputIndex)
+                return .ignored
+            }
+            return Batch(
+                events: events(
+                    from: item,
+                    includeText: !didReceiveTextDelta,
+                    citationOffset: textBaseOffsets[event.outputIndex ?? 0] ?? 0,
+                    textItemKey: item.id ?? "output:\(event.outputIndex ?? 0)"
+                )
+            )
+        case "response.function_call_arguments.delta":
+            guard let itemID = event.itemID,
+                  let delta = event.delta,
+                  !delta.isEmpty,
+                  var pending = pendingToolCalls[itemID] else {
+                throw OpenAIProviderError.invalidResponse
+            }
+            pending.arguments = (pending.arguments ?? "") + delta
+            pendingToolCalls[itemID] = pending
+            return Batch(events: [.toolCallDelta(ModelToolCallDelta(
+                callID: pending.callID,
+                name: pending.name,
+                argumentsDelta: delta
+            ))])
+        case "response.output_item.done":
+            guard let item = event.item else {
+                return .ignored
+            }
+            if item.type == "function_call" {
+                return Batch(events: try completeToolCall(
+                    item,
+                    outputIndex: event.outputIndex
+                ))
             }
             return Batch(
                 events: events(
@@ -450,13 +695,16 @@ private struct OpenAICompatibleStreamParser {
                 )
             )
         case "response.completed":
-            var events = event.response.map {
-                self.events(from: $0, includeText: !hasText)
-            } ?? []
+            guard let response = event.response,
+                  let rawResponse = rawEvent.objectValue?["response"] else {
+                throw OpenAIProviderError.invalidResponse
+            }
+            var events = try self.events(from: response, includeText: !hasText)
             // usage 不计作文本输出，也不改变终止判断（计划《上下文压缩 v1》§4）。
-            if let usage = event.response?.usage?.snapshot() {
+            if let usage = response.usage?.snapshot() {
                 events.append(.usage(usage))
             }
+            events.append(try completion(rawResponse: rawResponse))
             return Batch(events: events, isCompleted: true)
         case "response.failed", "response.incomplete":
             let payload = event.response?.error
@@ -487,19 +735,122 @@ private struct OpenAICompatibleStreamParser {
     private mutating func events(
         from response: APIResponse,
         includeText: Bool
-    ) -> [ModelEvent] {
+    ) throws -> [ModelEvent] {
         var events: [ModelEvent] = []
         var citationOffset = 0
         for (index, item) in (response.output ?? []).enumerated() {
-            events.append(contentsOf: self.events(
-                from: item,
-                includeText: includeText,
-                citationOffset: citationOffset,
-                textItemKey: item.id ?? "response:\(index)"
-            ))
+            if item.type == "function_call" {
+                events.append(contentsOf: try completeToolCall(item, outputIndex: index))
+            } else {
+                events.append(contentsOf: self.events(
+                    from: item,
+                    includeText: includeText,
+                    citationOffset: citationOffset,
+                    textItemKey: item.id ?? "response:\(index)"
+                ))
+            }
             citationOffset += item.textUTF16Count
         }
         return events
+    }
+
+    private mutating func registerToolCall(
+        _ item: ResponseOutputItem,
+        outputIndex: Int?
+    ) throws {
+        guard let itemID = item.id, !itemID.isEmpty,
+              let callID = item.callID, !callID.isEmpty,
+              let name = item.name, !name.isEmpty else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        if let existing = pendingToolCalls[itemID] {
+            guard existing.callID == callID, existing.name == name else {
+                throw OpenAIProviderError.invalidResponse
+            }
+            return
+        }
+        guard !pendingToolCalls.values.contains(where: { $0.callID == callID }) else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        pendingToolCalls[itemID] = PendingToolCall(
+            itemID: itemID,
+            outputIndex: outputIndex,
+            callID: callID,
+            name: name,
+            arguments: item.arguments
+        )
+    }
+
+    private mutating func completeToolCall(
+        _ item: ResponseOutputItem,
+        outputIndex: Int?
+    ) throws -> [ModelEvent] {
+        guard let itemID = item.id, !itemID.isEmpty else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        let pending = pendingToolCalls[itemID]
+        let callID = item.callID ?? pending?.callID
+        let name = item.name ?? pending?.name
+        guard let callID, !callID.isEmpty,
+              let name, !name.isEmpty,
+              pending?.callID == nil || pending?.callID == callID,
+              pending?.name == nil || pending?.name == name,
+              pending?.outputIndex == nil
+                || outputIndex == nil
+                || pending?.outputIndex == outputIndex else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        if let completedItemID = completedItemIDsByCallID[callID] {
+            guard completedItemID == itemID else {
+                throw OpenAIProviderError.invalidResponse
+            }
+            return []
+        }
+        guard let arguments = item.arguments ?? pending?.arguments,
+              !arguments.isEmpty else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        let call = ModelToolCall(
+            callID: callID,
+            name: name,
+            arguments: arguments
+        )
+        completedItemIDsByCallID[callID] = itemID
+        hasToolCall = true
+        completedToolCalls.append(call)
+        return [.toolCallCompleted(call)]
+    }
+
+    private mutating func completion(rawResponse: JSONValue) throws -> ModelEvent {
+        guard !didEmitCompletion else {
+            throw OpenAIProviderError.invalidResponse
+        }
+        let continuation: ModelContinuation?
+        if hasToolCall {
+            guard let outputItems = rawResponse.objectValue?["output"]?.arrayValue,
+                  !outputItems.isEmpty,
+                  outputItems.compactMap({ item -> String? in
+                      guard item.objectValue?["type"] == .string("function_call"),
+                            case let .string(callID)? = item.objectValue?["call_id"] else {
+                          return nil
+                      }
+                      return callID
+                  }) == completedToolCalls.map(\.callID) else {
+                throw OpenAIProviderError.invalidResponse
+            }
+            let payload = ResponsesContinuationPayload(
+                outputItems: outputItems,
+                callIDs: completedToolCalls.map(\.callID)
+            )
+            continuation = ModelContinuation(
+                format: ResponsesContinuationPayload.format,
+                payload: try JSONEncoder().encode(payload)
+            )
+        } else {
+            continuation = nil
+        }
+        didEmitCompletion = true
+        return .completed(ModelCompletion(continuation: continuation))
     }
 
     private mutating func events(
@@ -707,8 +1058,22 @@ private struct ResponseOutputItem: Decodable {
     let id: String?
     let type: String?
     let status: String?
+    let callID: String?
+    let name: String?
+    let arguments: String?
     let action: ResponseAction?
     let content: [ResponseContent]?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case type
+        case status
+        case callID = "call_id"
+        case name
+        case arguments
+        case action
+        case content
+    }
 
     var textUTF16Count: Int {
         content?.reduce(0) { result, content in
@@ -833,6 +1198,9 @@ enum OpenAIProviderError: LocalizedError {
     case invalidResponse
     case noModels
     case noTextOutput
+    case localToolsUnsupported
+    case invalidToolDefinition
+    case invalidToolFollowUp
     case http(statusCode: Int, message: String?)
     case responseFailed(String)
     /// 服务端明确报告输入超出模型上下文窗口（计划《上下文压缩 v1》§3）。
@@ -847,6 +1215,12 @@ enum OpenAIProviderError: LocalizedError {
             "服务器没有返回任何可用模型。"
         case .noTextOutput:
             "模型没有返回文本内容。请确认所选模型支持 Responses API。"
+        case .localToolsUnsupported:
+            "当前 Responses 方言尚未支持本地 function tools。"
+        case .invalidToolDefinition:
+            "function tool 定义无效；参数 schema 必须是禁止额外字段的对象。"
+        case .invalidToolFollowUp:
+            "function tool 续传无效；请确认 continuation 与所有 call ID 的结果完整对应。"
         case let .http(statusCode, message):
             if let message, !message.isEmpty {
                 message

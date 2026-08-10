@@ -1,5 +1,96 @@
 import Foundation
 
+/// 与具体 Provider 无关的 JSON 值，用于结构化工具 schema。
+/// Provider 原始响应仍留在各自 Adapter 内，不通过该类型暴露给 UI。
+enum JSONValue: Codable, Sendable, Equatable {
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case string(String)
+    case number(Double)
+    case boolean(Bool)
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .boolean(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([JSONValue].self) {
+            self = .array(value)
+        } else {
+            self = .object(try container.decode([String: JSONValue].self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .object(value):
+            try container.encode(value)
+        case let .array(value):
+            try container.encode(value)
+        case let .string(value):
+            try container.encode(value)
+        case let .number(value):
+            try container.encode(value)
+        case let .boolean(value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+/// Runtime 向 Provider 广告的 client-owned function tool。
+struct ModelToolDefinition: Sendable, Equatable {
+    let name: String
+    let description: String
+    let inputSchema: JSONValue
+}
+
+/// 流式 arguments 增量；只在 Provider 已解析出稳定 call ID 与工具名后发射。
+struct ModelToolCallDelta: Sendable, Equatable {
+    let callID: String
+    let name: String
+    let argumentsDelta: String
+}
+
+/// Provider 完整收敛后的工具调用。
+struct ModelToolCall: Sendable, Equatable {
+    let callID: String
+    let name: String
+    let arguments: String
+}
+
+/// Runtime 执行工具后回传给模型的有限结果。
+struct ModelToolResult: Sendable, Equatable {
+    let callID: String
+    let output: String
+}
+
+/// Provider 私有、仅在当前 run 内原样回放的 continuation。
+/// payload 不进入 UI、日志或持久化。
+struct ModelContinuation: Sendable, Equatable {
+    let format: String
+    let payload: Data
+}
+
+/// continuation 与对应工具结果不可拆分，避免构造“有结果但无上一轮”的请求。
+struct ModelToolFollowUp: Sendable, Equatable {
+    let continuation: ModelContinuation
+    let results: [ModelToolResult]
+}
+
+/// Provider 成功完成一轮响应时发射的终止元数据。
+struct ModelCompletion: Sendable, Equatable {
+    let continuation: ModelContinuation?
+}
+
 /// 单个模型请求（计划 §8 `stream(request:)` 的入参）。
 /// 模型与推理开关是**每请求参数**：Provider 是无状态传输（ADR-001），
 /// 不持有会话配置；具体模型/是否推理由 Runtime 按会话配置填入。
@@ -15,6 +106,8 @@ struct ModelRequest: Sendable {
     let reasoningEnabled: Bool
     let reasoningEffort: String?
     let hostedTools: Set<HostedToolKind>
+    let functionTools: [ModelToolDefinition]
+    let toolFollowUp: ModelToolFollowUp?
 
     init(
         instructions: String? = nil,
@@ -22,7 +115,9 @@ struct ModelRequest: Sendable {
         model: String,
         reasoningEnabled: Bool,
         reasoningEffort: String? = nil,
-        hostedTools: Set<HostedToolKind> = []
+        hostedTools: Set<HostedToolKind> = [],
+        functionTools: [ModelToolDefinition] = [],
+        toolFollowUp: ModelToolFollowUp? = nil
     ) {
         self.instructions = instructions
         self.messages = messages
@@ -30,6 +125,8 @@ struct ModelRequest: Sendable {
         self.reasoningEnabled = reasoningEnabled
         self.reasoningEffort = reasoningEffort
         self.hostedTools = hostedTools
+        self.functionTools = functionTools
+        self.toolFollowUp = toolFollowUp
     }
 }
 
@@ -93,9 +190,13 @@ enum ModelEvent: Sendable, Equatable {
     case reasoningDelta(String)
     case hostedToolUpdated(HostedToolSnapshot)
     case citationAdded(TextCitation)
+    case toolCallDelta(ModelToolCallDelta)
+    case toolCallCompleted(ModelToolCall)
     /// 服务端返回的真实 token 用量（计划《上下文压缩 v1》§4）。
     /// 不计作文本输出，也不改变终止判断。
     case usage(TokenUsageSnapshot)
+    /// Provider 成功流恰好发射一次，随后流结束。
+    case completed(ModelCompletion)
 }
 
 /// Provider 错误的统一分类（计划《上下文压缩 v1》§3）。

@@ -91,6 +91,7 @@ struct OpenAIChatCompletionsProvider: ModelProvider {
                             continuation.yield(event)
                         }
                         try parser.validateCompletion()
+                        continuation.yield(.completed(ModelCompletion(continuation: nil)))
                         continuation.finish()
                         return
                     }
@@ -105,6 +106,7 @@ struct OpenAIChatCompletionsProvider: ModelProvider {
                         }
                         if batch.isCompleted {
                             try parser.validateCompletion()
+                            continuation.yield(.completed(ModelCompletion(continuation: nil)))
                             continuation.finish()
                             return
                         }
@@ -117,6 +119,7 @@ struct OpenAIChatCompletionsProvider: ModelProvider {
                         }
                     }
                     try parser.validateCompletion()
+                    continuation.yield(.completed(ModelCompletion(continuation: nil)))
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -134,6 +137,9 @@ struct OpenAIChatCompletionsProvider: ModelProvider {
     }
 
     private func makeURLRequest(request: ModelRequest) throws -> URLRequest {
+        guard request.functionTools.isEmpty, request.toolFollowUp == nil else {
+            throw ChatCompletionsProviderError.localToolsUnsupported
+        }
         var urlRequest = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
         urlRequest.httpMethod = "POST"
         urlRequest.timeoutInterval = 90
@@ -485,6 +491,7 @@ enum ChatCompletionsProviderError: LocalizedError {
     case noModels
     case noTextOutput
     case unsupportedToolCall
+    case localToolsUnsupported
     case http(statusCode: Int, message: String?)
     case responseFailed(String)
     case contextOverflow(message: String)
@@ -499,6 +506,8 @@ enum ChatCompletionsProviderError: LocalizedError {
             "模型没有返回文本内容。请确认所选模型支持 Chat Completions API。"
         case .unsupportedToolCall:
             "模型请求调用工具，但当前 Chat Completions Runtime 尚未接入本地工具循环。"
+        case .localToolsUnsupported:
+            "当前 Chat Completions Provider 尚未支持本地 function tools。"
         case let .http(statusCode, message):
             if let message, !message.isEmpty {
                 message

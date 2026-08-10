@@ -200,6 +200,7 @@ final class OpenAICompatibleProviderTests: XCTestCase {
                     HostedToolSource(url: "https://swift.org/blog", title: "Swift Blog"),
                 ]
             )),
+            .completed(ModelCompletion(continuation: nil)),
         ])
     }
 
@@ -304,7 +305,234 @@ final class OpenAICompatibleProviderTests: XCTestCase {
                 url: "https://example.org",
                 title: "More"
             )),
+            .completed(ModelCompletion(continuation: nil)),
         ])
+    }
+
+    func testOpenAIFunctionToolStreamsOnceAndReplaysOpaqueContinuation() async throws {
+        FunctionToolConversationURLProtocol.reset(expectsWebSearch: true)
+        let provider = makeResponsesProvider(
+            protocolClass: FunctionToolConversationURLProtocol.self,
+            dialect: .openAI
+        )
+        let tool = weatherTool()
+        let firstEvents = try await collectEvents(provider, request: ModelRequest(
+            messages: [ChatMessage(role: .user, text: "上海天气")],
+            model: "test-model",
+            reasoningEnabled: true,
+            hostedTools: [.webSearch],
+            functionTools: [tool]
+        ))
+
+        XCTAssertEqual(firstEvents.compactMap { event in
+            guard case let .toolCallDelta(delta) = event else { return nil }
+            return delta
+        }, [
+            ModelToolCallDelta(
+                callID: "call_weather",
+                name: "lookup_weather",
+                argumentsDelta: "{\"city\":"
+            ),
+            ModelToolCallDelta(
+                callID: "call_weather",
+                name: "lookup_weather",
+                argumentsDelta: "\"上海\"}"
+            ),
+        ])
+        XCTAssertEqual(firstEvents.compactMap { event in
+            guard case let .toolCallCompleted(call) = event else { return nil }
+            return call
+        }, [ModelToolCall(
+            callID: "call_weather",
+            name: "lookup_weather",
+            arguments: "{\"city\":\"上海\"}"
+        )])
+        let completions = firstEvents.compactMap { event -> ModelCompletion? in
+            guard case let .completed(completion) = event else { return nil }
+            return completion
+        }
+        XCTAssertEqual(completions.count, 1)
+        let continuation = try XCTUnwrap(completions.first?.continuation)
+        XCTAssertEqual(continuation.format, "openai.responses.output-items.v1")
+
+        let invalidFollowUps = [
+            ModelToolFollowUp(
+                continuation: ModelContinuation(
+                    format: "wrong-format",
+                    payload: continuation.payload
+                ),
+                results: [ModelToolResult(callID: "call_weather", output: "晴，28°C")]
+            ),
+            ModelToolFollowUp(continuation: continuation, results: []),
+            ModelToolFollowUp(
+                continuation: continuation,
+                results: [ModelToolResult(callID: "unknown", output: "晴，28°C")]
+            ),
+            ModelToolFollowUp(
+                continuation: continuation,
+                results: [
+                    ModelToolResult(callID: "call_weather", output: "晴，28°C"),
+                    ModelToolResult(callID: "call_weather", output: "重复"),
+                ]
+            ),
+        ]
+        for followUp in invalidFollowUps {
+            do {
+                _ = try await collectEvents(provider, request: ModelRequest(
+                    messages: [ChatMessage(role: .user, text: "上海天气")],
+                    model: "test-model",
+                    reasoningEnabled: true,
+                    functionTools: [tool],
+                    toolFollowUp: followUp
+                ))
+                XCTFail("expected invalid tool follow-up")
+            } catch let error as OpenAIProviderError {
+                guard case .invalidToolFollowUp = error else {
+                    return XCTFail("expected invalidToolFollowUp, got \(error)")
+                }
+            }
+        }
+
+        let secondEvents = try await collectEvents(provider, request: ModelRequest(
+            messages: [ChatMessage(role: .user, text: "上海天气")],
+            model: "test-model",
+            reasoningEnabled: true,
+            functionTools: [tool],
+            toolFollowUp: ModelToolFollowUp(
+                continuation: continuation,
+                results: [ModelToolResult(callID: "call_weather", output: "晴，28°C")]
+            )
+        ))
+        XCTAssertEqual(secondEvents, [
+            .textDelta("今天晴，28°C"),
+            .completed(ModelCompletion(continuation: nil)),
+        ])
+        XCTAssertEqual(FunctionToolConversationURLProtocol.receivedRequestCount, 2)
+    }
+
+    func testSSEAndCompleteJSONProduceEquivalentFunctionCompletion() async throws {
+        FunctionToolConversationURLProtocol.reset(expectsWebSearch: false)
+        let sseProvider = makeResponsesProvider(
+            protocolClass: FunctionToolConversationURLProtocol.self,
+            dialect: .openAI
+        )
+        let jsonProvider = makeResponsesProvider(
+            protocolClass: FunctionToolJSONURLProtocol.self,
+            dialect: .openAI
+        )
+        let request = ModelRequest(
+            messages: [ChatMessage(role: .user, text: "上海天气")],
+            model: "test-model",
+            reasoningEnabled: true,
+            functionTools: [weatherTool()]
+        )
+
+        let sseEvents = try await collectEvents(sseProvider, request: request)
+        let jsonEvents = try await collectEvents(jsonProvider, request: request)
+        XCTAssertEqual(
+            sseEvents.compactMap { event -> ModelToolCall? in
+                guard case let .toolCallCompleted(call) = event else { return nil }
+                return call
+            },
+            jsonEvents.compactMap { event -> ModelToolCall? in
+                guard case let .toolCallCompleted(call) = event else { return nil }
+                return call
+            }
+        )
+        let sseContinuation = try XCTUnwrap(sseEvents.compactMap { event -> ModelContinuation? in
+            guard case let .completed(completion) = event else { return nil }
+            return completion.continuation
+        }.first)
+        let jsonContinuation = try XCTUnwrap(jsonEvents.compactMap { event -> ModelContinuation? in
+            guard case let .completed(completion) = event else { return nil }
+            return completion.continuation
+        }.first)
+        XCTAssertEqual(sseContinuation.format, jsonContinuation.format)
+        let ssePayload = try JSONSerialization.jsonObject(with: sseContinuation.payload) as? NSDictionary
+        let jsonPayload = try JSONSerialization.jsonObject(with: jsonContinuation.payload) as? NSDictionary
+        XCTAssertEqual(ssePayload, jsonPayload)
+    }
+
+    func testUnsupportedResponsesDialectsRejectFunctionToolsBeforeNetwork() async throws {
+        for dialect in [OpenAIResponsesProvider.Dialect.deepSeek, .compatible] {
+            let provider = makeResponsesProvider(
+                protocolClass: UnexpectedNetworkURLProtocol.self,
+                dialect: dialect
+            )
+            do {
+                _ = try await collectEvents(provider, request: ModelRequest(
+                    messages: [ChatMessage(role: .user, text: "Hi")],
+                    model: "test-model",
+                    reasoningEnabled: true,
+                    functionTools: [weatherTool()]
+                ))
+                XCTFail("expected unsupported function tools")
+            } catch let error as OpenAIProviderError {
+                guard case .localToolsUnsupported = error else {
+                    return XCTFail("expected localToolsUnsupported, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testInvalidFunctionDefinitionsAreRejectedBeforeNetwork() async throws {
+        let provider = makeResponsesProvider(
+            protocolClass: UnexpectedNetworkURLProtocol.self,
+            dialect: .openAI
+        )
+        let invalidDefinitions = [
+            [ModelToolDefinition(
+                name: "lookup_weather",
+                description: "缺少严格对象约束",
+                inputSchema: .object(["type": .string("object")])
+            )],
+            [weatherTool(), weatherTool()],
+        ]
+
+        for functionTools in invalidDefinitions {
+            do {
+                _ = try await collectEvents(provider, request: ModelRequest(
+                    messages: [ChatMessage(role: .user, text: "Hi")],
+                    model: "test-model",
+                    reasoningEnabled: true,
+                    functionTools: functionTools
+                ))
+                XCTFail("expected invalid function definition")
+            } catch let error as OpenAIProviderError {
+                guard case .invalidToolDefinition = error else {
+                    return XCTFail("expected invalidToolDefinition, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testIncompleteFunctionCallsFailWithoutCompletedEvent() async throws {
+        for protocolClass in [
+            MissingFunctionNameURLProtocol.self,
+            MissingFunctionOutputURLProtocol.self,
+        ] {
+            let provider = makeResponsesProvider(protocolClass: protocolClass, dialect: .openAI)
+            var events: [ModelEvent] = []
+            do {
+                for try await event in provider.stream(request: ModelRequest(
+                    messages: [ChatMessage(role: .user, text: "Hi")],
+                    model: "test-model",
+                    reasoningEnabled: true,
+                    functionTools: [weatherTool()]
+                )) {
+                    events.append(event)
+                }
+                XCTFail("expected invalid response")
+            } catch let error as OpenAIProviderError {
+                guard case .invalidResponse = error else {
+                    return XCTFail("expected invalidResponse, got \(error)")
+                }
+            }
+            XCTAssertFalse(events.contains { event in
+                if case .completed = event { return true }
+                return false
+            })
+        }
     }
 }
 
@@ -622,6 +850,175 @@ private final class JSONWebSearchURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
+private final class FunctionToolConversationURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var requestCount = 0
+    nonisolated(unsafe) private static var expectsWebSearch = false
+
+    static var receivedRequestCount: Int {
+        lock.withLock { requestCount }
+    }
+
+    static func reset(expectsWebSearch: Bool) {
+        lock.withLock {
+            requestCount = 0
+            self.expectsWebSearch = expectsWebSearch
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let count = Self.lock.withLock {
+            Self.requestCount += 1
+            return Self.requestCount
+        }
+        let body = requestJSON(request)
+        XCTAssertEqual(body?["store"] as? Bool, false)
+        XCTAssertEqual(body?["tool_choice"] as? String, "auto")
+        XCTAssertEqual(body?["parallel_tool_calls"] as? Bool, false)
+        let tools = body?["tools"] as? [[String: Any]]
+        let function = tools?.first { $0["type"] as? String == "function" }
+        XCTAssertEqual(function?["name"] as? String, "lookup_weather")
+        XCTAssertEqual(function?["description"] as? String, "查询城市天气")
+        XCTAssertEqual(function?["strict"] as? Bool, true)
+        let parameters = function?["parameters"] as? [String: Any]
+        XCTAssertEqual(parameters?["type"] as? String, "object")
+        XCTAssertEqual(parameters?["additionalProperties"] as? Bool, false)
+
+        if count == 1 {
+            let hasWebSearch = tools?.contains {
+                $0["type"] as? String == "web_search"
+            } == true
+            let expectsWebSearch = Self.lock.withLock { Self.expectsWebSearch }
+            XCTAssertEqual(hasWebSearch, expectsWebSearch)
+            if expectsWebSearch {
+                XCTAssertEqual(
+                    body?["include"] as? [String],
+                    ["web_search_call.action.sources"]
+                )
+            }
+            sendSSEStream(functionToolSSE(), chunkSize: 1)
+        } else {
+            let input = body?["input"] as? [[String: Any]]
+            XCTAssertEqual(input?.count, 4)
+            XCTAssertEqual(input?[0]["role"] as? String, "user")
+            XCTAssertEqual(input?[1]["type"] as? String, "reasoning")
+            XCTAssertEqual(
+                ((input?[1]["future_field"] as? [String: Any])?["nested"] as? Bool),
+                true
+            )
+            XCTAssertEqual(input?[2]["type"] as? String, "function_call")
+            XCTAssertEqual(input?[2]["future_call_field"] as? String, "preserved")
+            XCTAssertEqual(input?[3]["type"] as? String, "function_call_output")
+            XCTAssertEqual(input?[3]["call_id"] as? String, "call_weather")
+            XCTAssertEqual(input?[3]["output"] as? String, "晴，28°C")
+            sendSSEStream(Data(
+                """
+                data: {"type":"response.output_text.delta","delta":"今天晴，28°C"}
+
+                data: {"type":"response.completed","response":{"output":[]}}
+
+                """.utf8
+            ))
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class FunctionToolJSONURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        sendResponse(
+            statusCode: 200,
+            contentType: "application/json",
+            body: functionToolResponseJSON()
+        )
+    }
+
+    override func stopLoading() {}
+}
+
+private final class MissingFunctionNameURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        sendSSEStream(Data(
+            """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_missing","type":"function_call","call_id":"call_missing","arguments":""}}
+
+            """.utf8
+        ))
+    }
+
+    override func stopLoading() {}
+}
+
+private final class MissingFunctionOutputURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        sendSSEStream(Data(
+            """
+            data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_missing_output","type":"function_call","call_id":"call_missing_output","name":"lookup_weather","arguments":""}}
+
+            data: {"type":"response.function_call_arguments.delta","item_id":"fc_missing_output","output_index":0,"delta":"{}"}
+
+            data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_missing_output","type":"function_call","call_id":"call_missing_output","name":"lookup_weather","arguments":"{}"}}
+
+            data: {"type":"response.completed","response":{}}
+
+            """.utf8
+        ))
+    }
+
+    override func stopLoading() {}
+}
+
+private final class UnexpectedNetworkURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        XCTFail("请求应在发起网络访问前失败")
+        client?.urlProtocol(
+            self,
+            didFailWithError: URLError(.unsupportedURL)
+        )
+    }
+
+    override func stopLoading() {}
+}
+
+private func functionToolResponseJSON() -> String {
+    #"{"output":[{"id":"rs_weather","type":"reasoning","summary":[],"encrypted_content":"opaque","future_field":{"nested":true}},{"id":"fc_weather","type":"function_call","call_id":"call_weather","name":"lookup_weather","arguments":"{\"city\":\"上海\"}","future_call_field":"preserved"}]}"#
+}
+
+private func functionToolSSE() -> Data {
+    Data(
+        """
+        data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_weather","type":"function_call","call_id":"call_weather","name":"lookup_weather","arguments":""}}
+
+        data: {"type":"response.function_call_arguments.delta","item_id":"fc_weather","output_index":1,"delta":"{\\"city\\":"}
+
+        data: {"type":"response.function_call_arguments.delta","item_id":"fc_weather","output_index":1,"delta":"\\"上海\\"}"}
+
+        data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_weather","type":"function_call","call_id":"call_weather","name":"lookup_weather","arguments":"{\\"city\\":\\"上海\\"}"}}
+
+        data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_weather","type":"function_call","call_id":"call_weather","name":"lookup_weather","arguments":"{\\"city\\":\\"上海\\"}"}}
+
+        data: {"type":"response.completed","response":\(functionToolResponseJSON())}
+
+        """.utf8
+    )
+}
+
 private func requestBodyData(_ request: URLRequest) -> Data? {
     if let body = request.httpBody {
         return body
@@ -732,6 +1129,48 @@ private extension URLProtocol {
 
 @MainActor
 private extension OpenAICompatibleProviderTests {
+    func makeResponsesProvider(
+        protocolClass: URLProtocol.Type,
+        dialect: OpenAIResponsesProvider.Dialect
+    ) -> OpenAIResponsesProvider {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [protocolClass]
+        return OpenAIResponsesProvider(
+            apiKey: "test-key",
+            baseURL: URL(string: "https://api.openai.test/v1")!,
+            session: URLSession(configuration: configuration),
+            dialect: dialect
+        )
+    }
+
+    func weatherTool() -> ModelToolDefinition {
+        ModelToolDefinition(
+            name: "lookup_weather",
+            description: "查询城市天气",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "city": .object([
+                        "type": .string("string"),
+                    ]),
+                ]),
+                "required": .array([.string("city")]),
+                "additionalProperties": .boolean(false),
+            ])
+        )
+    }
+
+    func collectEvents(
+        _ provider: OpenAIResponsesProvider,
+        request: ModelRequest
+    ) async throws -> [ModelEvent] {
+        var events: [ModelEvent] = []
+        for try await event in provider.stream(request: request) {
+            events.append(event)
+        }
+        return events
+    }
+
     func streamText(
         _ provider: OpenAIResponsesProvider,
         model: String,
@@ -740,6 +1179,7 @@ private extension OpenAICompatibleProviderTests {
         hostedTools: Set<HostedToolKind> = []
     ) async throws -> String {
         var text = ""
+        var completionCount = 0
         for try await event in provider.stream(request: ModelRequest(
             messages: [ChatMessage(role: .user, text: "Hi")],
             model: model,
@@ -750,7 +1190,11 @@ private extension OpenAICompatibleProviderTests {
             if case let .textDelta(delta) = event {
                 text += delta
             }
+            if case .completed = event {
+                completionCount += 1
+            }
         }
+        XCTAssertEqual(completionCount, 1)
         return text
     }
 

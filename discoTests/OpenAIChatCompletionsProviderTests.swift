@@ -23,6 +23,7 @@ final class OpenAIChatCompletionsProviderTests: XCTestCase {
                 totalTokens: 12
             )),
             .textDelta("！"),
+            .completed(ModelCompletion(continuation: nil)),
         ])
     }
 
@@ -39,7 +40,10 @@ final class OpenAIChatCompletionsProviderTests: XCTestCase {
             reasoningEnabled: false
         )
 
-        XCTAssertEqual(events, [.textDelta("完成")])
+        XCTAssertEqual(events, [
+            .textDelta("完成"),
+            .completed(ModelCompletion(continuation: nil)),
+        ])
     }
 
     func testModelsUsesParallelModelsEndpointAndSortsIDs() async throws {
@@ -64,6 +68,7 @@ final class OpenAIChatCompletionsProviderTests: XCTestCase {
         XCTAssertEqual(events, [
             .reasoningDelta("完整思考"),
             .textDelta("完整回答"),
+            .completed(ModelCompletion(continuation: nil)),
         ])
     }
 
@@ -95,6 +100,29 @@ final class OpenAIChatCompletionsProviderTests: XCTestCase {
         }
     }
 
+    func testFunctionToolsAreRejectedBeforeChatCompletionsNetworkRequest() async throws {
+        let provider = makeProvider(protocolClass: KimiUnexpectedNetworkURLProtocol.self)
+
+        do {
+            _ = try await collectEvents(
+                provider,
+                functionTools: [ModelToolDefinition(
+                    name: "lookup_weather",
+                    description: "查询天气",
+                    inputSchema: .object([
+                        "type": .string("object"),
+                        "additionalProperties": .boolean(false),
+                    ])
+                )]
+            )
+            XCTFail("expected unsupported function tools")
+        } catch let error as ChatCompletionsProviderError {
+            guard case .localToolsUnsupported = error else {
+                return XCTFail("expected localToolsUnsupported, got \(error)")
+            }
+        }
+    }
+
     private func makeProvider(
         protocolClass: URLProtocol.Type
     ) -> OpenAIChatCompletionsProvider {
@@ -111,18 +139,32 @@ final class OpenAIChatCompletionsProviderTests: XCTestCase {
     private func collectEvents(
         _ provider: OpenAIChatCompletionsProvider,
         messages: [ChatMessage]? = nil,
-        reasoningEnabled: Bool = true
+        reasoningEnabled: Bool = true,
+        functionTools: [ModelToolDefinition] = []
     ) async throws -> [ModelEvent] {
         var events: [ModelEvent] = []
         for try await event in provider.stream(request: ModelRequest(
             messages: messages ?? [ChatMessage(role: .user, text: "你好")],
             model: "kimi-for-coding",
-            reasoningEnabled: reasoningEnabled
+            reasoningEnabled: reasoningEnabled,
+            functionTools: functionTools
         )) {
             events.append(event)
         }
         return events
     }
+}
+
+private final class KimiUnexpectedNetworkURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        XCTFail("请求应在发起网络访问前失败")
+        client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+    }
+
+    override func stopLoading() {}
 }
 
 private final class KimiChatStreamURLProtocol: URLProtocol, @unchecked Sendable {

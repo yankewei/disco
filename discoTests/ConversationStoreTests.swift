@@ -89,6 +89,32 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertFalse(store.canRetry)
     }
 
+    func testUnexpectedLocalToolCallFailsWithoutExecutingIt() async throws {
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: RecordingProvider(
+                recorder: StreamRecorder(),
+                result: .success([
+                    .toolCallCompleted(ModelToolCall(
+                        callID: "call_1",
+                        name: "read_file",
+                        arguments: "{}"
+                    )),
+                    .completed(ModelCompletion(continuation: nil)),
+                ])
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: true)
+        ))
+        store.draft = "读取文件"
+
+        store.send()
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.map(\.text), ["读取文件"])
+        XCTAssertEqual(store.errorMessage, "模型请求调用本地工具，但工具循环尚未启用。")
+        XCTAssertTrue(store.canRetry)
+    }
+
     func testStopRemovesOnlyTheEmptyAssistantPlaceholder() async throws {
         let store = ConversationStore()
         store.configure(runtime: GenericAgentRuntime(
