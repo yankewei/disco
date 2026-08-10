@@ -154,6 +154,7 @@ final class CodexRuntime: AgentRuntime {
                 emitTerminal(.runFailed(runID, AgentFailure(message: "Codex 会话线程尚未就绪。")))
                 return
             }
+            continuation.yield(.runStateChanged(runID, .running))
             var hasText = false
             for try await turnEvent in transport.startTurn(
                 threadID: threadID,

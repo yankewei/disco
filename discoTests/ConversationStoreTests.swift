@@ -115,6 +115,81 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertTrue(store.canRetry)
     }
 
+    func testRequestUserInputPausesRunAndResumesWithValidatedAnswer() async throws {
+        let script = UserInputToolScript()
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: UserInputToolProvider(script: script),
+            configuration: .init(
+                model: "test-model",
+                reasoningEnabled: true,
+                userInputEnabled: true
+            )
+        ))
+        store.draft = "帮我选择"
+
+        store.send()
+        try await waitUntil(store) { $0.runState == .waitingForUserInput }
+
+        guard case let .userInput(request)? = store.firstPendingInteraction else {
+            return XCTFail("应该收到用户问答请求")
+        }
+        XCTAssertTrue(store.isStreaming)
+        XCTAssertEqual(request.questions.map(\.id), ["target"])
+        XCTAssertEqual(request.questions[0].options.map(\.label), ["A", "B"])
+        XCTAssertFalse(store.canSubmitUserInput(request))
+
+        store.updateUserInput(
+            requestID: request.id,
+            questionID: "target",
+            value: "B",
+            isCustom: false
+        )
+        XCTAssertTrue(store.canSubmitUserInput(request))
+        store.submitUserInput(request)
+        try await waitUntilStreamingFinishes(store)
+
+        XCTAssertEqual(store.messages.last?.text, "你选择了 B")
+        XCTAssertNil(store.userInputDrafts[request.id])
+        XCTAssertEqual(
+            store.interactionRecords.first(where: { $0.id == .userInput(request.id) })?.status,
+            .resolved("已回答")
+        )
+
+        let requests = await script.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].functionTools.map(\.name), ["request_user_input"])
+        XCTAssertNil(requests[0].toolFollowUp)
+        XCTAssertEqual(requests[1].toolFollowUp?.results.first?.callID, "call_input")
+        XCTAssertEqual(
+            requests[1].toolFollowUp?.results.first?.output,
+            #"{"answers":[{"answers":["B"],"question_id":"target"}]}"#
+        )
+    }
+
+    func testStoppingWhileWaitingForUserInputCancelsInteractionAndRun() async throws {
+        let script = UserInputToolScript()
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: UserInputToolProvider(script: script),
+            configuration: .init(
+                model: "test-model",
+                reasoningEnabled: true,
+                userInputEnabled: true
+            )
+        ))
+        store.draft = "先问我"
+
+        store.send()
+        try await waitUntil(store) { $0.runState == .waitingForUserInput }
+        store.stop()
+
+        XCTAssertEqual(store.runState, .cancelled)
+        XCTAssertFalse(store.isStreaming)
+        XCTAssertTrue(store.userInputDrafts.isEmpty)
+        XCTAssertEqual(store.interactionRecords.last?.status, .cancelled)
+    }
+
     func testStopRemovesOnlyTheEmptyAssistantPlaceholder() async throws {
         let store = ConversationStore()
         store.configure(runtime: GenericAgentRuntime(
@@ -308,6 +383,16 @@ final class ConversationStoreTests: XCTestCase {
         }
         XCTAssertFalse(store.isStreaming)
     }
+
+    private func waitUntil(
+        _ store: ConversationStore,
+        condition: (ConversationStore) -> Bool
+    ) async throws {
+        for _ in 0..<100 where !condition(store) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(store))
+    }
 }
 
 private actor StreamRecorder {
@@ -354,6 +439,51 @@ private struct NeverEndingProvider: ModelProvider {
     }
     func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
         AsyncThrowingStream { _ in }
+    }
+}
+
+private actor UserInputToolScript {
+    private(set) var requests: [ModelRequest] = []
+
+    func events(for request: ModelRequest) -> [ModelEvent] {
+        requests.append(request)
+        if request.toolFollowUp == nil {
+            return [
+                .toolCallCompleted(ModelToolCall(
+                    callID: "call_input",
+                    name: "request_user_input",
+                    arguments: #"{"questions":[{"id":"target","header":"目标","question":"请选择一个目标","options":[{"label":"A","description":"第一个选项"},{"label":"B","description":"第二个选项"}],"allows_other":false}]}"#
+                )),
+                .completed(ModelCompletion(continuation: ModelContinuation(
+                    format: "test",
+                    payload: Data("{}".utf8)
+                ))),
+            ]
+        }
+        return [
+            .textDelta("你选择了 B"),
+            .completed(ModelCompletion(continuation: nil)),
+        ]
+    }
+}
+
+private struct UserInputToolProvider: ModelProvider {
+    let script: UserInputToolScript
+    let descriptor = ProviderDescriptor(id: "user-input", displayName: "User Input")
+
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                for event in await script.events(for: request) {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
     }
 }
 

@@ -12,6 +12,7 @@ struct ChatView: View {
     @State private var isAtLatestMessage = true
     @State private var shouldFollowLatestMessage = true
     @State private var isUserScrolling = false
+    @State private var presentedInteractionID: PendingUserInteraction.ID?
 
     private static let latestMessageAnchor = "latest-message-anchor"
 
@@ -88,6 +89,12 @@ struct ChatView: View {
                             }
                         }
 
+                        ForEach(store.interactionRecords) { record in
+                            UserInteractionCard(record: record) {
+                                presentedInteractionID = record.id
+                            }
+                        }
+
                         Color.clear
                             .frame(height: 1)
                             .id(Self.latestMessageAnchor)
@@ -112,6 +119,10 @@ struct ChatView: View {
                     isUserScrolling = phase.isScrolling && phase != .animating
                 }
                 .onChange(of: store.messages) {
+                    guard shouldFollowLatestMessage else { return }
+                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                }
+                .onChange(of: store.interactionRecords) {
                     guard shouldFollowLatestMessage else { return }
                     proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
                 }
@@ -201,12 +212,441 @@ struct ChatView: View {
         } message: {
             Text("这只会清空当前窗口中的消息。")
         }
+        .sheet(item: interactionBinding, onDismiss: presentNextInteraction) { interaction in
+            UserInteractionSheet(interaction: interaction, store: store)
+                .interactiveDismissDisabled(store.isStreaming)
+        }
+        .onChange(of: store.firstPendingInteraction?.id) {
+            if presentedInteractionID == nil {
+                presentedInteractionID = store.firstPendingInteraction?.id
+            }
+        }
+        .onAppear {
+            if presentedInteractionID == nil {
+                presentedInteractionID = store.firstPendingInteraction?.id
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .discoRequestClearConversation)) { _ in
             guard !store.messages.isEmpty else { return }
             isConfirmingClear = true
         }
         .task(id: "\(appState.activeVendor.rawValue):\(appState.model)") {
             await appState.refreshCodexModelCatalogIfNeeded()
+        }
+    }
+
+    private var interactionBinding: Binding<PendingUserInteraction?> {
+        Binding(
+            get: {
+                guard let presentedInteractionID,
+                      let record = store.interactionRecords.first(where: {
+                          $0.id == presentedInteractionID
+                      }) else { return nil }
+                switch record.status {
+                case .pending, .submitting, .failed:
+                    return record.interaction
+                case .resolved, .cancelled:
+                    return nil
+                }
+            },
+            set: { interaction in
+                presentedInteractionID = interaction?.id
+            }
+        )
+    }
+
+    private func presentNextInteraction() {
+        presentedInteractionID = store.firstPendingInteraction?.id
+    }
+}
+
+private struct UserInteractionCard: View {
+    let record: UserInteractionRecord
+    let present: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(isResolved ? .secondary : DiscoTheme.accent)
+                .frame(width: 30, height: 30)
+                .background(Color.primary.opacity(0.06), in: Circle())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 12)
+
+            if canPresent {
+                Button("处理", action: present)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DiscoTheme.elevatedSurface, in: RoundedRectangle(
+            cornerRadius: DiscoRadius.medium,
+            style: .continuous
+        ))
+        .overlay {
+            RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var title: String {
+        switch record.interaction {
+        case .approval: "需要确认操作"
+        case let .userInput(request):
+            request.questions.count == 1 ? request.questions[0].header : "需要回答几个问题"
+        }
+    }
+
+    private var icon: String {
+        switch record.interaction {
+        case .approval: "checkmark.shield"
+        case .userInput: "questionmark.bubble"
+        }
+    }
+
+    private var statusText: String {
+        switch record.status {
+        case .pending: "等待你的操作"
+        case .submitting: "正在提交"
+        case let .resolved(summary): summary
+        case let .failed(message): "提交失败：\(message)"
+        case .cancelled: "已取消"
+        }
+    }
+
+    private var canPresent: Bool {
+        switch record.status {
+        case .pending, .failed: true
+        case .submitting, .resolved, .cancelled: false
+        }
+    }
+
+    private var isResolved: Bool {
+        switch record.status {
+        case .resolved, .cancelled: true
+        case .pending, .submitting, .failed: false
+        }
+    }
+}
+
+private struct UserInteractionSheet: View {
+    let interaction: PendingUserInteraction
+    @ObservedObject var store: ConversationStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(DiscoTheme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("需要你的操作")
+                        .font(.headline)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(22)
+
+            Divider()
+
+            ScrollView {
+                switch interaction {
+                case let .approval(request):
+                    ApprovalInteractionContent(request: request, store: store)
+                case let .userInput(request):
+                    UserInputInteractionContent(request: request, store: store)
+                }
+            }
+        }
+        .frame(minWidth: 520, idealWidth: 580, minHeight: 360, idealHeight: 520)
+        .background(DiscoTheme.canvas)
+    }
+
+    private var icon: String {
+        switch interaction {
+        case .approval: "checkmark.shield"
+        case .userInput: "questionmark.bubble"
+        }
+    }
+
+    private var subtitle: String {
+        switch interaction {
+        case .approval: "请确认操作的精确影响范围"
+        case .userInput: "回答后，模型会继续当前运行"
+        }
+    }
+}
+
+private struct UserInputInteractionContent: View {
+    let request: UserInputRequest
+    @ObservedObject var store: ConversationStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            ForEach(request.questions) { question in
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(question.header)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(DiscoTheme.accent)
+                        .textCase(.uppercase)
+                    Text(question.question)
+                        .font(.body.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if question.options.isEmpty {
+                        answerField(for: question, isCustom: true)
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(question.options) { option in
+                                optionButton(option, for: question)
+                            }
+                            if question.allowsOther {
+                                otherButton(for: question)
+                                if draft.customQuestionIDs.contains(question.id) {
+                                    answerField(for: question, isCustom: true)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if case let .failed(message) = status {
+                Label(message, systemImage: "exclamationmark.circle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+
+            Text("答案仅用于继续当前运行，不会保存到聊天记录。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Button("停止本轮", role: .destructive) {
+                    store.stop()
+                }
+                Spacer()
+                Button(isSubmitting ? "正在提交…" : "提交回答") {
+                    store.submitUserInput(request)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!store.canSubmitUserInput(request) || isSubmitting)
+            }
+        }
+        .padding(22)
+    }
+
+    private func optionButton(
+        _ option: UserInputOption,
+        for question: UserInputQuestion
+    ) -> some View {
+        let selected = draft.values[question.id] == option.label
+            && !draft.customQuestionIDs.contains(question.id)
+        return Button {
+            store.updateUserInput(
+                requestID: request.id,
+                questionID: question.id,
+                value: option.label,
+                isCustom: false
+            )
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(selected ? DiscoTheme.accent : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(option.label)
+                        .font(.callout.weight(.medium))
+                    if let description = option.description {
+                        Text(description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+            }
+            .padding(11)
+            .contentShape(Rectangle())
+            .background(
+                selected ? DiscoTheme.accent.opacity(0.10) : Color.primary.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isSubmitting)
+    }
+
+    private func otherButton(for question: UserInputQuestion) -> some View {
+        let selected = draft.customQuestionIDs.contains(question.id)
+        return Button {
+            store.updateUserInput(
+                requestID: request.id,
+                questionID: question.id,
+                value: selected ? (draft.values[question.id] ?? "") : "",
+                isCustom: true
+            )
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(selected ? DiscoTheme.accent : .secondary)
+                Text("其他")
+                    .font(.callout.weight(.medium))
+                Spacer()
+            }
+            .padding(11)
+            .contentShape(Rectangle())
+            .background(
+                selected ? DiscoTheme.accent.opacity(0.10) : Color.primary.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isSubmitting)
+    }
+
+    private func answerField(
+        for question: UserInputQuestion,
+        isCustom: Bool
+    ) -> some View {
+        Group {
+            if question.isSensitive {
+                SecureField("输入回答", text: answerBinding(for: question, isCustom: isCustom))
+            } else {
+                TextField(
+                    question.options.isEmpty ? "输入回答" : "输入其他回答",
+                    text: answerBinding(for: question, isCustom: isCustom),
+                    axis: .vertical
+                )
+                .lineLimit(1...4)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .disabled(isSubmitting)
+    }
+
+    private func answerBinding(
+        for question: UserInputQuestion,
+        isCustom: Bool
+    ) -> Binding<String> {
+        Binding(
+            get: { draft.values[question.id] ?? "" },
+            set: {
+                store.updateUserInput(
+                    requestID: request.id,
+                    questionID: question.id,
+                    value: $0,
+                    isCustom: isCustom
+                )
+            }
+        )
+    }
+
+    private var draft: UserInputDraft {
+        store.userInputDrafts[request.id] ?? UserInputDraft()
+    }
+
+    private var status: UserInteractionStatus? {
+        store.interactionRecords.first(where: { $0.id == .userInput(request.id) })?.status
+    }
+
+    private var isSubmitting: Bool {
+        status == .submitting
+    }
+}
+
+private struct ApprovalInteractionContent: View {
+    let request: ApprovalRequest
+    @ObservedObject var store: ConversationStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(request.title)
+                .font(.title3.weight(.semibold))
+            if let reason = request.reason {
+                Text(reason)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                ApprovalImpactDetails(impact: request.impact)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(
+                cornerRadius: DiscoRadius.small,
+                style: .continuous
+            ))
+
+            HStack {
+                Button("拒绝", role: .destructive) {
+                    store.decideApproval(request, decision: .decline)
+                }
+                Button("停止本轮", role: .destructive) {
+                    store.stop()
+                }
+                Spacer()
+                if request.allowsSessionApproval {
+                    Button("本次会话允许") {
+                        store.decideApproval(request, decision: .approveForSession)
+                    }
+                }
+                Button("允许一次") {
+                    store.decideApproval(request, decision: .approveOnce)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+    }
+}
+
+private struct ApprovalImpactDetails: View {
+    let impact: ApprovalImpact
+
+    var body: some View {
+        switch impact {
+        case let .command(executable, arguments, cwd):
+            LabeledContent("工作目录", value: cwd)
+            LabeledContent("命令") {
+                Text(([executable] + arguments).joined(separator: " "))
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+            }
+        case let .fileChange(paths, summary, diff):
+            Text(summary)
+            ForEach(paths, id: \.self) { path in
+                Label(path, systemImage: "doc")
+                    .font(.callout.monospaced())
+            }
+            if let diff {
+                Text(diff)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            }
+        case let .network(host, scheme, port):
+            LabeledContent("目标", value: host)
+            LabeledContent("协议", value: scheme)
+            if let port {
+                LabeledContent("端口", value: String(port))
+            }
+        case let .permission(scope, description):
+            LabeledContent("范围", value: scope)
+            Text(description)
         }
     }
 }
@@ -855,8 +1295,8 @@ private struct ComposerView: View {
 
                 Spacer(minLength: 12)
 
-                if store.isStreaming {
-                    Text("回复生成中")
+                if let runStatusText = store.runStatusText {
+                    Text(runStatusText)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 } else if isConfigured {
@@ -1641,6 +2081,27 @@ private func makePreviewConversation() -> ConversationSession {
     )
 }
 
+@MainActor
+private func makePreviewUserInputRequest() -> UserInputRequest {
+    UserInputRequest(
+        id: UserInputRequestID(rawValue: "preview-input"),
+        runID: RunID(),
+        questions: [
+            UserInputQuestion(
+                id: "scope",
+                header: "实现范围",
+                question: "这次先实现哪一部分？",
+                options: [
+                    UserInputOption(id: "generic", label: "Generic", description: "先接 OpenAI Responses"),
+                    UserInputOption(id: "codex", label: "Codex", description: "先接 app-server"),
+                ],
+                allowsOther: true,
+                isSensitive: false
+            ),
+        ]
+    )
+}
+
 #Preview("聊天窗") {
     ChatView(store: makePreviewConversation().store)
         .environmentObject(makePreviewAppState())
@@ -1651,4 +2112,12 @@ private func makePreviewConversation() -> ConversationSession {
     ModelDrawer(dismiss: {})
         .environmentObject(makePreviewAppState())
         .frame(width: 460, height: 300)
+}
+
+#Preview("用户问答") {
+    UserInteractionSheet(
+        interaction: .userInput(makePreviewUserInputRequest()),
+        store: ConversationStore()
+    )
+    .frame(width: 580, height: 520)
 }

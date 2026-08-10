@@ -1,6 +1,7 @@
 # Generic tool call 与工具循环实施计划
 
-> 状态：当前最高优先级，已完成现有代码与 OpenAI Responses 官方 tool calling 文档核对，尚未开始实现
+> 状态：G1 已完成；已落地 Provider 无关的用户交互合约、OpenAI Generic
+> `request_user_input` 暂停/续传和统一问答 UI。通用 ToolExecutor 与只读 Tool Host 尚未开始。
 
 ## 目标
 
@@ -47,6 +48,19 @@ Codex cwd、command/file item 与审批接入延后；已完成的 Codex schema 
 - 达到限制时返回稳定中文失败，不伪造最终回答。
 - 取消在模型流和工具执行两处都生效，并保持一次 run 恰好一个终止事件。
 - 工具已经执行后若发生上下文溢出，不自动重放该工具；避免重复副作用。
+
+### G2a. Client-owned 用户问答（已完成首片）
+
+- `request_user_input` 是 Runtime 保留的 function tool，不进入 ToolExecutor。
+- 首批只由 OpenAI 原生 Responses 方言广告；DeepSeek、compatible 与 Chat Completions
+  等各自 Provider 完成 tool calling adapter 后再复用同一 Runtime/UI。
+- Runtime 只在拿到完整 tool call 与 opaque continuation 后发出用户输入请求；
+  回答按 request/question ID 校验并编码为 `function_call_output` 续传。
+- 单次 1～3 个问题，选择题 2～3 个选项；候选项不自动成为默认答案。
+- Generic v1 不允许模型请求密码、API Key、验证码等敏感信息。
+- 每个 run 最多连续询问 4 轮；停止、清空或 shutdown 会解除悬挂 continuation。
+- Store 使用内存队列和 request-scoped 草稿；答案不进入 ChatMessage、日志或持久化。
+- UI 使用统一“需要你的操作”卡片与 Sheet；审批与问答共享外壳但保持不同领域语义。
 
 ### G3. 只读 Tool Host
 

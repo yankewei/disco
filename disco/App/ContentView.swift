@@ -407,12 +407,19 @@ private struct ConversationRow: View {
 
                     Spacer(minLength: 4)
 
+                    if store.firstPendingInteraction != nil {
+                        Circle()
+                            .fill(DiscoTheme.accent)
+                            .frame(width: 7, height: 7)
+                            .help("等待你的操作")
+                    }
+
                     Text(conversation.updatedAt, style: .time)
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
 
-                Text(store.isStreaming ? "正在生成回复…" : preview)
+                Text(store.runStatusText ?? preview)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)

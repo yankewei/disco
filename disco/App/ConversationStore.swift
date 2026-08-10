@@ -1,12 +1,36 @@
 import Combine
 import Foundation
 
+enum UserInteractionStatus: Equatable {
+    case pending
+    case submitting
+    case resolved(String)
+    case failed(String)
+    case cancelled
+}
+
+struct UserInteractionRecord: Identifiable, Equatable {
+    let interaction: PendingUserInteraction
+    var status: UserInteractionStatus
+
+    var id: PendingUserInteraction.ID { interaction.id }
+}
+
+struct UserInputDraft: Equatable {
+    var values: [String: String] = [:]
+    var customQuestionIDs: Set<String> = []
+}
+
 @MainActor
 final class ConversationStore: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
     @Published var draft = ""
-    @Published private(set) var isStreaming = false
+    @Published private(set) var runState: AgentRunState = .idle
     @Published private(set) var errorMessage: String?
+    /// 仅驻留内存的交互记录；不进入 ChatMessage 或持久化回调。
+    @Published private(set) var interactionRecords: [UserInteractionRecord] = []
+    /// 表单草稿按 request ID 保存，切换会话不会丢失；运行终止时清空。
+    @Published private(set) var userInputDrafts: [UserInputRequestID: UserInputDraft] = [:]
     /// 最近一次上下文占用快照（服务商返回或本地估算）。
     @Published private(set) var contextUsage: ContextUsageSnapshot?
     /// 最近一次成功的压缩记录（面板展示用）。
@@ -27,6 +51,28 @@ final class ConversationStore: ObservableObject {
     private(set) var contextState: ConversationContextState
 
     var hasRuntime: Bool { runtime != nil }
+    var isStreaming: Bool { runState.isActive }
+
+    var firstPendingInteraction: PendingUserInteraction? {
+        interactionRecords.first { record in
+            switch record.status {
+            case .pending, .failed: true
+            case .submitting, .resolved, .cancelled: false
+            }
+        }?.interaction
+    }
+
+    var runStatusText: String? {
+        switch runState {
+        case .connecting: "正在连接"
+        case .running: "回复生成中"
+        case .waitingForTool: "正在等待工具"
+        case .waitingForApproval: "等待你确认操作"
+        case .waitingForUserInput: "等待你的回答"
+        case .cancelling: "正在停止"
+        case .idle, .completed, .failed, .cancelled: nil
+        }
+    }
 
     init(
         messages: [ChatMessage] = [],
@@ -130,6 +176,12 @@ final class ConversationStore: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let runtime, !text.isEmpty, !isStreaming else { return }
 
+        interactionRecords.removeAll { record in
+            switch record.status {
+            case .resolved, .cancelled: true
+            case .pending, .submitting, .failed: false
+            }
+        }
         draft = ""
         errorMessage = nil
         messages.append(ChatMessage(role: .user, text: text))
@@ -141,7 +193,7 @@ final class ConversationStore: ObservableObject {
         let requestMessages = Array(messages.dropLast())
         let runID = RunID()
         activeRunID = runID
-        isStreaming = true
+        runState = .connecting
 
         requestTask = Task { [weak self] in
             guard let self else { return }
@@ -161,6 +213,7 @@ final class ConversationStore: ObservableObject {
             } catch {
                 guard !Task.isCancelled, activeRunID == runID else { return }
                 errorMessage = "对话中断：\(error.localizedDescription)"
+                runState = .failed
                 removeEmptyPlaceholder(assistantID)
             }
 
@@ -170,6 +223,8 @@ final class ConversationStore: ObservableObject {
 
     private func handle(_ event: AgentEvent, assistantID: UUID) {
         switch event {
+        case let .runStateChanged(_, state):
+            runState = state
         case let .messageDelta(delta):
             guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
             messages[index].appendText(delta)
@@ -190,11 +245,52 @@ final class ConversationStore: ObservableObject {
             contextUsage = snapshot
         case let .contextCompactionUpdated(update):
             handleCompactionUpdate(update)
+        case let .approvalRequested(request):
+            appendInteraction(.approval(request))
+        case let .approvalResolved(id, decision):
+            resolveInteraction(.approval(id), summary: Self.approvalSummary(decision))
+        case let .userInputRequested(request):
+            appendInteraction(.userInput(request))
+            if userInputDrafts[request.id] == nil {
+                userInputDrafts[request.id] = UserInputDraft()
+            }
+        case let .userInputResolved(id):
+            resolveInteraction(.userInput(id), summary: "已回答")
+            userInputDrafts[id] = nil
         case let .runFailed(_, failure):
             errorMessage = failure.message
+            runState = .failed
+            cancelPendingInteractions()
             removeEmptyPlaceholder(assistantID)
-        case .runCompleted, .runCancelled:
-            break
+        case .runCompleted:
+            runState = .completed
+        case .runCancelled:
+            runState = .cancelled
+            cancelPendingInteractions()
+        }
+    }
+
+    private func appendInteraction(_ interaction: PendingUserInteraction) {
+        guard !interactionRecords.contains(where: { $0.id == interaction.id }) else { return }
+        interactionRecords.append(UserInteractionRecord(
+            interaction: interaction,
+            status: .pending
+        ))
+    }
+
+    private func resolveInteraction(
+        _ id: PendingUserInteraction.ID,
+        summary: String
+    ) {
+        guard let index = interactionRecords.firstIndex(where: { $0.id == id }) else { return }
+        interactionRecords[index].status = .resolved(summary)
+    }
+
+    private static func approvalSummary(_ decision: ApprovalDecision) -> String {
+        switch decision {
+        case .approveOnce: "已允许一次"
+        case .approveForSession: "已在本次会话允许"
+        case .decline: "已拒绝"
         }
     }
 
@@ -227,7 +323,6 @@ final class ConversationStore: ObservableObject {
         guard activeRunID == runID else { return }
         persistImmediately()
         activeRunID = nil
-        isStreaming = false
         requestTask = nil
     }
 
@@ -259,11 +354,99 @@ final class ConversationStore: ObservableObject {
         contextUsage = nil
         lastSuccessfulCompaction = nil
         activeCompaction = nil
+        interactionRecords.removeAll()
+        userInputDrafts.removeAll()
+        runState = .idle
         persistImmediately()
     }
 
     func dismissError() {
         errorMessage = nil
+    }
+
+    func updateUserInput(
+        requestID: UserInputRequestID,
+        questionID: String,
+        value: String,
+        isCustom: Bool
+    ) {
+        guard case let .userInput(request)? = interactionRecords.first(
+            where: { $0.id == .userInput(requestID) }
+        )?.interaction,
+              request.questions.contains(where: { $0.id == questionID }) else { return }
+        var draft = userInputDrafts[requestID] ?? UserInputDraft()
+        draft.values[questionID] = value
+        if isCustom {
+            draft.customQuestionIDs.insert(questionID)
+        } else {
+            draft.customQuestionIDs.remove(questionID)
+        }
+        userInputDrafts[requestID] = draft
+    }
+
+    func canSubmitUserInput(_ request: UserInputRequest) -> Bool {
+        guard let draft = userInputDrafts[request.id] else { return false }
+        return request.questions.allSatisfy { question in
+            guard let value = draft.values[question.id]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return false }
+            if question.options.isEmpty || draft.customQuestionIDs.contains(question.id) {
+                return true
+            }
+            return question.options.contains(where: { $0.label == value })
+        }
+    }
+
+    func submitUserInput(_ request: UserInputRequest) {
+        guard let runtime,
+              canSubmitUserInput(request),
+              let index = interactionRecords.firstIndex(where: {
+                  $0.id == .userInput(request.id)
+              }),
+              interactionRecords[index].status != .submitting,
+              let draft = userInputDrafts[request.id] else { return }
+
+        let answers = request.questions.map {
+            UserInputAnswer(
+                questionID: $0.id,
+                answers: [draft.values[$0.id]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""]
+            )
+        }
+        interactionRecords[index].status = .submitting
+        errorMessage = nil
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await runtime.submitUserInput(requestID: request.id, answers: answers)
+            } catch {
+                guard let index = interactionRecords.firstIndex(where: {
+                    $0.id == .userInput(request.id)
+                }) else { return }
+                interactionRecords[index].status = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func decideApproval(_ request: ApprovalRequest, decision: ApprovalDecision) {
+        guard let runtime,
+              let index = interactionRecords.firstIndex(where: {
+                  $0.id == .approval(request.id)
+              }),
+              interactionRecords[index].status != .submitting else { return }
+        interactionRecords[index].status = .submitting
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await runtime.respond(to: request.id, decision: decision)
+            } catch {
+                guard let index = interactionRecords.firstIndex(where: {
+                    $0.id == .approval(request.id)
+                }) else { return }
+                interactionRecords[index].status = .failed(error.localizedDescription)
+            }
+        }
     }
 
     func retryLastMessage() {
@@ -337,6 +520,9 @@ final class ConversationStore: ObservableObject {
     }
 
     private func cancelRequest() {
+        if isStreaming {
+            runState = .cancelling
+        }
         requestTask?.cancel()
         requestTask = nil
         if let runID = activeRunID {
@@ -344,7 +530,20 @@ final class ConversationStore: ObservableObject {
             let runtime = runtime
             Task { await runtime?.cancel(runID: runID) }
         }
-        isStreaming = false
+        cancelPendingInteractions()
+        runState = .cancelled
+    }
+
+    private func cancelPendingInteractions() {
+        for index in interactionRecords.indices {
+            switch interactionRecords[index].status {
+            case .pending, .submitting, .failed:
+                interactionRecords[index].status = .cancelled
+            case .resolved, .cancelled:
+                break
+            }
+        }
+        userInputDrafts.removeAll()
     }
 
     private func schedulePersistence() {

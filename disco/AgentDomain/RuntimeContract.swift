@@ -3,6 +3,142 @@ import Foundation
 /// 一次运行的唯一标识（计划 §8 `cancel(run_id: RunID)`）。
 typealias RunID = UUID
 
+/// Agent 运行状态。终止事件仍由 `runCompleted` / `runFailed` / `runCancelled`
+/// 唯一承载；该状态用于让 Store/UI 准确表达运行正停在哪个阶段。
+enum AgentRunState: Sendable, Equatable {
+    case idle
+    case connecting
+    case running
+    case waitingForTool
+    case waitingForApproval
+    case waitingForUserInput
+    case cancelling
+    case completed
+    case failed
+    case cancelled
+
+    var isActive: Bool {
+        switch self {
+        case .connecting, .running, .waitingForTool, .waitingForApproval,
+             .waitingForUserInput, .cancelling:
+            true
+        case .idle, .completed, .failed, .cancelled:
+            false
+        }
+    }
+}
+
+// MARK: - 用户交互契约（计划 §8 Approval / RequestUserInput）
+
+struct ApprovalRequestID: RawRepresentable, Hashable, Codable, Sendable {
+    let rawValue: String
+}
+
+struct UserInputRequestID: RawRepresentable, Hashable, Codable, Sendable {
+    let rawValue: String
+}
+
+enum ApprovalKind: String, Codable, Sendable, Equatable {
+    case command
+    case fileChange
+    case network
+    case permission
+}
+
+enum ApprovalImpact: Sendable, Equatable {
+    case command(executable: String, arguments: [String], cwd: String)
+    case fileChange(paths: [String], summary: String, diff: String?)
+    case network(host: String, scheme: String, port: Int?)
+    case permission(scope: String, description: String)
+}
+
+/// 审批绑定的精确影响快照。Runtime/Executor 必须在执行前再次校验 `fingerprint`；
+/// 展示文案本身不能作为授权依据。
+struct ApprovalRequest: Identifiable, Sendable, Equatable {
+    let id: ApprovalRequestID
+    let runID: RunID
+    let itemID: String?
+    let kind: ApprovalKind
+    let title: String
+    let reason: String?
+    let impact: ApprovalImpact
+    let fingerprint: String
+    let allowsSessionApproval: Bool
+}
+
+enum ApprovalDecision: Sendable, Equatable {
+    case approveOnce
+    case approveForSession
+    case decline
+}
+
+struct UserInputOption: Identifiable, Codable, Sendable, Equatable {
+    let id: String
+    let label: String
+    let description: String?
+}
+
+struct UserInputQuestion: Identifiable, Codable, Sendable, Equatable {
+    let id: String
+    let header: String
+    let question: String
+    let options: [UserInputOption]
+    let allowsOther: Bool
+    /// Generic v1 不向模型开放敏感输入；该字段为 Codex 等可信协议预留。
+    let isSensitive: Bool
+}
+
+struct UserInputRequest: Identifiable, Sendable, Equatable {
+    let id: UserInputRequestID
+    let runID: RunID
+    let itemID: String?
+    let questions: [UserInputQuestion]
+    let isBlocking: Bool
+
+    init(
+        id: UserInputRequestID,
+        runID: RunID,
+        itemID: String? = nil,
+        questions: [UserInputQuestion],
+        isBlocking: Bool = true
+    ) {
+        self.id = id
+        self.runID = runID
+        self.itemID = itemID
+        self.questions = questions
+        self.isBlocking = isBlocking
+    }
+}
+
+struct UserInputAnswer: Codable, Sendable, Equatable {
+    let questionID: String
+    let answers: [String]
+}
+
+enum PendingUserInteraction: Identifiable, Sendable, Equatable {
+    enum ID: Hashable, Sendable {
+        case approval(ApprovalRequestID)
+        case userInput(UserInputRequestID)
+    }
+
+    case approval(ApprovalRequest)
+    case userInput(UserInputRequest)
+
+    var id: ID {
+        switch self {
+        case let .approval(request): .approval(request.id)
+        case let .userInput(request): .userInput(request.id)
+        }
+    }
+
+    var runID: RunID {
+        switch self {
+        case let .approval(request): request.runID
+        case let .userInput(request): request.runID
+        }
+    }
+}
+
 /// 一次运行请求（计划 §8 AgentRunRequest）。
 /// MVP 只携带消息；系统指令 / 项目上下文在后续迭代加入。
 struct AgentRunRequest: Sendable {
@@ -41,6 +177,7 @@ struct ContextCompactionRequest: Sendable {
 /// Runtime 保证：一次运行恰好发射一个终止事件
 /// （runCompleted / runFailed / runCancelled），随后流结束。
 enum AgentEvent: Sendable, Equatable {
+    case runStateChanged(RunID, AgentRunState)
     case messageDelta(String)
     case reasoningDelta(String)
     case hostedToolUpdated(HostedToolSnapshot)
@@ -49,6 +186,10 @@ enum AgentEvent: Sendable, Equatable {
     case contextUsageUpdated(ContextUsageSnapshot)
     /// 压缩状态更新（自动 / 手动 / 溢出恢复；running / completed / failed）。
     case contextCompactionUpdated(ContextCompactionUpdate)
+    case approvalRequested(ApprovalRequest)
+    case approvalResolved(ApprovalRequestID, ApprovalDecision)
+    case userInputRequested(UserInputRequest)
+    case userInputResolved(UserInputRequestID)
     case runCompleted(RunID)
     case runFailed(RunID, AgentFailure)
     case runCancelled(RunID)
@@ -107,6 +248,12 @@ protocol AgentRuntime: Sendable {
     func start(request: AgentRunRequest) -> AsyncThrowingStream<AgentEvent, Error>
     func cancel(runID: RunID) async
 
+    func respond(to approvalID: ApprovalRequestID, decision: ApprovalDecision) async throws
+    func submitUserInput(
+        requestID: UserInputRequestID,
+        answers: [UserInputAnswer]
+    ) async throws
+
     /// 手动压缩上下文（计划《上下文压缩 v1》）。
     /// Generic 生成摘要 checkpoint；Codex 发送 thread/compact/start。
     func compactContext(request: ContextCompactionRequest) async throws -> ContextCompactionUpdate
@@ -119,6 +266,17 @@ protocol AgentRuntime: Sendable {
 /// 过渡默认实现：让各 Runtime 在接入压缩前保持可编译。
 /// TODO(compaction)：Generic 与 Codex 都落地真实实现后移除该扩展。
 extension AgentRuntime {
+    func respond(to approvalID: ApprovalRequestID, decision: ApprovalDecision) async throws {
+        throw AgentFailure(message: "当前运行时没有待处理的审批请求。")
+    }
+
+    func submitUserInput(
+        requestID: UserInputRequestID,
+        answers: [UserInputAnswer]
+    ) async throws {
+        throw AgentFailure(message: "当前运行时没有待回答的问题。")
+    }
+
     func compactContext(request: ContextCompactionRequest) async throws -> ContextCompactionUpdate {
         throw AgentFailure(
             code: .contextCompactionFailed,

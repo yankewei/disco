@@ -48,6 +48,7 @@ final class CodexRuntimeTests: XCTestCase {
         }
 
         XCTAssertEqual(events, [
+            .runStateChanged(runID, .running),
             .reasoningDelta("让我想想"),
             .messageDelta("你好，"),
             .messageDelta("世界"),
@@ -156,6 +157,7 @@ final class CodexRuntimeTests: XCTestCase {
             events.append(event)
         }
         XCTAssertEqual(events, [
+            .runStateChanged(runID, .running),
             .runFailed(runID, AgentFailure(message: "助手没有返回文本内容。")),
         ])
     }
@@ -184,7 +186,7 @@ final class CodexRuntimeTests: XCTestCase {
         var events: [AgentEvent] = []
         for try await event in runtime.start(request: request) {
             events.append(event)
-            if events.count == 1 {
+            if case .messageDelta = event {
                 process.terminate() // 模拟子进程崩溃
             }
         }
@@ -223,8 +225,16 @@ final class CodexRuntimeTests: XCTestCase {
             secondEvents.append(event)
         }
 
-        XCTAssertEqual(firstEvents, [.messageDelta("第一轮"), .runCompleted(firstRunID)])
-        XCTAssertEqual(secondEvents, [.messageDelta("第二轮"), .runCompleted(secondRunID)])
+        XCTAssertEqual(firstEvents, [
+            .runStateChanged(firstRunID, .running),
+            .messageDelta("第一轮"),
+            .runCompleted(firstRunID),
+        ])
+        XCTAssertEqual(secondEvents, [
+            .runStateChanged(secondRunID, .running),
+            .messageDelta("第二轮"),
+            .runCompleted(secondRunID),
+        ])
 
         let threadStarts = process.sentLines.filter { lineMethod(of: $0) == "thread/start" }
         let turnStarts = process.sentLines.filter { lineMethod(of: $0) == "turn/start" }

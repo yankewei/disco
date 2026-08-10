@@ -899,14 +899,17 @@ final class AppState: ObservableObject {
             )
         }
         guard let provider = makeProvider(vendor: vendor) else { return nil }
+        let catalogEntry = config.catalogEntry(for: config.model)
         return GenericAgentRuntime(
             provider: provider,
             configuration: GenericAgentRuntime.Configuration(
                 model: config.model,
                 reasoningEnabled: config.thinkingEnabled,
                 reasoningEffort: selectedReasoningEffort(for: vendor),
-                hostedTools: config.catalogEntry(for: config.model)?.hostedTools
+                hostedTools: catalogEntry?.hostedTools
                     ?? vendor.hostedTools(for: config.model),
+                userInputEnabled: vendor == .openai
+                    && catalogEntry?.supportsToolCalling != false,
                 contextWindow: contextWindow(for: vendor, model: config.model)
             )
         )
