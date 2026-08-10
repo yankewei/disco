@@ -222,16 +222,15 @@ struct AgentRunRequest: Sendable {
     let runID: RunID
     let conversationID: UUID
     let messages: [ChatMessage]
-    let workspace: WorkspaceContext
-    let executionPolicy: ExecutionPolicy
 }
 ```
 
 迁移说明：
 
+- Generic 与 Codex 都把 workspace 和执行策略固定在各自 Runtime 的 `Configuration`；同一 Conversation 若切换 Project 或策略，必须重建 Runtime，不能通过下一次 run 偷换执行环境。
 - 第一阶段可保留现有 `resumeThreadID` 兼容字段。
 - Codex 恢复稳定后，将 thread ID 移到 `CodexRuntime.Configuration` 或会话的 Runtime 状态中。
-- `AgentRunRequest` 最终只承载两个 Runtime 都需要的领域输入。
+- `AgentRunRequest` 只承载单次运行输入，不重复携带会话级 workspace 或执行策略。
 
 ### 6.3 Run 与 Item 快照
 
@@ -518,9 +517,9 @@ codex app-server generate-json-schema --out /tmp/disco-codex-schema
 
 实施基线：
 
-- 新 thread 使用 `sandbox: "workspace-write"`，不使用 `danger-full-access`。
+- `Codex cwd and sandbox configuration` 阶段先使用 `sandbox: "read-only"` 和关闭网络；原生审批链路完成后，Project thread 才切换到 `workspace-write`。任何阶段都不使用 `danger-full-access`。
 - `approvalPolicy` 初始在 `untrusted` 与 `on-request` 中通过真实 smoke test 选择；任何 coding-agent Beta 都不使用 `never` 作为默认值。
-- per-turn 需要覆盖时使用结构化 `sandboxPolicy.type = "workspaceWrite"`，并明确 writable roots 和 network access。
+- 原生审批链路完成并启用写入后，per-turn 覆盖使用结构化 `sandboxPolicy.type = "workspaceWrite"`，并明确 writable roots 和 network access；当前只读阶段发送 `readOnly` 且关闭网络。
 - `baseInstructions` 保持 nil，继续使用 Codex 内置基础指令。
 - `developerInstructions` 只承载用户明确配置的附加指令；第一条纵向切片保持 nil，优先验证 `cwd` 和 `instructionSources`。
 - 当前版本的 command approval params 没有 `availableDecisions` 字段；领域 `availableDecisions` 由 Adapter 根据请求类型和锁定 schema 填充。未来 wire 新增该字段时取两者交集。
@@ -922,7 +921,7 @@ Generic Runtime 必须有版本化的内置 coding instructions，至少约束�
 
 ## 12. Generic Agent Runtime
 
-Codex 纵向闭环完成后再进入本节。
+2026-08-09 优先级调整：Project/Workspace 身份切片完成后，先实现 Generic tool call、单工具循环与只读 Tool Host；Codex cwd/sandbox 与后续 Codex item 链路延后。
 
 ### 12.1 ModelContract 扩展
 
@@ -1283,7 +1282,7 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 - 新增 Project/Workspace 领域模型。
 - `NSOpenPanel` 打开项目。
 - Conversation 绑定 Project。
-- `AgentRunRequest` 携带 Workspace/ExecutionPolicy。
+- `CodexRuntime.Configuration` 携带 Workspace 与锁定的安全策略；Generic tool loop 接入时再收敛公共 `AgentRunRequest`。
 - 扩展 Codex thread/turn DTO，传 cwd 和只读/安全策略。
 - 解码完整 plan、command item，但第一阶段可以只展示不审批写入。
 - 新增 Run 状态。
@@ -1369,6 +1368,8 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 
 ### Phase D：Generic Provider tool call
 
+专项实施计划见 `generic-tool-loop-implementation-plan.md`。
+
 目标：OpenAI Platform/API Key 路径能提出结构化工具调用并显示统一事件。
 
 主要改动：
@@ -1433,17 +1434,15 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 为降低 review 风险，每个 PR 保持一个可验证主题：
 
 1. `Project + Workspace persistence`：项目选择、绑定、迁移，不改 Codex 事件。
-2. `Codex cwd and sandbox configuration`：生成 schema、扩展 thread/turn 参数和合约测试。
-3. `Agent item domain + command timeline`：命令 item/output 映射和 UI。
-4. `File changes + diff timeline`：file item、turn diff 和 UI。
-5. `Approval + requestUserInput domain`：wire request、respond/submit 接口、pending map 和 transport 测试。
-6. `Native interaction sheets`：审批与用户问答、状态隔离和竞态测试。
-7. `Run/item persistence`：schema migration、恢复和大输出。
-8. `Generic ModelEvent tool calls`：Provider 解析与 fixture。
-9. `Generic single-tool loop`：Runtime + fake ToolExecutor。
-10. `Tool Host read/search/patch`：独立 helper 和路径安全。
-11. `Tool Host shell + cancellation`：进程树、输出和审批。
-12. `Beta hardening`：Keychain、binary packaging、诊断与发布。
+2. `Generic ModelEvent tool calls`：OpenAI Responses function tool、Provider continuation、流式解析与 fixture。
+3. `Generic single-tool loop`：Runtime + fake ToolExecutor，先完成单工具多轮闭环。
+4. `Generic read-only Tool Host`：独立 helper、read/list/search/git status 与路径安全。
+5. `Generic tool activity timeline`：统一 item 状态、有限输出和错误展示。
+6. `Generic write/shell approvals`：apply patch、shell、审批、进程树取消和 diff。
+7. `Codex cwd and sandbox configuration`：生成 schema、扩展 thread/turn 参数和合约测试。
+8. `Codex item + native interaction`：command/file item、审批与 user input 映射并复用既有 UI。
+9. `Run/item persistence`：schema migration、恢复和大输出。
+10. `Beta hardening`：Keychain、binary packaging、诊断与发布。
 
 允许在同一 PR 中合并强耦合的小步骤，但不要把 Project、审批、Generic tool loop 和 Tool Host 一次性混入一个无法审查的大改动。
 
@@ -1478,6 +1477,8 @@ DISCO_CODEX_INTEGRATION_TESTS=1 xcodebuild test \
 验收：选择目录、重启 App、Project 和路径仍存在。
 
 ### 21.2 Codex schema 快照
+
+专项实施计划见 `codex-workspace-configuration-plan.md`。
 
 - 用本机 0.147.0 生成 schema 到临时目录。
 - 记录需要的 thread start/resume、turn start、command/file item DTO。

@@ -12,7 +12,7 @@
 - 目录失效时保留 Project 与历史记录，禁止继续发送，并允许重新关联。
 - 本阶段只建立工作区身份、持久化与 UI，不把目录传给 Codex，也不提供文件或命令能力。
 
-完成后，下一个独立阶段是把 `WorkspaceContext.rootURL` 接入 Codex `thread/start` 的 `cwd` 与 sandbox policy。
+完成后，按 2026-08-09 优先级调整，先把 `WorkspaceContext` 接入 Generic Runtime 的只读 Tool Host；Codex `cwd` 与 sandbox policy 延后。
 
 ## 领域模型与接口
 
@@ -276,4 +276,4 @@ xcodebuild test \
 - 不实现 Project 重命名、删除、合并或对话跨 Project 移动。
 - 不修改 `AgentRunRequest`、Codex wire DTO、审批、sandbox、diff、命令或文件 item。
 - 不向 system prompt 注入目录路径。
-- 后续独立阶段以这里生成的 `WorkspaceContext` 为输入，实现 Codex `cwd`、sandbox policy，并处理工作区变化后 thread resume 的兼容策略。
+- 下一阶段以这里生成的 `WorkspaceContext` 为输入，实现 Generic Runtime 的只读 Tool Host 与路径安全；后续 Codex 阶段再实现 `cwd`、sandbox policy，并处理工作区变化后 thread resume 的兼容策略。
