@@ -123,6 +123,250 @@ final class GenericToolLoopTests: XCTestCase {
         )])
     }
 
+    func testExpectedNonSuccessToolResultsAreReturnedToModel() async throws {
+        let cases: [(ToolExecutionResult.Status, String)] = [
+            (.failure, "failure"),
+            (.declined, "declined"),
+            (.cancelled, "cancelled"),
+            (.timedOut, "timed_out"),
+        ]
+
+        for (status, encodedStatus) in cases {
+            let providerScript = SingleToolProviderScript()
+            let runtime = GenericAgentRuntime(
+                provider: SingleToolProvider(script: providerScript),
+                configuration: .init(model: "test-model", reasoningEnabled: false),
+                toolExecutor: ScriptedToolExecutor(
+                    recorder: ToolExecutorRecorder(),
+                    result: ToolExecutionResult(status: status, output: "工具没有完成")
+                )
+            )
+            let runID = RunID()
+            var events: [AgentEvent] = []
+
+            for try await event in runtime.start(request: AgentRunRequest(
+                runID: runID,
+                messages: [ChatMessage(role: .user, text: "读取文件")]
+            )) {
+                events.append(event)
+            }
+
+            let modelRequests = await providerScript.requests
+            XCTAssertEqual(modelRequests.count, 2, "status: \(encodedStatus)")
+            XCTAssertEqual(modelRequests[1].toolFollowUp?.results, [ModelToolResult(
+                callID: "call_read",
+                output: "{\"is_truncated\":false,\"output\":\"工具没有完成\",\"status\":\"\(encodedStatus)\"}"
+            )], "status: \(encodedStatus)")
+            XCTAssertEqual(events.filter(\.isTerminal), [.runCompleted(runID)])
+        }
+    }
+
+    func testExecutorCancellationWithoutRunCancellationFailsTheRun() async throws {
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FixedToolProvider(calls: [ModelToolCall(
+                callID: "call_cancelled",
+                name: "filesystem.read",
+                arguments: #"{"path":"README.md"}"#
+            )]),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ThrowingToolExecutor(error: CancellationError())
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取文件")]
+        )) {
+            events.append(event)
+        }
+
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(
+                message: "工具执行被意外取消，运行已停止。"
+            )),
+        ])
+    }
+
+    func testExecutorInfrastructureFailureEmitsOneRunFailedWithoutFollowUp() async throws {
+        let providerScript = SingleToolProviderScript()
+        let executorRecorder = ToolExecutorRecorder()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: SingleToolProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ThrowingToolExecutor(
+                error: TestExecutorFailure.disconnected,
+                recorder: executorRecorder
+            )
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取文件")]
+        )) {
+            events.append(event)
+        }
+
+        let modelRequests = await providerScript.requests
+        let executionCount = await executorRecorder.requests.count
+        XCTAssertEqual(modelRequests.count, 1)
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(message: "Tool Host 连接已中断。")),
+        ])
+    }
+
+    func testDuplicateCallIDIsNotExecutedTwice() async throws {
+        let providerScript = DuplicateToolProviderScript()
+        let executorRecorder = ToolExecutorRecorder()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: DuplicateToolProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ScriptedToolExecutor(
+                recorder: executorRecorder,
+                result: ToolExecutionResult(status: .success, output: "README contents")
+            )
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取 README")]
+        )) {
+            events.append(event)
+        }
+
+        let requestCount = await providerScript.requestCount
+        let executionCount = await executorRecorder.requests.count
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(
+                message: "模型重复提交了已经处理的工具调用：call_read"
+            )),
+        ])
+    }
+
+    func testContextOverflowAfterToolExecutionFailsWithoutReplayingTool() async throws {
+        let providerScript = TwoRoundProviderScript()
+        let executorRecorder = ToolExecutorRecorder()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FollowUpOverflowProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ScriptedToolExecutor(
+                recorder: executorRecorder,
+                result: ToolExecutionResult(status: .success, output: "README contents")
+            )
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取 README")]
+        )) {
+            events.append(event)
+        }
+
+        let requestCount = await providerScript.requestCount
+        let executionCount = await executorRecorder.requests.count
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(
+                code: .contextOverflow,
+                message: "工具已经执行，但后续请求超出上下文窗口。为避免重复执行工具，运行已停止。",
+                recoverySuggestion: "请缩短上下文或新建会话；重试前请先确认工具产生的结果。",
+                isRetryable: false
+            )),
+        ])
+    }
+
+    func testFollowUpDisconnectKeepsPartialTextAndDoesNotReplayTool() async throws {
+        let providerScript = TwoRoundProviderScript()
+        let executorRecorder = ToolExecutorRecorder()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FollowUpDisconnectProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ScriptedToolExecutor(
+                recorder: executorRecorder,
+                result: ToolExecutionResult(status: .success, output: "README contents")
+            )
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取 README")]
+        )) {
+            events.append(event)
+        }
+
+        let requestCount = await providerScript.requestCount
+        let executionCount = await executorRecorder.requests.count
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertTrue(events.contains(.messageDelta("已经读取，正在整理")))
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(message: "测试模型连接中断")),
+        ])
+    }
+
+    func testModelStreamFailureBeforeAnyVisibleEventFailsWithoutRetrying() async throws {
+        let providerScript = FailingModelProviderScript()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FailingModelProvider(script: providerScript, events: []),
+            configuration: .init(model: "test-model", reasoningEnabled: false)
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "你好")]
+        )) {
+            events.append(event)
+        }
+
+        let requestCount = await providerScript.requestCount
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(message: "测试模型连接中断")),
+        ])
+    }
+
+    func testModelStreamFailureAfterVisibleEventsKeepsDeltasWithoutRetrying() async throws {
+        let providerScript = FailingModelProviderScript()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FailingModelProvider(
+                script: providerScript,
+                events: [.reasoningDelta("先检查"), .textDelta("部分回答")]
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: false)
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "你好")]
+        )) {
+            events.append(event)
+        }
+
+        let requestCount = await providerScript.requestCount
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertTrue(events.contains(.reasoningDelta("先检查")))
+        XCTAssertTrue(events.contains(.messageDelta("部分回答")))
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(message: "测试模型连接中断")),
+        ])
+    }
+
     func testToolCallLimitStopsBeforeExecutingTheExtraCall() async throws {
         let providerScript = RepeatingToolProviderScript()
         let executorRecorder = ToolExecutorRecorder()
@@ -135,7 +379,7 @@ final class GenericToolLoopTests: XCTestCase {
             ),
             toolExecutor: ScriptedToolExecutor(
                 recorder: executorRecorder,
-                result: ToolExecutionResult(status: .success, output: "README contents")
+                result: ToolExecutionResult(status: .declined, output: "用户拒绝")
             )
         )
         let runID = RunID()
@@ -188,6 +432,42 @@ final class GenericToolLoopTests: XCTestCase {
         XCTAssertEqual(events.filter(\.isTerminal), [
             .runFailed(runID, AgentFailure(
                 message: "模型返回的工具参数不是有效的 JSON object。"
+            )),
+        ])
+    }
+
+    func testToolCallWithoutContinuationFailsBeforeToolExecution() async throws {
+        let executorRecorder = ToolExecutorRecorder()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: FixedToolProvider(
+                calls: [ModelToolCall(
+                    callID: "call_without_continuation",
+                    name: "filesystem.read",
+                    arguments: #"{"path":"README.md"}"#
+                )],
+                completionContinuation: nil
+            ),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: ScriptedToolExecutor(
+                recorder: executorRecorder,
+                result: ToolExecutionResult(status: .success, output: "must not execute")
+            )
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.start(request: AgentRunRequest(
+            runID: runID,
+            messages: [ChatMessage(role: .user, text: "读取文件")]
+        )) {
+            events.append(event)
+        }
+
+        let executedRequests = await executorRecorder.requests
+        XCTAssertTrue(executedRequests.isEmpty)
+        XCTAssertEqual(events.filter(\.isTerminal), [
+            .runFailed(runID, AgentFailure(
+                message: "模型没有返回可续接的完整工具调用。"
             )),
         ])
     }
@@ -295,6 +575,68 @@ final class GenericToolLoopTests: XCTestCase {
         XCTAssertTrue(events.contains(.runStateChanged(runID, .waitingForTool)))
         XCTAssertEqual(events.filter(\.isTerminal), [.runCancelled(runID)])
     }
+
+    func testRunCancellationWinsWhenExecutorReturnsCancelledResult() async throws {
+        let providerScript = SingleToolProviderScript()
+        let executor = CancellationReturningToolExecutor()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: SingleToolProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: executor
+        )
+
+        let eventTask = Task { @MainActor () throws -> [AgentEvent] in
+            var events: [AgentEvent] = []
+            for try await event in runtime.start(request: AgentRunRequest(
+                runID: runID,
+                messages: [ChatMessage(role: .user, text: "读取文件")]
+            )) {
+                events.append(event)
+            }
+            return events
+        }
+
+        await executor.waitUntilStarted()
+        await runtime.cancel(runID: runID)
+        let events = try await eventTask.value
+
+        let modelRequests = await providerScript.requests
+        let cancelledRunIDs = await executor.cancelledRunIDs
+        XCTAssertEqual(modelRequests.count, 1)
+        XCTAssertEqual(cancelledRunIDs, [runID])
+        XCTAssertEqual(events.filter(\.isTerminal), [.runCancelled(runID)])
+    }
+
+    func testRunCancellationWinsWhenExecutorReportsInfrastructureFailure() async throws {
+        let providerScript = SingleToolProviderScript()
+        let executor = CancellationFailingToolExecutor()
+        let runID = RunID()
+        let runtime = GenericAgentRuntime(
+            provider: SingleToolProvider(script: providerScript),
+            configuration: .init(model: "test-model", reasoningEnabled: false),
+            toolExecutor: executor
+        )
+
+        let eventTask = Task { @MainActor () throws -> [AgentEvent] in
+            var events: [AgentEvent] = []
+            for try await event in runtime.start(request: AgentRunRequest(
+                runID: runID,
+                messages: [ChatMessage(role: .user, text: "读取文件")]
+            )) {
+                events.append(event)
+            }
+            return events
+        }
+
+        await executor.waitUntilStarted()
+        await runtime.cancel(runID: runID)
+        let events = try await eventTask.value
+
+        let modelRequests = await providerScript.requests
+        XCTAssertEqual(modelRequests.count, 1)
+        XCTAssertEqual(events.filter(\.isTerminal), [.runCancelled(runID)])
+    }
 }
 
 private extension AgentEvent {
@@ -334,6 +676,37 @@ private struct ScriptedToolExecutor: ToolExecutor {
     func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
         await recorder.record(request)
         return result
+    }
+}
+
+private struct ThrowingToolExecutor: ToolExecutor {
+    let error: any Error & Sendable
+    var recorder: ToolExecutorRecorder? = nil
+
+    let toolDefinitions = [ModelToolDefinition(
+        name: "filesystem.read",
+        description: "Read one text file from the workspace.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string")]),
+            ]),
+            "required": .array([.string("path")]),
+            "additionalProperties": .boolean(false),
+        ])
+    )]
+
+    func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
+        await recorder?.record(request)
+        throw error
+    }
+}
+
+private enum TestExecutorFailure: Error, LocalizedError, Sendable {
+    case disconnected
+
+    var errorDescription: String? {
+        "Tool Host 连接已中断。"
     }
 }
 
@@ -422,8 +795,176 @@ private struct RepeatingToolProvider: ModelProvider {
     }
 }
 
+private actor DuplicateToolProviderScript {
+    private(set) var requestCount = 0
+
+    func nextEvents() -> [ModelEvent] {
+        requestCount += 1
+        if requestCount <= 2 {
+            return [
+                .toolCallCompleted(ModelToolCall(
+                    callID: "call_read",
+                    name: "filesystem.read",
+                    arguments: #"{"path":"README.md"}"#
+                )),
+                .completed(ModelCompletion(continuation: ModelContinuation(
+                    format: "test",
+                    payload: Data(#"{"output":[]}"#.utf8)
+                ))),
+            ]
+        }
+        return [
+            .textDelta("读取完成。"),
+            .completed(ModelCompletion(continuation: nil)),
+        ]
+    }
+}
+
+private struct DuplicateToolProvider: ModelProvider {
+    let script: DuplicateToolProviderScript
+    let descriptor = ProviderDescriptor(id: "duplicate-tool", displayName: "Duplicate Tool")
+
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model", supportsToolCalling: true)]
+    }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                for event in await script.nextEvents() {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+    }
+}
+
+private actor TwoRoundProviderScript {
+    private(set) var requestCount = 0
+
+    func beginRequest() -> Int {
+        requestCount += 1
+        return requestCount
+    }
+}
+
+private struct FollowUpOverflowProvider: ModelProvider {
+    let script: TwoRoundProviderScript
+    let descriptor = ProviderDescriptor(id: "follow-up-overflow", displayName: "Follow-up Overflow")
+
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model", supportsToolCalling: true)]
+    }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                if await script.beginRequest() == 1 {
+                    continuation.yield(.toolCallCompleted(ModelToolCall(
+                        callID: "call_read",
+                        name: "filesystem.read",
+                        arguments: #"{"path":"README.md"}"#
+                    )))
+                    continuation.yield(.completed(ModelCompletion(continuation: ModelContinuation(
+                        format: "test",
+                        payload: Data(#"{"output":[]}"#.utf8)
+                    ))))
+                    continuation.finish()
+                } else {
+                    continuation.finish(throwing: TestModelFailure.contextOverflow)
+                }
+            }
+        }
+    }
+}
+
+private struct FollowUpDisconnectProvider: ModelProvider {
+    let script: TwoRoundProviderScript
+    let descriptor = ProviderDescriptor(id: "follow-up-disconnect", displayName: "Follow-up Disconnect")
+
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model", supportsToolCalling: true)]
+    }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                if await script.beginRequest() == 1 {
+                    continuation.yield(.toolCallCompleted(ModelToolCall(
+                        callID: "call_read",
+                        name: "filesystem.read",
+                        arguments: #"{"path":"README.md"}"#
+                    )))
+                    continuation.yield(.completed(ModelCompletion(continuation: ModelContinuation(
+                        format: "test",
+                        payload: Data(#"{"output":[]}"#.utf8)
+                    ))))
+                    continuation.finish()
+                } else {
+                    continuation.yield(.textDelta("已经读取，正在整理"))
+                    continuation.finish(throwing: TestModelFailure.disconnected)
+                }
+            }
+        }
+    }
+}
+
+private enum TestModelFailure: Error, LocalizedError, ModelFailureClassifying, Sendable {
+    case contextOverflow
+    case disconnected
+
+    var failureKind: ModelFailureKind {
+        switch self {
+        case .contextOverflow: .contextOverflow
+        case .disconnected: .other
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .contextOverflow: "测试模型上下文溢出"
+        case .disconnected: "测试模型连接中断"
+        }
+    }
+}
+
+private actor FailingModelProviderScript {
+    private(set) var requestCount = 0
+
+    func beginRequest() {
+        requestCount += 1
+    }
+}
+
+private struct FailingModelProvider: ModelProvider {
+    let script: FailingModelProviderScript
+    let events: [ModelEvent]
+    let descriptor = ProviderDescriptor(id: "failing-model", displayName: "Failing Model")
+
+    func modelCatalog() async throws -> [ModelCatalogEntry] {
+        [ModelCatalogEntry(id: "test-model")]
+    }
+
+    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                await script.beginRequest()
+                for event in events {
+                    continuation.yield(event)
+                }
+                continuation.finish(throwing: TestModelFailure.disconnected)
+            }
+        }
+    }
+}
+
 private struct FixedToolProvider: ModelProvider {
     let calls: [ModelToolCall]
+    var completionContinuation: ModelContinuation? = ModelContinuation(
+        format: "test",
+        payload: Data(#"{"output":[]}"#.utf8)
+    )
     let descriptor = ProviderDescriptor(id: "fixed-tool", displayName: "Fixed Tool")
 
     func modelCatalog() async throws -> [ModelCatalogEntry] {
@@ -435,10 +976,9 @@ private struct FixedToolProvider: ModelProvider {
             for call in calls {
                 continuation.yield(.toolCallCompleted(call))
             }
-            continuation.yield(.completed(ModelCompletion(continuation: ModelContinuation(
-                format: "test",
-                payload: Data(#"{"output":[]}"#.utf8)
-            ))))
+            continuation.yield(.completed(ModelCompletion(
+                continuation: completionContinuation
+            )))
             continuation.finish()
         }
     }
@@ -480,5 +1020,92 @@ private actor BlockingToolExecutor: ToolExecutor {
 
     func cancel(runID: RunID) {
         cancelledRunIDs.append(runID)
+    }
+}
+
+private actor CancellationReturningToolExecutor: ToolExecutor {
+    nonisolated let toolDefinitions = [ModelToolDefinition(
+        name: "filesystem.read",
+        description: "Read one text file from the workspace.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string")]),
+            ]),
+            "required": .array([.string("path")]),
+            "additionalProperties": .boolean(false),
+        ])
+    )]
+
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var executionContinuation: CheckedContinuation<ToolExecutionResult, Never>?
+    private(set) var cancelledRunIDs: [RunID] = []
+
+    func waitUntilStarted() async {
+        guard !didStart else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
+        didStart = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return await withCheckedContinuation { continuation in
+            executionContinuation = continuation
+        }
+    }
+
+    func cancel(runID: RunID) {
+        cancelledRunIDs.append(runID)
+        executionContinuation?.resume(returning: ToolExecutionResult(
+            status: .cancelled,
+            output: "工具已取消"
+        ))
+        executionContinuation = nil
+    }
+}
+
+private actor CancellationFailingToolExecutor: ToolExecutor {
+    nonisolated let toolDefinitions = [ModelToolDefinition(
+        name: "filesystem.read",
+        description: "Read one text file from the workspace.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string")]),
+            ]),
+            "required": .array([.string("path")]),
+            "additionalProperties": .boolean(false),
+        ])
+    )]
+
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var executionContinuation: CheckedContinuation<ToolExecutionResult, Error>?
+
+    func waitUntilStarted() async {
+        guard !didStart else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
+        didStart = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        return try await withCheckedThrowingContinuation { continuation in
+            executionContinuation = continuation
+        }
+    }
+
+    func cancel(runID: RunID) {
+        executionContinuation?.resume(throwing: TestExecutorFailure.disconnected)
+        executionContinuation = nil
     }
 }

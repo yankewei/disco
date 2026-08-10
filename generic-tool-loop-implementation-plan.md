@@ -1,8 +1,8 @@
 # Generic tool call 与工具循环实施计划
 
-> 状态：G1、G2-1 已完成；已落地 Provider 无关的用户交互合约、OpenAI Generic
+> 状态：G1、G2-1、G2-2 已完成；已落地 Provider 无关的用户交互合约、OpenAI Generic
 > `request_user_input` 暂停/续传、统一问答 UI，以及由脚本化 ToolExecutor 验证的
-> Generic 单工具循环。生产只读 Tool Host 尚未开始，因此 App 当前不广告本地文件工具。
+> Generic 单工具循环和失败矩阵。生产只读 Tool Host 尚未开始，因此 App 当前不广告本地文件工具。
 
 ## 目标
 
@@ -55,11 +55,23 @@ Codex cwd、command/file item 与审批接入延后；已完成的 Codex schema 
 本片只注入脚本化内存 Executor；`WorkspaceContext` 已在 Runtime 创建时锁定并随执行请求
 跨越 seam，但没有生产工具实现，不改变用户可见能力。
 
-#### G2-2. 失败矩阵加固（下一批）
+#### G2-2. 失败矩阵加固（已完成）
 
-- 覆盖 declined、cancelled 与 timed out 结果的续传断言；failure 与 truncated 已覆盖。
-- 覆盖 Provider/Executor 抛错、continuation 方言不匹配和工具执行后 context overflow。
-- 覆盖模型流中取消，并复核每条失败路径都只有一个终止事件。
+- success、failure、declined、cancelled、timed out 与 truncated 均按结构化结果续传；
+  expected failure 不升级成 Runtime failure。
+- Executor 基础设施异常映射为唯一 `runFailed`；只有 Runtime Task 确实被取消时才映射
+  `runCancelled`，即使 Executor 同时返回 cancelled 或报告其他异常也由 run cancellation 获胜。
+- 工具调用拿到完整 continuation 后进入单 run commit ledger；后续 completion 重复同一
+  `call_id` 时在 Executor 前失败，已执行调用不得重放。
+- 工具结果续传发生 context overflow 时使用稳定、不可直接重试的失败；续传中途断流时
+  保留已发出的 delta。两者都不重新执行工具。
+- Provider 在首个事件前或流式输出后失败均 fail closed；Runtime 不自动重发模型 round。
+- 缺失 continuation、非法参数、未知/并行工具、模型轮数与工具调用数边界继续在副作用前失败。
+- 研究依据、竞品行为与完整测试矩阵见
+  [`coding-agent-failure-matrix-research.md`](coding-agent-failure-matrix-research.md)。
+
+单工具 wall-clock timeout、单次输出裁剪和 helper 崩溃清理仍属于 G3 Executor/IPC seam；
+G2-2 不在 Runtime 外层用超时重放一个可能已经提交副作用的调用。
 
 ### G2a. Client-owned 用户问答（已完成首片）
 

@@ -239,6 +239,14 @@ extension AgentFailure {
         recoverySuggestion: "请在设置中填写模型上下文窗口、手动压缩会话，或新建会话。",
         isRetryable: false
     )
+
+    /// 工具结果续传溢出时不得自动重放可能已经产生副作用的工具。
+    static let contextOverflowAfterToolExecution = AgentFailure(
+        code: .contextOverflow,
+        message: "工具已经执行，但后续请求超出上下文窗口。为避免重复执行工具，运行已停止。",
+        recoverySuggestion: "请缩短上下文或新建会话；重试前请先确认工具产生的结果。",
+        isRetryable: false
+    )
 }
 
 /// 推理循环的所有者（ADR-001：Provider 与 Runtime 是两个正交维度）。

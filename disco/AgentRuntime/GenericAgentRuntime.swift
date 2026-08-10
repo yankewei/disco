@@ -297,6 +297,7 @@ final class GenericAgentRuntime: AgentRuntime {
             var userInputRoundCount = 0
             var modelRoundCount = 0
             var toolCallCount = 0
+            var committedToolCallIDs = Set<String>()
             var hasAnyText = false
             while true {
                 try Task.checkCancellation()
@@ -388,6 +389,11 @@ final class GenericAgentRuntime: AgentRuntime {
                         guard let modelContinuation = modelCompletion?.continuation else {
                             throw AgentFailure(message: "模型没有返回可续接的完整工具调用。")
                         }
+                        guard committedToolCallIDs.insert(call.callID).inserted else {
+                            throw AgentFailure(
+                                message: "模型重复提交了已经处理的工具调用：\(call.callID)"
+                            )
+                        }
                         guard toolCallCount < configuration.maximumToolCalls else {
                             throw AgentFailure(
                                 message: "模型工具循环超过最大工具调用次数（\(configuration.maximumToolCalls)），运行已停止。"
@@ -427,13 +433,28 @@ final class GenericAgentRuntime: AgentRuntime {
                                 throw AgentFailure(message: "模型返回的工具参数不是有效的 JSON object。")
                             }
                             continuation.yield(.runStateChanged(request.runID, .waitingForTool))
-                            let result = try await toolExecutor.execute(ToolExecutionRequest(
-                                call: call,
-                                context: ToolExecutionContext(
-                                    runID: request.runID,
-                                    workspace: configuration.workspace
+                            let result: ToolExecutionResult
+                            do {
+                                result = try await toolExecutor.execute(ToolExecutionRequest(
+                                    call: call,
+                                    context: ToolExecutionContext(
+                                        runID: request.runID,
+                                        workspace: configuration.workspace
+                                    )
+                                ))
+                            } catch is CancellationError where !Task.isCancelled {
+                                throw AgentFailure(
+                                    message: "工具执行被意外取消，运行已停止。"
                                 )
-                            ))
+                            } catch let error as URLError
+                                where error.code == .cancelled && !Task.isCancelled {
+                                throw AgentFailure(
+                                    message: "工具执行被意外取消，运行已停止。"
+                                )
+                            } catch where Task.isCancelled {
+                                throw CancellationError()
+                            }
+                            try Task.checkCancellation()
                             continuation.yield(.runStateChanged(request.runID, .running))
                             output = try Self.encodeToolExecutionResult(result)
                         }
@@ -455,6 +476,10 @@ final class GenericAgentRuntime: AgentRuntime {
                     throw CancellationError()
                 } catch let error as URLError where error.code == .cancelled {
                     throw CancellationError()
+                } catch let error as ModelFailureClassifying
+                    where error.failureKind == .contextOverflow
+                    && toolFollowUp != nil {
+                    throw AgentFailure.contextOverflowAfterToolExecution
                 } catch let error as ModelFailureClassifying
                     where error.failureKind == .contextOverflow
                     && !recoveryAttempted
