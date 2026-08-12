@@ -73,5 +73,23 @@ mod tests {
                 .map(SharedString::from)
                 .to_vec()
         );
+        assert!(
+            assets
+                .load("icons/ui/chevron-down.svg")
+                .expect("the chevron icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/chevron-up.svg")
+                .expect("the upward chevron icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/settings.svg")
+                .expect("the settings icon should be readable")
+                .is_some()
+        );
     }
 }

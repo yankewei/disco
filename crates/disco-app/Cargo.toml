@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 directories.workspace = true
+disco-codex-engine = { path = "../disco-codex-engine" }
 disco-storage = { path = "../disco-storage" }
 disco-ui = { path = "../disco-ui" }
 gpui.workspace = true

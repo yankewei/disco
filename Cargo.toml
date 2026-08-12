@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/disco-app",
+    "crates/disco-codex-engine",
     "crates/disco-domain",
     "crates/disco-kernel",
     "crates/disco-protocol",
@@ -23,6 +24,7 @@ rust-version = "1.96"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+keyring = "4.1.0"
 rig = { version = "0.41.0", default-features = false, features = ["agent", "derive", "rustls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
