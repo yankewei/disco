@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/disco-app",
+    "crates/disco-codex-engine",
+    "crates/disco-domain",
+    "crates/disco-kernel",
+    "crates/disco-protocol",
+    "crates/disco-rig-engine",
+    "crates/disco-storage",
+    "crates/disco-tool-runtime",
+    "crates/disco-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Disco contributors"]
+repository = "https://github.com/yankewei/disco"
+rust-version = "1.96"
+
+[workspace.dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+keyring = "4.1.0"
+rig = { version = "0.41.0", default-features = false, features = ["agent", "derive", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite_migration = "2.6.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.20.0", features = ["serde", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
