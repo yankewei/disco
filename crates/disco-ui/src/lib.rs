@@ -5,7 +5,10 @@ mod settings;
 
 pub use composer_input::{ComposerInput, init as init_composer_input};
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use composer_input::ComposerSubmitted;
 use disco_codex_engine::{CodexModel, CodexRuntime, CodexTurnResult};
@@ -13,17 +16,17 @@ use disco_domain::{
     EngineKind, Project, ProjectId, RunEventPayload, RunId, RunStatus, SessionId, TokenUsage,
     ToolCall,
 };
-use disco_kernel::{ActivityItem, EventJournal, Kernel, ProjectStore, RunProjection};
+use disco_kernel::{ActivityItem, ActivityKind, EventJournal, Kernel, ProjectStore, RunProjection};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, PathPromptOptions, Render, StatefulInteractiveElement, Styled, Window, div, img,
-    px, rgb,
+    AppContext, ClipboardItem, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, PathPromptOptions,
+    Pixels, Point, Render, StatefulInteractiveElement, Styled, Window, WindowAppearance, anchored,
+    deferred, div, img, px, rgb,
 };
 use serde_json::json;
 use settings::{CodexUiSettings, save_api_key};
 
-const APP_LOGO_ASSET: &str = "images/app-logo.png";
 const CODEX_ICON_ASSET: &str = "icons/providers/codex.png";
 const DEEPSEEK_ICON_ASSET: &str = "icons/providers/deepseek.svg";
 const KIMI_ICON_ASSET: &str = "icons/providers/kimi-code.png";
@@ -36,28 +39,6 @@ const PROVIDERS_ICON_ASSET: &str = "icons/ui/providers.svg";
 const SEND_ICON_ASSET: &str = "icons/ui/send.svg";
 const STOP_ICON_ASSET: &str = "icons/ui/stop.svg";
 const FOLDER_ICON_ASSET: &str = "icons/ui/folder.svg";
-const CANVAS: u32 = 0xffffff;
-const SIDEBAR: u32 = 0xf1f1f3;
-const SURFACE: u32 = 0xffffff;
-const SURFACE_SUBTLE: u32 = 0xf5f6f8;
-const SURFACE_HOVER: u32 = 0xe7e8eb;
-const BORDER: u32 = 0xe1e3e7;
-const BORDER_STRONG: u32 = 0xd3d6dc;
-const TEXT: u32 = 0x222327;
-const MUTED: u32 = 0x6e727a;
-const MUTED_LIGHT: u32 = 0x9a9ea6;
-const BLUE: u32 = 0x007aff;
-const BLUE_HOVER: u32 = 0x006ee6;
-const BLUE_ACTIVE: u32 = 0x0062cc;
-const BLUE_TINT: u32 = 0xeaf3ff;
-const BLUE_INK: u32 = 0x174a7e;
-const GREEN: u32 = 0x28a745;
-const RED: u32 = 0xd7373f;
-const SETTINGS_CANVAS: u32 = 0xf7f7f8;
-const SETTINGS_SIDEBAR: u32 = 0xededef;
-const SETTINGS_SELECTION: u32 = 0x0a84ff;
-const SETTINGS_CONTROL: u32 = 0xe8e8ed;
-const SETTINGS_SEPARATOR: u32 = 0xd1d1d6;
 const TYPE_CAPTION: f32 = 11.;
 const TYPE_UI: f32 = 12.5;
 const TYPE_BODY: f32 = 13.5;
@@ -69,6 +50,214 @@ const CHAT_COLUMN_WIDTH: f32 = 760.;
 const RADIUS_SMALL: f32 = 6.;
 const RADIUS_MEDIUM: f32 = 9.;
 const RADIUS_LARGE: f32 = 12.;
+
+#[derive(Clone, Copy)]
+struct AppAppearance {
+    canvas: u32,
+    surface: u32,
+    surface_subtle: u32,
+    surface_hover: u32,
+    surface_pressed: u32,
+    border: u32,
+    border_strong: u32,
+    text: u32,
+    muted: u32,
+    muted_light: u32,
+    blue: u32,
+    blue_hover: u32,
+    blue_active: u32,
+    blue_tint: u32,
+    green: u32,
+    red: u32,
+    settings_canvas: u32,
+    settings_sidebar: u32,
+    settings_selection: u32,
+    settings_control: u32,
+    settings_separator: u32,
+    sidebar: SidebarAppearance,
+    composer: ComposerAppearance,
+    conversation: ConversationAppearance,
+}
+
+impl AppAppearance {
+    const MACOS_LIGHT: Self = Self {
+        canvas: 0xffffff,
+        surface: 0xffffff,
+        surface_subtle: 0xf5f6f8,
+        surface_hover: 0xe7e8eb,
+        surface_pressed: 0xd9dbe0,
+        border: 0xe1e3e7,
+        border_strong: 0xd3d6dc,
+        text: 0x222327,
+        muted: 0x6e727a,
+        muted_light: 0x9a9ea6,
+        blue: 0x007aff,
+        blue_hover: 0x006ee6,
+        blue_active: 0x0062cc,
+        blue_tint: 0xeaf3ff,
+        green: 0x28a745,
+        red: 0xd7373f,
+        settings_canvas: 0xf7f7f8,
+        settings_sidebar: 0xededef,
+        settings_selection: 0x0a84ff,
+        settings_control: 0xe8e8ed,
+        settings_separator: 0xd1d1d6,
+        sidebar: SidebarAppearance::MACOS_LIGHT,
+        composer: ComposerAppearance::MACOS_LIGHT,
+        conversation: ConversationAppearance::MACOS_LIGHT,
+    };
+
+    const MACOS_DARK: Self = Self {
+        canvas: 0x1c1c1e,
+        surface: 0x242426,
+        surface_subtle: 0x2b2b2e,
+        surface_hover: 0x37373b,
+        surface_pressed: 0x444449,
+        border: 0x38383c,
+        border_strong: 0x48484d,
+        text: 0xf0f0f2,
+        muted: 0xa4a4aa,
+        muted_light: 0x77777f,
+        blue: 0x0a84ff,
+        blue_hover: 0x2390ff,
+        blue_active: 0x0070df,
+        blue_tint: 0x183a5a,
+        green: 0x32d74b,
+        red: 0xff453a,
+        settings_canvas: 0x1c1c1e,
+        settings_sidebar: 0x252527,
+        settings_selection: 0x0a84ff,
+        settings_control: 0x333336,
+        settings_separator: 0x3a3a3c,
+        sidebar: SidebarAppearance::MACOS_DARK,
+        composer: ComposerAppearance::MACOS_DARK,
+        conversation: ConversationAppearance::MACOS_DARK,
+    };
+
+    const fn for_window(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::MACOS_DARK,
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::MACOS_LIGHT,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SidebarAppearance {
+    background: u32,
+    separator: u32,
+    hover: u32,
+    pressed: u32,
+    selection: u32,
+    selection_focused: u32,
+    focus: u32,
+    text: u32,
+    secondary_text: u32,
+}
+
+impl SidebarAppearance {
+    const MACOS_LIGHT: Self = Self {
+        background: 0xf1f1f3,
+        separator: 0xd9dade,
+        hover: 0xe7e7e9,
+        pressed: 0xd9dade,
+        selection: 0xdfe0e3,
+        selection_focused: 0xd8d9dd,
+        focus: 0xe5e5e8,
+        text: 0x27282b,
+        secondary_text: 0x73767d,
+    };
+
+    const MACOS_DARK: Self = Self {
+        background: 0x242426,
+        separator: 0x3a3a3c,
+        hover: 0x303033,
+        pressed: 0x3a3a3e,
+        selection: 0x3a3a3d,
+        selection_focused: 0x444449,
+        focus: 0x303034,
+        text: 0xe8e8eb,
+        secondary_text: 0x98989f,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct ComposerAppearance {
+    surface: u32,
+    border: u32,
+    focus_border: u32,
+    control: u32,
+    control_border: u32,
+    control_hover: u32,
+    control_pressed: u32,
+    action_disabled: u32,
+}
+
+impl ComposerAppearance {
+    const MACOS_LIGHT: Self = Self {
+        surface: 0xffffff,
+        border: 0xd4d5d9,
+        focus_border: 0x84aee8,
+        control: 0xffffff,
+        control_border: 0xd9dade,
+        control_hover: 0xf1f1f3,
+        control_pressed: 0xe5e5e8,
+        action_disabled: 0xe5e5ea,
+    };
+
+    const MACOS_DARK: Self = Self {
+        surface: 0x242426,
+        border: 0x45454a,
+        focus_border: 0x3f84d4,
+        control: 0x303033,
+        control_border: 0x4a4a4f,
+        control_hover: 0x3a3a3e,
+        control_pressed: 0x444449,
+        action_disabled: 0x3a3a3c,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct ConversationAppearance {
+    secondary_surface: u32,
+    secondary_separator: u32,
+    identity: u32,
+    secondary_text: u32,
+    warning: u32,
+    failure_surface: u32,
+}
+
+impl ConversationAppearance {
+    const MACOS_LIGHT: Self = Self {
+        secondary_surface: 0xf5f5f6,
+        secondary_separator: 0xe3e3e6,
+        identity: 0x303135,
+        secondary_text: 0x6f7278,
+        warning: 0xe49322,
+        failure_surface: 0xfff2f2,
+    };
+
+    const MACOS_DARK: Self = Self {
+        secondary_surface: 0x28282b,
+        secondary_separator: 0x3a3a3f,
+        identity: 0xe8e8ec,
+        secondary_text: 0x9a9aa2,
+        warning: 0xff9f0a,
+        failure_surface: 0x462427,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarItem {
+    Project(ProjectId),
+    Task(ProjectId, SessionId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectContextMenu {
+    project_id: ProjectId,
+    position: Point<Pixels>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum WorkspacePage {
@@ -200,6 +389,9 @@ pub struct DiscoWorkspace<J: EventJournal> {
     projects: Vec<ProjectState>,
     active_project_id: ProjectId,
     active_session_id: SessionId,
+    sidebar_focus_handle: FocusHandle,
+    sidebar_focused_item: SidebarItem,
+    project_context_menu: Option<ProjectContextMenu>,
     composer: Entity<ComposerInput>,
     page: WorkspacePage,
     settings_path: PathBuf,
@@ -414,11 +606,15 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .and_then(|selected| models.iter().find(|model| model.id == selected))
             .map(|model| model.default_reasoning_effort.clone())
             .unwrap_or_else(|| "medium".into());
+        let sidebar_focus_handle = cx.focus_handle().tab_stop(true);
         Self {
             kernel,
             projects,
             active_project_id,
             active_session_id,
+            sidebar_focus_handle,
+            sidebar_focused_item: SidebarItem::Task(active_project_id, active_session_id),
+            project_context_menu: None,
             composer,
             page: WorkspacePage::Chat,
             settings_path,
@@ -477,6 +673,110 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .tasks
             .iter_mut()
             .find(|task| task.session_id == active_session_id)
+    }
+
+    fn visible_sidebar_items(&self) -> Vec<SidebarItem> {
+        let mut items = Vec::new();
+        for project in &self.projects {
+            let project_id = project.project.id;
+            items.push(SidebarItem::Project(project_id));
+            if project.expanded {
+                items.extend(
+                    project
+                        .tasks
+                        .iter()
+                        .map(|task| SidebarItem::Task(project_id, task.session_id)),
+                );
+            }
+        }
+        items
+    }
+
+    fn move_sidebar_selection(&mut self, offset: isize, cx: &mut Context<Self>) {
+        if self.run_in_progress() {
+            return;
+        }
+        let items = self.visible_sidebar_items();
+        let Some(current_index) = items
+            .iter()
+            .position(|item| *item == self.sidebar_focused_item)
+            .or_else(|| {
+                items.iter().position(|item| {
+                    *item == SidebarItem::Task(self.active_project_id, self.active_session_id)
+                })
+            })
+        else {
+            return;
+        };
+        let target_index = current_index
+            .saturating_add_signed(offset)
+            .min(items.len().saturating_sub(1));
+        let target = items[target_index];
+        match target {
+            SidebarItem::Project(project_id) => self.select_project(project_id, cx),
+            SidebarItem::Task(project_id, session_id) => {
+                self.select_task(project_id, session_id, cx)
+            }
+        }
+        self.sidebar_focused_item = target;
+    }
+
+    fn on_sidebar_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "up" => self.move_sidebar_selection(-1, cx),
+            "down" => self.move_sidebar_selection(1, cx),
+            "left" => match self.sidebar_focused_item {
+                SidebarItem::Project(project_id) => {
+                    if let Some(project) = self
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.project.id == project_id)
+                        && project.expanded
+                    {
+                        project.expanded = false;
+                    }
+                }
+                SidebarItem::Task(project_id, _) => {
+                    self.select_project(project_id, cx);
+                    self.sidebar_focused_item = SidebarItem::Project(project_id);
+                }
+            },
+            "right" => {
+                if let SidebarItem::Project(project_id) = self.sidebar_focused_item
+                    && let Some(project) = self
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.project.id == project_id)
+                {
+                    if project.expanded {
+                        if let Some(task) = project.tasks.first() {
+                            let session_id = task.session_id;
+                            self.select_task(project_id, session_id, cx);
+                            self.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
+                        }
+                    } else {
+                        project.expanded = true;
+                    }
+                }
+            }
+            "enter" | "return" => match self.sidebar_focused_item {
+                SidebarItem::Project(project_id) => self.select_project(project_id, cx),
+                SidebarItem::Task(project_id, session_id) => {
+                    self.select_task(project_id, session_id, cx)
+                }
+            },
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn task_for_run_mut(&mut self, run_id: RunId) -> Option<&mut ChatConversation> {
@@ -827,6 +1127,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         project.tasks.insert(0, task);
         self.active_project_id = project_id;
         self.active_session_id = session_id;
+        self.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
         self.composer
             .update(cx, |composer, cx| composer.set_content("", cx));
         self.model_menu_open = false;
@@ -908,6 +1209,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.projects[project_index].selected_session_id = Some(session_id);
         self.active_project_id = project_id;
         self.active_session_id = session_id;
+        self.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
         self.page = WorkspacePage::Chat;
         self.model_menu_open = false;
         self.thinking_menu_open = false;
@@ -985,6 +1287,117 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         }
     }
 
+    fn render_project_context_menu(
+        &self,
+        menu: ProjectContextMenu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.project.id == menu.project_id)
+            .expect("a context menu can only target a visible project");
+        let project_id = menu.project_id;
+        let project_path = project.project.root_path.clone();
+        let navigation_locked = self.run_in_progress();
+
+        div()
+            .id((ElementId::from(project_id.as_uuid()), "context-menu"))
+            .w(px(208.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .rounded(px(RADIUS_MEDIUM))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border_strong))
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.project_context_menu = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id((ElementId::from(project_id.as_uuid()), "context-new-task"))
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(RADIUS_SMALL))
+                    .text_size(px(TYPE_UI))
+                    .text_color(rgb(palette.text))
+                    .when(navigation_locked, |item| item.opacity(0.42))
+                    .when(!navigation_locked, |item| {
+                        item.cursor_pointer()
+                            .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                            .active(move |style| style.bg(rgb(palette.surface_pressed)))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if !this.run_in_progress() {
+                            this.project_context_menu = None;
+                            window.focus(&this.sidebar_focus_handle);
+                            this.new_task_for_project(project_id, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child("New Task"),
+            )
+            .child(div().mx_2().my_1().h(px(1.)).bg(rgb(palette.border)))
+            .child(
+                div()
+                    .id((ElementId::from(project_id.as_uuid()), "context-reveal"))
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(RADIUS_SMALL))
+                    .cursor_pointer()
+                    .text_size(px(TYPE_UI))
+                    .text_color(rgb(palette.text))
+                    .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                    .active(move |style| style.bg(rgb(palette.surface_pressed)))
+                    .on_click(cx.listener({
+                        let project_path = project_path.clone();
+                        move |this, _, _, cx| {
+                            this.project_context_menu = None;
+                            if let Err(error) = Command::new("/usr/bin/open")
+                                .arg("-R")
+                                .arg(&project_path)
+                                .spawn()
+                            {
+                                this.project_notice =
+                                    Some(format!("Could not reveal the project: {error}"));
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .child("Reveal in Finder"),
+            )
+            .child(
+                div()
+                    .id((ElementId::from(project_id.as_uuid()), "context-copy-path"))
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(RADIUS_SMALL))
+                    .cursor_pointer()
+                    .text_size(px(TYPE_UI))
+                    .text_color(rgb(palette.text))
+                    .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                    .active(move |style| style.bg(rgb(palette.surface_pressed)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.project_context_menu = None;
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            project_path.to_string_lossy().into_owned(),
+                        ));
+                        cx.notify();
+                    }))
+                    .child("Copy Path"),
+            )
+    }
+
     fn status_label(&self) -> &'static str {
         let Some(current) = self.active_task().and_then(ChatConversation::current) else {
             return if self.runtime.is_some() {
@@ -1005,14 +1418,18 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         }
     }
 
-    fn status_color(&self) -> u32 {
+    fn status_color(&self, palette: AppAppearance) -> u32 {
         let Some(current) = self.active_task().and_then(ChatConversation::current) else {
-            return if self.runtime.is_some() { GREEN } else { RED };
+            return if self.runtime.is_some() {
+                palette.green
+            } else {
+                palette.red
+            };
         };
         match current.status {
-            RunStatus::Completed => GREEN,
-            RunStatus::Failed | RunStatus::Cancelled => RED,
-            _ => BLUE,
+            RunStatus::Completed => palette.green,
+            RunStatus::Failed | RunStatus::Cancelled => palette.red,
+            _ => palette.blue,
         }
     }
 
@@ -1044,7 +1461,29 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         }
     }
 
-    fn activity_row(item: &ActivityItem) -> impl IntoElement {
+    fn token_count_label(count: u64) -> String {
+        let digits = count.to_string();
+        let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+        for (index, digit) in digits.chars().enumerate() {
+            if index > 0 && (digits.len() - index).is_multiple_of(3) {
+                formatted.push(',');
+            }
+            formatted.push(digit);
+        }
+        formatted
+    }
+
+    fn activity_row(item: &ActivityItem, palette: AppAppearance) -> impl IntoElement {
+        let appearance = palette.conversation;
+        let indicator = if item.completed {
+            palette.green
+        } else {
+            match item.kind {
+                ActivityKind::Approval => appearance.warning,
+                ActivityKind::Failure => palette.red,
+                ActivityKind::Plan | ActivityKind::Tool => palette.blue,
+            }
+        };
         div()
             .flex()
             .items_start()
@@ -1056,7 +1495,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .mt(px(5.))
                     .size(px(6.))
                     .rounded_full()
-                    .bg(rgb(if item.completed { GREEN } else { BLUE })),
+                    .bg(rgb(indicator)),
             )
             .child(
                 div()
@@ -1068,108 +1507,228 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         div()
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(palette.text))
                             .child(item.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(TYPE_CAPTION))
-                            .line_height(px(16.))
-                            .text_color(rgb(MUTED))
-                            .child(item.detail.clone()),
-                    ),
-            )
-    }
-
-    fn conversation_turn(turn: RunProjection) -> impl IntoElement {
-        let prompt = turn.prompt.unwrap_or_default();
-        let is_working = !turn.status.is_terminal();
-        let assistant = turn.assistant_text;
-        let activities = turn.activities;
-        let usage = turn.usage;
-        let failure = turn.failure_message;
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div().w_full().flex().justify_end().child(
-                    div()
-                        .max_w(px(620.))
-                        .px_3()
-                        .py_2()
-                        .rounded(px(RADIUS_LARGE))
-                        .bg(rgb(BLUE_TINT))
-                        .text_size(px(TYPE_BODY))
-                        .line_height(px(20.))
-                        .text_color(rgb(BLUE_INK))
-                        .child(prompt),
-                ),
-            )
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .max_w(px(700.))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .when(!assistant.is_empty(), |column| {
-                        column.child(
-                            div()
-                                .text_size(px(TYPE_BODY))
-                                .line_height(px(21.))
-                                .child(assistant),
-                        )
-                    })
-                    .when(is_working, |column| {
-                        column.child(
-                            div()
-                                .text_size(px(TYPE_UI))
-                                .text_color(rgb(MUTED))
-                                .child("Working…"),
-                        )
-                    })
-                    .when_some(failure, |column, message| {
-                        column.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .rounded(px(RADIUS_MEDIUM))
-                                .bg(rgb(0xffeeee))
-                                .text_size(px(TYPE_UI))
-                                .text_color(rgb(RED))
-                                .child(message),
-                        )
-                    })
-                    .when(!activities.is_empty(), |column| {
-                        column.child(
-                            div()
-                                .rounded(px(RADIUS_MEDIUM))
-                                .bg(rgb(SURFACE_SUBTLE))
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .children(activities.iter().map(Self::activity_row)),
-                        )
-                    })
-                    .when(usage.total_tokens > 0, |column| {
-                        column.child(
+                    .when(!item.detail.is_empty(), |content| {
+                        content.child(
                             div()
                                 .text_size(px(TYPE_CAPTION))
-                                .text_color(rgb(MUTED_LIGHT))
-                                .child(format!(
-                                    "{} input · {} output · {} total tokens",
-                                    usage.input_tokens, usage.output_tokens, usage.total_tokens
-                                )),
+                                .line_height(px(16.))
+                                .text_color(rgb(appearance.secondary_text))
+                                .child(item.detail.clone()),
                         )
                     }),
             )
     }
 
-    fn project_sidebar_group(&self, project: ProjectState, cx: &mut Context<Self>) -> gpui::Div {
+    fn conversation_turn(turn: RunProjection, palette: AppAppearance) -> impl IntoElement {
+        let appearance = palette.conversation;
+        let prompt = turn.prompt.unwrap_or_default();
+        let is_working = !turn.status.is_terminal();
+        let assistant = turn.assistant_text;
+        let reasoning = turn.reasoning_text;
+        let activities = turn
+            .activities
+            .into_iter()
+            .filter(|item| item.kind != ActivityKind::Failure)
+            .collect::<Vec<_>>();
+        let usage = turn.usage;
+        let failure = turn.failure_message;
+        let has_response = !assistant.is_empty()
+            || !reasoning.is_empty()
+            || !activities.is_empty()
+            || failure.is_some()
+            || usage.total_tokens > 0
+            || is_working;
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .max_w(px(700.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(TYPE_UI))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(appearance.identity))
+                            .child("You"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_BODY))
+                            .line_height(px(22.))
+                            .text_color(rgb(palette.text))
+                            .child(prompt),
+                    ),
+            )
+            .when(has_response, |turn| {
+                turn.child(
+                    div()
+                        .min_w(px(0.))
+                        .max_w(px(700.))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(TYPE_UI))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(appearance.identity))
+                                .child("Disco"),
+                        )
+                        .when(!reasoning.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .rounded(px(RADIUS_MEDIUM))
+                                    .bg(rgb(appearance.secondary_surface))
+                                    .px_3()
+                                    .py_2()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(div().size(px(6.)).rounded_full().bg(rgb(
+                                                if is_working {
+                                                    palette.blue
+                                                } else {
+                                                    palette.muted_light
+                                                },
+                                            )))
+                                            .child(
+                                                div()
+                                                    .text_size(px(TYPE_CAPTION))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(appearance.secondary_text))
+                                                    .child("Thinking"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(TYPE_BODY))
+                                            .line_height(px(21.))
+                                            .text_color(rgb(appearance.secondary_text))
+                                            .child(reasoning),
+                                    ),
+                            )
+                        })
+                        .when(!activities.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .rounded(px(RADIUS_MEDIUM))
+                                    .overflow_hidden()
+                                    .bg(rgb(appearance.secondary_surface))
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .pt_2()
+                                            .pb_1()
+                                            .text_size(px(TYPE_CAPTION))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(appearance.secondary_text))
+                                            .child("Activity"),
+                                    )
+                                    .children(activities.iter().enumerate().map(
+                                        |(index, item)| {
+                                            div()
+                                                .when(index > 0, |row| {
+                                                    row.border_t_1().border_color(rgb(
+                                                        appearance.secondary_separator
+                                                    ))
+                                                })
+                                                .child(Self::activity_row(item, palette))
+                                        },
+                                    )),
+                            )
+                        })
+                        .when(!assistant.is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .text_size(px(TYPE_BODY))
+                                    .line_height(px(22.))
+                                    .text_color(rgb(palette.text))
+                                    .child(assistant),
+                            )
+                        })
+                        .when(is_working, |column| {
+                            column.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(px(TYPE_UI))
+                                    .text_color(rgb(appearance.secondary_text))
+                                    .child(div().size(px(6.)).rounded_full().bg(rgb(palette.blue)))
+                                    .child("Working…"),
+                            )
+                        })
+                        .when_some(failure, |column, message| {
+                            column.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(px(RADIUS_MEDIUM))
+                                    .bg(rgb(appearance.failure_surface))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .text_size(px(TYPE_UI))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(palette.red))
+                                            .child("Run failed"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(TYPE_UI))
+                                            .line_height(px(18.))
+                                            .text_color(rgb(palette.red))
+                                            .child(message),
+                                    ),
+                            )
+                        })
+                        .when(usage.total_tokens > 0, |column| {
+                            column.child(
+                                div()
+                                    .pt_1()
+                                    .text_size(px(TYPE_CAPTION))
+                                    .text_color(rgb(palette.muted_light))
+                                    .child(format!(
+                                        "{} input · {} output",
+                                        Self::token_count_label(usage.input_tokens),
+                                        Self::token_count_label(usage.output_tokens)
+                                    )),
+                            )
+                        }),
+                )
+            })
+    }
+
+    fn project_sidebar_group(
+        &self,
+        project: ProjectState,
+        focus_visible: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        let appearance = palette.sidebar;
         let project_id = project.project.id;
         let is_active_project = project_id == self.active_project_id;
+        let navigation_locked = self.run_in_progress();
+        let project_disabled = navigation_locked && !is_active_project;
+        let project_focused =
+            focus_visible && self.sidebar_focused_item == SidebarItem::Project(project_id);
         let project_hover_group = format!("project-row-{project_id}");
         let task_rows = project
             .tasks
@@ -1177,6 +1736,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .map(|task| {
                 let session_id = task.session_id;
                 let selected = is_active_project && session_id == self.active_session_id;
+                let disabled = navigation_locked && !selected;
+                let focused = focus_visible
+                    && self.sidebar_focused_item == SidebarItem::Task(project_id, session_id);
                 let title = task
                     .title_prompt()
                     .map(Self::compact_title)
@@ -1188,20 +1750,41 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .id((ElementId::from(session_id.as_uuid()), "task"))
                     .mx_2()
                     .h(px(30.))
-                    .pl(px(38.))
+                    .pl(px(44.))
                     .pr_2()
                     .flex()
                     .items_center()
                     .justify_between()
                     .rounded(px(RADIUS_SMALL))
-                    .cursor_pointer()
-                    .bg(rgb(if selected { 0xdedfe3 } else { SIDEBAR }))
-                    .hover(move |style| {
-                        style.bg(rgb(if selected { 0xd7d9de } else { SURFACE_HOVER }))
+                    .bg(rgb(if selected {
+                        if focused {
+                            appearance.selection_focused
+                        } else {
+                            appearance.selection
+                        }
+                    } else if focused {
+                        appearance.focus
+                    } else {
+                        appearance.background
+                    }))
+                    .when(disabled, |row| row.opacity(0.48))
+                    .when(!disabled, |row| {
+                        row.cursor_pointer()
+                            .hover(move |style| {
+                                style.bg(rgb(if selected {
+                                    appearance.selection_focused
+                                } else {
+                                    appearance.hover
+                                }))
+                            })
+                            .active(move |style| style.bg(rgb(appearance.pressed)))
                     })
-                    .active(|style| style.bg(rgb(0xd1d3d8)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_task(project_id, session_id, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if !this.run_in_progress() || session_id == this.active_session_id {
+                            window.focus(&this.sidebar_focus_handle);
+                            this.select_task(project_id, session_id, cx);
+                            this.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
+                        }
                         cx.notify();
                     }))
                     .child(
@@ -1209,11 +1792,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .min_w(px(0.))
                             .truncate()
                             .text_size(px(TYPE_UI))
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(rgb(appearance.text))
                             .child(title),
                     )
                     .when(running, |row| {
@@ -1223,7 +1803,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                 .size(px(7.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(BLUE)),
+                                .bg(rgb(palette.blue)),
                         )
                     })
             })
@@ -1244,13 +1824,42 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .items_center()
                     .gap(px(6.))
                     .rounded(px(RADIUS_SMALL))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                    .active(|style| style.bg(rgb(0xd1d3d8)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_project(project_id, cx);
-                        cx.notify();
+                    .bg(rgb(if project_focused {
+                        appearance.focus
+                    } else {
+                        appearance.background
                     }))
+                    .when(project_disabled, |row| row.opacity(0.48))
+                    .when(!project_disabled, |row| {
+                        row.cursor_pointer()
+                            .hover(move |style| style.bg(rgb(appearance.hover)))
+                            .active(move |style| style.bg(rgb(appearance.pressed)))
+                    })
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            if event.standard_click()
+                                && (!this.run_in_progress() || project_id == this.active_project_id)
+                            {
+                                window.focus(&this.sidebar_focus_handle);
+                                this.select_project(project_id, cx);
+                                this.sidebar_focused_item = SidebarItem::Project(project_id);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&this.sidebar_focus_handle);
+                            this.sidebar_focused_item = SidebarItem::Project(project_id);
+                            this.project_context_menu = Some(ProjectContextMenu {
+                                project_id,
+                                position: event.position,
+                            });
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .id((ElementId::from(project_id.as_uuid()), "project-disclosure"))
@@ -1260,8 +1869,10 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .items_center()
                             .cursor_pointer()
                             .justify_center()
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
+                                window.focus(&this.sidebar_focus_handle);
+                                this.sidebar_focused_item = SidebarItem::Project(project_id);
                                 this.toggle_project(project_id);
                                 cx.notify();
                             }))
@@ -1282,9 +1893,10 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .truncate()
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(appearance.text))
                             .child(project.project.name),
                     )
-                    .when(is_active_project, |row| {
+                    .when(is_active_project && !navigation_locked, |row| {
                         row.child(
                             div()
                                 .id((ElementId::from(project_id.as_uuid()), "new-task"))
@@ -1295,13 +1907,18 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                 .justify_center()
                                 .rounded(px(4.))
                                 .text_size(px(15.))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(appearance.secondary_text))
                                 .opacity(0.)
                                 .group_hover(project_hover_group, |style| style.opacity(1.))
-                                .hover(|style| style.bg(rgb(0xdfe1e5)).text_color(rgb(TEXT)))
-                                .active(|style| style.bg(rgb(0xd4d7dc)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .hover(move |style| {
+                                    style
+                                        .bg(rgb(appearance.hover))
+                                        .text_color(rgb(appearance.text))
+                                })
+                                .active(move |style| style.bg(rgb(appearance.pressed)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
+                                    window.focus(&this.sidebar_focus_handle);
                                     this.new_task_for_project(project_id, cx);
                                     cx.notify();
                                 }))
@@ -1312,34 +1929,41 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .when(project.expanded, |group| group.children(task_rows))
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, focus_visible: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        let appearance = palette.sidebar;
+        let navigation_locked = self.run_in_progress();
         let projects = self.projects.clone();
         let project_groups = projects
             .into_iter()
-            .map(|project| self.project_sidebar_group(project, cx))
+            .map(|project| self.project_sidebar_group(project, focus_visible, cx))
             .collect::<Vec<_>>();
         div()
+            .id("project-sidebar")
+            .key_context("ProjectSidebar")
+            .track_focus(&self.sidebar_focus_handle)
+            .on_key_down(cx.listener(Self::on_sidebar_key_down))
             .w(px(APP_SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(rgb(SIDEBAR))
+            .bg(rgb(appearance.background))
             .border_r_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(appearance.separator))
             .child(div().h(px(APP_SIDEBAR_TOP_INSET)))
             .child(
                 div()
-                    .h(px(34.))
+                    .h(px(32.))
                     .px_3()
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(TYPE_UI))
+                            .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(appearance.secondary_text))
                             .child("Projects"),
                     )
                     .child(
@@ -1350,13 +1974,24 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .items_center()
                             .justify_center()
                             .rounded(px(4.))
-                            .cursor_pointer()
                             .text_size(px(17.))
-                            .text_color(rgb(MUTED))
-                            .hover(|style| style.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
-                            .active(|style| style.bg(rgb(0xd4d7dc)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_project_picker(cx);
+                            .text_color(rgb(appearance.secondary_text))
+                            .when(navigation_locked, |button| button.opacity(0.48))
+                            .when(!navigation_locked, |button| {
+                                button
+                                    .cursor_pointer()
+                                    .hover(move |style| {
+                                        style
+                                            .bg(rgb(appearance.hover))
+                                            .text_color(rgb(appearance.text))
+                                    })
+                                    .active(move |style| style.bg(rgb(appearance.pressed)))
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.run_in_progress() {
+                                    window.focus(&this.sidebar_focus_handle);
+                                    this.open_project_picker(cx);
+                                }
                                 cx.notify();
                             }))
                             .child("＋"),
@@ -1368,7 +2003,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         .mx_4()
                         .mb_2()
                         .text_size(px(TYPE_CAPTION))
-                        .text_color(rgb(RED))
+                        .text_color(rgb(palette.red))
                         .child(notice),
                 )
             })
@@ -1387,12 +2022,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .py_2()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .border_t_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(appearance.separator))
                     .child(
                         div()
                             .id("open-settings")
+                            .w_full()
                             .h(px(30.))
                             .px_2()
                             .flex()
@@ -1401,12 +2036,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .rounded(px(RADIUS_SMALL))
                             .cursor_pointer()
                             .bg(rgb(if self.page == WorkspacePage::Settings {
-                                0xe3e4e7
+                                appearance.selection
                             } else {
-                                SIDEBAR
+                                appearance.background
                             }))
-                            .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                            .active(|style| style.bg(rgb(0xdde3eb)))
+                            .hover(move |style| style.bg(rgb(appearance.hover)))
+                            .active(move |style| style.bg(rgb(appearance.pressed)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.page = WorkspacePage::Settings;
                                 this.model_menu_open = false;
@@ -1415,13 +2050,6 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             }))
                             .child(img(SETTINGS_ICON_ASSET).size(px(17.)))
                             .child("Settings"),
-                    )
-                    .child(
-                        div()
-                            .size(px(22.))
-                            .rounded(px(RADIUS_SMALL))
-                            .overflow_hidden()
-                            .child(img(APP_LOGO_ASSET).size_full()),
                     ),
             )
     }
@@ -1433,6 +2061,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         ready: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let selected = self.model_menu_provider == provider;
         div()
             .id(("chat-provider", provider as usize))
@@ -1443,10 +2072,18 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .gap_2()
             .rounded(px(RADIUS_MEDIUM))
             .cursor_pointer()
-            .bg(rgb(if selected { SURFACE } else { SURFACE_SUBTLE }))
-            .text_color(rgb(if selected { TEXT } else { MUTED }))
-            .hover(|style| style.bg(rgb(SURFACE)))
-            .active(|style| style.bg(rgb(SURFACE_HOVER)))
+            .bg(rgb(if selected {
+                palette.surface
+            } else {
+                palette.surface_subtle
+            }))
+            .text_color(rgb(if selected {
+                palette.text
+            } else {
+                palette.muted
+            }))
+            .hover(move |style| style.bg(rgb(palette.surface)))
+            .active(move |style| style.bg(rgb(palette.surface_hover)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.select_model_menu_provider(provider);
                 cx.notify();
@@ -1463,7 +2100,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .bg(rgb(if provider == ProviderKind::KimiCode {
                         0x101114
                     } else {
-                        SURFACE
+                        palette.surface
                     }))
                     .child(img(provider.icon()).max_w(px(22.)).max_h(px(22.))),
             )
@@ -1485,7 +2122,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         div()
                             .truncate()
                             .text_size(px(TYPE_CAPTION))
-                            .text_color(rgb(MUTED_LIGHT))
+                            .text_color(rgb(palette.muted_light))
                             .child(detail),
                     ),
             )
@@ -1494,7 +2131,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .size(px(6.))
                     .flex_shrink_0()
                     .rounded_full()
-                    .bg(rgb(if ready { GREEN } else { MUTED_LIGHT })),
+                    .bg(rgb(if ready {
+                        palette.green
+                    } else {
+                        palette.muted_light
+                    })),
             )
     }
 
@@ -1503,6 +2144,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         provider: ProviderKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let settings = match provider {
             ProviderKind::KimiCode => &self.settings.kimi_code,
             ProviderKind::DeepSeek => &self.settings.deepseek,
@@ -1528,7 +2170,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .bg(rgb(if provider == ProviderKind::KimiCode {
                         0x101114
                     } else {
-                        SURFACE_SUBTLE
+                        palette.surface_subtle
                     }))
                     .child(img(provider.icon()).max_w(px(28.)).max_h(px(28.))),
             )
@@ -1545,7 +2187,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .max_w(px(290.))
                     .text_size(px(TYPE_UI))
                     .line_height(px(18.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                     .child(if configured {
                         "This provider is configured, but remote execution is not connected in this build. It cannot be selected for a real run yet."
                     } else {
@@ -1560,11 +2202,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         .px_3()
                         .py_2()
                         .rounded(px(RADIUS_MEDIUM))
-                        .bg(rgb(SURFACE_SUBTLE))
+                        .bg(rgb(palette.surface_subtle))
                         .child(
                             div()
                                 .text_size(px(TYPE_CAPTION))
-                                .text_color(rgb(MUTED_LIGHT))
+                                .text_color(rgb(palette.muted_light))
                                 .child("Configured model"),
                         )
                         .child(
@@ -1588,11 +2230,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .justify_center()
                     .rounded(px(RADIUS_SMALL))
                     .cursor_pointer()
-                    .bg(rgb(SETTINGS_CONTROL))
+                    .bg(rgb(palette.settings_control))
                     .text_size(px(TYPE_UI))
                     .font_weight(FontWeight::MEDIUM)
-                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                    .active(|style| style.bg(rgb(0xd9dbe0)))
+                    .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                    .active(move |style| style.bg(rgb(palette.surface_pressed)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.open_provider_settings(provider);
                         cx.notify();
@@ -1606,6 +2248,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let codex_ready = self.runtime.is_some();
         let codex_count = self.models.len();
         let codex_count_label = Self::model_count_label(codex_count);
@@ -1616,16 +2259,16 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
 
         div()
             .absolute()
-            .bottom(px(46.))
+            .bottom(px(42.))
             .left(px(0.))
             .w(px(520.))
             .h(px(300.))
             .flex()
             .overflow_hidden()
             .rounded(px(RADIUS_LARGE))
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette.surface))
             .border_1()
-            .border_color(rgb(BORDER_STRONG))
+            .border_color(rgb(palette.border_strong))
             .shadow_lg()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.model_menu_open = false;
@@ -1639,9 +2282,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .bg(rgb(SURFACE_SUBTLE))
+                    .bg(rgb(palette.surface_subtle))
                     .border_r_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(rgb(palette.border))
                     .child(
                         div()
                             .h(px(26.))
@@ -1650,7 +2293,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .items_center()
                             .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(MUTED_LIGHT))
+                            .text_color(rgb(palette.muted_light))
                             .child("PROVIDERS"),
                     )
                     .child(self.model_picker_provider_row(
@@ -1701,7 +2344,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .items_center()
                                     .justify_between()
                                     .border_b_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(rgb(palette.border))
                                     .child(
                                         div()
                                             .text_size(px(TYPE_UI))
@@ -1711,7 +2354,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .child(
                                         div()
                                             .text_size(px(TYPE_CAPTION))
-                                            .text_color(rgb(MUTED_LIGHT))
+                                            .text_color(rgb(palette.muted_light))
                                             .child(format!("{codex_count_label} available")),
                                     ),
                             )
@@ -1724,7 +2367,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                         .items_center()
                                         .justify_center()
                                         .text_size(px(TYPE_UI))
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(palette.muted))
                                         .child("Codex app-server did not return any models."),
                                 )
                             })
@@ -1752,12 +2395,16 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                                     .rounded(px(RADIUS_MEDIUM))
                                                     .cursor_pointer()
                                                     .bg(rgb(if selected {
-                                                        BLUE_TINT
+                                                        palette.blue_tint
                                                     } else {
-                                                        SURFACE
+                                                        palette.surface
                                                     }))
-                                                    .hover(|style| style.bg(rgb(SURFACE_SUBTLE)))
-                                                    .active(|style| style.bg(rgb(SURFACE_HOVER)))
+                                                    .hover(move |style| {
+                                                        style.bg(rgb(palette.surface_subtle))
+                                                    })
+                                                    .active(move |style| {
+                                                        style.bg(rgb(palette.surface_hover))
+                                                    })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.select_model(id.clone());
                                                         cx.notify();
@@ -1782,7 +2429,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                                                 div()
                                                                     .truncate()
                                                                     .text_size(px(TYPE_CAPTION))
-                                                                    .text_color(rgb(MUTED))
+                                                                    .text_color(rgb(palette.muted))
                                                                     .child(
                                                                         model.description.clone(),
                                                                     ),
@@ -1794,7 +2441,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                                             .w(px(18.))
                                                             .flex_shrink_0()
                                                             .text_size(px(TYPE_UI))
-                                                            .text_color(rgb(BLUE))
+                                                            .text_color(rgb(palette.blue))
                                                             .child(if selected {
                                                                 "✓"
                                                             } else {
@@ -1816,6 +2463,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn provider_row(&self, provider: ProviderSummary, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let selected = self.selected_provider == Some(provider.kind);
         div()
             .id(("provider-row", provider.kind as usize))
@@ -1825,9 +2473,13 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .items_center()
             .gap_3()
             .cursor_pointer()
-            .bg(rgb(if selected { 0xf7f7f8 } else { SURFACE }))
-            .hover(|style| style.bg(rgb(0xf3f3f5)))
-            .active(|style| style.bg(rgb(0xe3e3e6)))
+            .bg(rgb(if selected {
+                palette.surface_subtle
+            } else {
+                palette.surface
+            }))
+            .hover(move |style| style.bg(rgb(palette.surface_hover)))
+            .active(move |style| style.bg(rgb(palette.surface_pressed)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_provider = if this.selected_provider == Some(provider.kind) {
                     None
@@ -1849,7 +2501,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .bg(rgb(if provider.kind == ProviderKind::KimiCode {
                         0x101114
                     } else {
-                        0xf8f8fa
+                        palette.surface_subtle
                     }))
                     .child(
                         img(provider.icon)
@@ -1881,7 +2533,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .child(
                         div()
                             .text_size(px(TYPE_CAPTION))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(provider.description),
                     ),
             )
@@ -1899,14 +2551,14 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .items_center()
                             .gap_2()
                             .rounded_full()
-                            .bg(rgb(SURFACE_SUBTLE))
+                            .bg(rgb(palette.surface_subtle))
                             .text_size(px(TYPE_CAPTION))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(div().size(px(7.)).rounded_full().bg(rgb(
                                 if provider.configured {
-                                    GREEN
+                                    palette.green
                                 } else {
-                                    MUTED_LIGHT
+                                    palette.muted_light
                                 },
                             )))
                             .child(provider.status),
@@ -1936,20 +2588,30 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         detail: impl IntoElement,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let expanded = self.selected_provider == Some(provider.kind);
         div()
             .overflow_hidden()
             .rounded(px(RADIUS_LARGE))
-            .bg(rgb(SURFACE))
+            .bg(rgb(palette.surface))
             .border_1()
-            .border_color(rgb(SETTINGS_SEPARATOR))
+            .border_color(rgb(palette.settings_separator))
             .child(self.provider_row(provider, cx))
             .when(expanded, |item| {
-                item.child(div().border_t_1().border_color(rgb(0xe5e5e8)).child(detail))
+                item.child(
+                    div()
+                        .border_t_1()
+                        .border_color(rgb(palette.border))
+                        .child(detail),
+                )
             })
     }
 
-    fn settings_input(label: &'static str, input: Entity<ComposerInput>) -> impl IntoElement {
+    fn settings_input(
+        label: &'static str,
+        input: Entity<ComposerInput>,
+        palette: AppAppearance,
+    ) -> impl IntoElement {
         div()
             .h(px(44.))
             .px_3()
@@ -1971,9 +2633,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .flex()
                     .items_center()
                     .rounded(px(RADIUS_SMALL))
-                    .bg(rgb(0xffffff))
+                    .bg(rgb(palette.surface))
                     .border_1()
-                    .border_color(rgb(0xb8b8bd))
+                    .border_color(rgb(palette.border_strong))
                     .child(input),
             )
     }
@@ -1983,6 +2645,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         provider: ProviderKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<J> {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let (endpoint, model, api_key, configured) = match provider {
             ProviderKind::KimiCode => (
                 self.kimi_endpoint_input.clone(),
@@ -2004,22 +2667,22 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .flex()
             .flex_col()
             .gap_3()
-            .bg(rgb(0xfafafa))
+            .bg(rgb(palette.surface_subtle))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(Self::settings_input("API endpoint", endpoint))
-                    .child(Self::settings_input("Model", model))
-                    .child(Self::settings_input("API key", api_key)),
+                    .child(Self::settings_input("API endpoint", endpoint, palette))
+                    .child(Self::settings_input("Model", model, palette))
+                    .child(Self::settings_input("API key", api_key, palette)),
             )
             .child(
                 div()
                     .px_3()
                     .text_size(px(TYPE_CAPTION))
                     .line_height(px(16.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(palette.muted))
                     .child(if configured {
                         "The API key is stored in macOS Keychain. Leave the field blank to keep it."
                     } else {
@@ -2032,9 +2695,17 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         .px_3()
                         .py_2()
                         .rounded(px(RADIUS_MEDIUM))
-                        .bg(rgb(if success { 0xeaf7ee } else { 0xffecee }))
+                        .bg(rgb(if success {
+                            palette.blue_tint
+                        } else {
+                            palette.conversation.failure_surface
+                        }))
                         .text_size(px(TYPE_UI))
-                        .text_color(rgb(if success { 0x217a38 } else { RED }))
+                        .text_color(rgb(if success {
+                            palette.green
+                        } else {
+                            palette.red
+                        }))
                         .child(notice),
                 )
             })
@@ -2054,12 +2725,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .justify_center()
                             .rounded(px(RADIUS_SMALL))
                             .cursor_pointer()
-                            .bg(rgb(BLUE))
+                            .bg(rgb(palette.blue))
                             .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(SURFACE))
-                            .hover(|style| style.bg(rgb(BLUE_HOVER)))
-                            .active(|style| style.bg(rgb(BLUE_ACTIVE)))
+                            .text_color(rgb(0xffffff))
+                            .hover(move |style| style.bg(rgb(palette.blue_hover)))
+                            .active(move |style| style.bg(rgb(palette.blue_active)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.save_remote_provider(provider, cx);
                                 cx.notify();
@@ -2070,6 +2741,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn codex_provider_detail(&self, cx: &mut Context<Self>) -> impl IntoElement + use<J> {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let connected = self.runtime.is_some();
         let installation = self.runtime.as_ref().map(CodexRuntime::installation);
         let model_count = self.models.len();
@@ -2079,7 +2751,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .flex()
             .flex_col()
             .gap_3()
-            .bg(rgb(0xfafafa))
+            .bg(rgb(palette.surface_subtle))
             .child(
                 div()
                     .px_1()
@@ -2091,9 +2763,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                 div()
                     .overflow_hidden()
                     .rounded(px(RADIUS_LARGE))
-                    .bg(rgb(SURFACE))
+                    .bg(rgb(palette.surface))
                     .border_1()
-                    .border_color(rgb(SETTINGS_SEPARATOR))
+                    .border_color(rgb(palette.settings_separator))
                     .child(
                         div()
                             .h(px(42.))
@@ -2108,14 +2780,14 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .items_center()
                                     .gap_2()
                                     .text_size(px(TYPE_UI))
-                                    .text_color(rgb(MUTED))
-                                    .child(
-                                        div().size(px(8.)).rounded_full().bg(rgb(if connected {
-                                            GREEN
+                                    .text_color(rgb(palette.muted))
+                                    .child(div().size(px(8.)).rounded_full().bg(rgb(
+                                        if connected {
+                                            palette.green
                                         } else {
-                                            RED
-                                        })),
-                                    )
+                                            palette.red
+                                        },
+                                    )))
                                     .child(if connected {
                                         "Connected"
                                     } else {
@@ -2123,7 +2795,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     }),
                             ),
                     )
-                    .child(div().h(px(1.)).ml(px(16.)).bg(rgb(0xe5e5e8)))
+                    .child(div().h(px(1.)).ml(px(16.)).bg(rgb(palette.border)))
                     .when_some(installation, |group, installation| {
                         group.child(
                             div()
@@ -2144,13 +2816,13 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                         .child(
                                             div()
                                                 .text_size(px(TYPE_UI))
-                                                .text_color(rgb(MUTED))
+                                                .text_color(rgb(palette.muted))
                                                 .child(installation.version.clone()),
                                         )
                                         .child(
                                             div()
                                                 .text_size(px(TYPE_CAPTION))
-                                                .text_color(rgb(MUTED_LIGHT))
+                                                .text_color(rgb(palette.muted_light))
                                                 .child(installation.path.display().to_string()),
                                         ),
                                 ),
@@ -2162,10 +2834,10 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                 .px_4()
                                 .py_3()
                                 .border_t_1()
-                                .border_color(rgb(0xe5e5e8))
+                                .border_color(rgb(palette.border))
                                 .text_size(px(TYPE_CAPTION))
                                 .line_height(px(16.))
-                                .text_color(rgb(RED))
+                                .text_color(rgb(palette.red))
                                 .child(error),
                         )
                     }),
@@ -2184,7 +2856,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         div()
                             .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::NORMAL)
-                            .text_color(rgb(MUTED_LIGHT))
+                            .text_color(rgb(palette.muted_light))
                             .child(Self::model_count_label(model_count)),
                     ),
             )
@@ -2195,9 +2867,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .rounded(px(RADIUS_LARGE))
-                    .bg(rgb(SURFACE))
+                    .bg(rgb(palette.surface))
                     .border_1()
-                    .border_color(rgb(SETTINGS_SEPARATOR))
+                    .border_color(rgb(palette.settings_separator))
                     .when(model_count == 0, |list| {
                         list.child(
                             div()
@@ -2206,7 +2878,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                 .flex()
                                 .items_center()
                                 .text_size(px(TYPE_UI))
-                                .text_color(rgb(MUTED))
+                                .text_color(rgb(palette.muted))
                                 .child("No models available"),
                         )
                     })
@@ -2223,9 +2895,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                 .items_center()
                                 .justify_between()
                                 .cursor_pointer()
-                                .bg(rgb(SURFACE))
-                                .hover(|style| style.bg(rgb(0xf3f3f5)))
-                                .active(|style| style.bg(rgb(0xe3e3e6)))
+                                .bg(rgb(palette.surface))
+                                .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                                .active(move |style| style.bg(rgb(palette.surface_pressed)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_model(id.clone());
                                     cx.notify();
@@ -2244,11 +2916,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     div()
                                         .w(px(22.))
                                         .text_size(px(TYPE_UI))
-                                        .text_color(rgb(SETTINGS_SELECTION))
+                                        .text_color(rgb(palette.settings_selection))
                                         .child(if selected { "✓" } else { "" }),
                                 )
                                 .when(index + 1 < model_count, |row| {
-                                    row.border_b_1().border_color(rgb(0xe5e5e8))
+                                    row.border_b_1().border_color(rgb(palette.border))
                                 })
                         }))
                     }),
@@ -2256,6 +2928,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let connected = self.runtime.is_some();
         div()
             .absolute()
@@ -2264,7 +2937,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .bottom(px(0.))
             .left(px(0.))
             .flex()
-            .bg(rgb(SETTINGS_CANVAS))
+            .bg(rgb(palette.settings_canvas))
             .child(
                 div()
                     .w(px(APP_SIDEBAR_WIDTH))
@@ -2275,8 +2948,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .flex()
                     .flex_col()
                     .border_r_1()
-                    .border_color(rgb(0xd7d9dc))
-                    .bg(rgb(SETTINGS_SIDEBAR))
+                    .border_color(rgb(palette.settings_separator))
+                    .bg(rgb(palette.settings_sidebar))
                     .child(
                         div()
                             .id("close-settings")
@@ -2288,14 +2961,14 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .gap_2()
                             .rounded(px(RADIUS_MEDIUM))
                             .cursor_pointer()
-                            .bg(rgb(0xf7f7f8))
+                            .bg(rgb(palette.surface_subtle))
                             .border_1()
-                            .border_color(rgb(0xd5d7db))
+                            .border_color(rgb(palette.border_strong))
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
-                            .hover(|style| style.bg(rgb(0xffffff)))
-                            .active(|style| style.bg(rgb(0xdfe1e5)))
+                            .text_color(rgb(palette.text))
+                            .hover(move |style| style.bg(rgb(palette.surface)))
+                            .active(move |style| style.bg(rgb(palette.surface_pressed)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.page = WorkspacePage::Chat;
                                 cx.notify();
@@ -2310,7 +2983,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .pb_2()
                             .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child("SETTINGS"),
                     )
                     .child(
@@ -2324,12 +2997,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .gap_2()
                             .rounded(px(RADIUS_MEDIUM))
                             .cursor_pointer()
-                            .bg(rgb(SETTINGS_SELECTION))
+                            .bg(rgb(palette.settings_selection))
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(SURFACE))
-                            .hover(|style| style.bg(rgb(0x168bf9)))
-                            .active(|style| style.bg(rgb(0x006edc)))
+                            .text_color(rgb(0xffffff))
+                            .hover(move |style| style.bg(rgb(palette.blue_hover)))
+                            .active(move |style| style.bg(rgb(palette.blue_active)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_notice = None;
                                 cx.notify();
@@ -2353,8 +3026,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             .items_center()
                             .justify_center()
                             .border_b_1()
-                            .border_color(rgb(0xdedee1))
-                            .bg(rgb(0xf8f8f9))
+                            .border_color(rgb(palette.settings_separator))
+                            .bg(rgb(palette.surface))
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Providers"),
@@ -2389,7 +3062,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .child(
                                         div()
                                             .text_size(px(TYPE_UI))
-                                            .text_color(rgb(MUTED))
+                                            .text_color(rgb(palette.muted))
                                             .child("Choose where Disco gets its models and credentials."),
                                     ),
                             )
@@ -2450,7 +3123,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
 }
 
 impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
         let turns = self
             .active_task()
             .map_or_else(Vec::new, |task| task.turns().to_vec());
@@ -2485,16 +3159,19 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
             .map(|model| model.reasoning_efforts.clone())
             .unwrap_or_default();
         let selected_effort = self.selected_effort.clone();
+        let sidebar_focus_visible = self.sidebar_focus_handle.is_focused(window);
+        let composer_appearance = palette.composer;
+        let composer_focused = self.composer.read(cx).focus_handle(cx).is_focused(window);
 
         div()
             .size_full()
             .relative()
             .flex()
-            .bg(rgb(CANVAS))
+            .bg(rgb(palette.canvas))
             .font_family("-apple-system")
             .text_size(px(TYPE_UI))
-            .text_color(rgb(TEXT))
-            .child(self.sidebar(cx))
+            .text_color(rgb(palette.text))
+            .child(self.sidebar(sidebar_focus_visible, cx))
             .child(
                 div()
                     .relative()
@@ -2513,8 +3190,8 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                             .justify_center()
                             .gap_2()
                             .border_b_1()
-                            .border_color(rgb(BORDER))
-                            .bg(rgb(SURFACE))
+                            .border_color(rgb(palette.border))
+                            .bg(rgb(palette.surface))
                             .child(
                                 div()
                                     .max_w(px(520.))
@@ -2531,16 +3208,16 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                     .items_center()
                                     .gap(px(6.))
                                     .rounded_full()
-                                    .bg(rgb(SURFACE_SUBTLE))
+                                    .bg(rgb(palette.surface_subtle))
                                     .border_1()
-                                    .border_color(rgb(BORDER))
+                                    .border_color(rgb(palette.border))
                                     .text_size(px(TYPE_CAPTION))
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(palette.muted))
                                     .child(
                                         div()
                                             .size(px(6.))
                                             .rounded_full()
-                                            .bg(rgb(self.status_color())),
+                                            .bg(rgb(self.status_color(palette))),
                                     )
                                     .child(self.status_label()),
                             ),
@@ -2579,7 +3256,7 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                 .child(
                                                     div()
                                                         .text_size(px(TYPE_UI))
-                                                        .text_color(rgb(MUTED))
+                                                        .text_color(rgb(palette.muted))
                                                         .child(if self.runtime.is_some() {
                                                             "Messages, commands, and file changes come from codex app-server."
                                                         } else {
@@ -2598,37 +3275,46 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                         .flex()
                                         .flex_col()
                                         .gap_6()
-                                        .children(turns.into_iter().map(Self::conversation_turn)),
+                                        .children(
+                                            turns.into_iter().map(move |turn| {
+                                                Self::conversation_turn(turn, palette)
+                                            }),
+                                        ),
                                 )
                             }),
                     )
                     .child(
                         div()
                             .px_6()
-                            .pb_5()
-                            .pt_1()
+                            .pb_4()
+                            .pt_2()
                             .child(
                                 div()
                                     .relative()
                                     .w_full()
                                     .max_w(px(CHAT_COLUMN_WIDTH))
-                                    .h(px(104.))
+                                    .h(px(100.))
                                     .mx_auto()
                                     .child(
                                         div()
                                             .size_full()
-                                            .p_3()
+                                            .p_2()
                                             .flex()
                                             .flex_col()
                                             .justify_between()
                                             .rounded(px(RADIUS_LARGE))
-                                            .bg(rgb(0xf9fafb))
+                                            .bg(rgb(composer_appearance.surface))
                                             .border_1()
-                                            .border_color(rgb(BORDER_STRONG))
-                                            .shadow_md()
+                                            .border_color(rgb(if composer_focused {
+                                                composer_appearance.focus_border
+                                            } else {
+                                                composer_appearance.border
+                                            }))
+                                            .shadow_sm()
                                             .child(
                                                 div()
                                                     .min_w(px(0.))
+                                                    .px_1()
                                                     .child(self.composer.clone()),
                                             )
                                             .child(
@@ -2644,16 +3330,23 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                             .child(
                                                                 div()
                                                                     .id("model-menu-trigger")
-                                                                    .h(px(32.))
+                                                                    .h(px(28.))
+                                                                    .max_w(px(240.))
                                                                     .px_2()
                                                                     .flex()
                                                                     .items_center()
                                                                     .gap(px(6.))
                                                                     .rounded(px(RADIUS_SMALL))
-                                                                    .bg(rgb(0xeff1f4))
+                                                                    .bg(rgb(composer_appearance.control))
+                                                                    .border_1()
+                                                                    .border_color(rgb(composer_appearance.control_border))
                                                                     .cursor_pointer()
-                                                                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                                                                    .active(|style| style.bg(rgb(0xdde3eb)))
+                                                                    .hover(move |style| {
+                                                                        style.bg(rgb(composer_appearance.control_hover))
+                                                                    })
+                                                                    .active(move |style| {
+                                                                        style.bg(rgb(composer_appearance.control_pressed))
+                                                                    })
                                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                                         this.model_menu_open = !this.model_menu_open;
                                                                         this.model_menu_provider = this.selected_chat_provider;
@@ -2662,13 +3355,16 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                                     }))
                                                                     .child(
                                                                         div()
-                                                                            .size(px(18.))
+                                                                            .size(px(16.))
+                                                                            .flex_shrink_0()
                                                                             .rounded(px(5.))
                                                                             .overflow_hidden()
                                                                             .child(img(selected_chat_provider.icon()).size_full()),
                                                                     )
                                                                     .child(
                                                                         div()
+                                                                            .min_w(px(0.))
+                                                                            .truncate()
                                                                             .text_size(px(TYPE_UI))
                                                                             .font_weight(FontWeight::MEDIUM)
                                                                             .child(selected_model_name),
@@ -2690,16 +3386,22 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                             .child(
                                                                 div()
                                                                     .id("thinking-menu-trigger")
-                                                                    .h(px(32.))
+                                                                    .h(px(28.))
                                                                     .px_2()
                                                                     .flex()
                                                                     .items_center()
                                                                     .gap(px(6.))
                                                                     .rounded(px(RADIUS_SMALL))
-                                                                    .bg(rgb(0xeff1f4))
+                                                                    .bg(rgb(composer_appearance.control))
+                                                                    .border_1()
+                                                                    .border_color(rgb(composer_appearance.control_border))
                                                                     .cursor_pointer()
-                                                                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                                                                    .active(|style| style.bg(rgb(0xdde3eb)))
+                                                                    .hover(move |style| {
+                                                                        style.bg(rgb(composer_appearance.control_hover))
+                                                                    })
+                                                                    .active(move |style| {
+                                                                        style.bg(rgb(composer_appearance.control_pressed))
+                                                                    })
                                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                                         this.thinking_menu_open = !this.thinking_menu_open;
                                                                         this.model_menu_open = false;
@@ -2729,7 +3431,7 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                     .child(
                                                         div()
                                                             .id("composer-action")
-                                                            .size(px(32.))
+                                                            .size(px(28.))
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
@@ -2737,38 +3439,29 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                             .bg(rgb(if is_working {
                                                                 0x2c2c2e
                                                             } else if can_submit {
-                                                                BLUE
+                                                                palette.blue
                                                             } else {
-                                                                0xe5e5ea
+                                                                composer_appearance.action_disabled
                                                             }))
-                                                            .cursor_pointer()
-                                                            .hover(move |style| {
-                                                                style.bg(rgb(if is_working {
-                                                                    if action_enabled {
-                                                                        0x3a3a3c
-                                                                    } else {
-                                                                        0x2c2c2e
-                                                                    }
-                                                                } else if can_submit {
-                                                                    BLUE_HOVER
-                                                                } else {
-                                                                    0xe5e5ea
-                                                                }))
-                                                            })
-                                                            .active(move |style| {
-                                                                style
-                                                                    .bg(rgb(if is_working {
-                                                                        if action_enabled {
-                                                                            0x48484a
+                                                            .when(action_enabled, |button| {
+                                                                button
+                                                                    .cursor_pointer()
+                                                                    .hover(move |style| {
+                                                                        style.bg(rgb(if is_working {
+                                                                            0x3a3a3c
                                                                         } else {
-                                                                            0x2c2c2e
-                                                                        }
-                                                                    } else if can_submit {
-                                                                        BLUE_ACTIVE
-                                                                    } else {
-                                                                        0xe5e5ea
-                                                                    }))
-                                                                    .opacity(0.82)
+                                                                            palette.blue_hover
+                                                                        }))
+                                                                    })
+                                                                    .active(move |style| {
+                                                                        style
+                                                                            .bg(rgb(if is_working {
+                                                                                0x48484a
+                                                                            } else {
+                                                                                palette.blue_active
+                                                                            }))
+                                                                            .opacity(0.82)
+                                                                    })
                                                             })
                                                             .on_click(cx.listener(|this, _, _, cx| {
                                                                 if !this.run_in_progress()
@@ -2808,14 +3501,14 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                         composer.child(
                                             div()
                                                 .absolute()
-                                                .bottom(px(46.))
+                                                .bottom(px(42.))
                                                 .left(px(164.))
                                                 .w(px(220.))
                                                 .p_2()
                                                 .rounded(px(RADIUS_LARGE))
-                                                .bg(rgb(SURFACE))
+                                                .bg(rgb(palette.surface))
                                                 .border_1()
-                                                .border_color(rgb(BORDER_STRONG))
+                                                .border_color(rgb(palette.border_strong))
                                                 .shadow_lg()
                                                 .on_mouse_down_out(cx.listener(
                                                     |this, _, _, cx| {
@@ -2835,9 +3528,17 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                         .justify_between()
                                                         .rounded(px(RADIUS_MEDIUM))
                                                         .cursor_pointer()
-                                                        .bg(rgb(if selected { BLUE_TINT } else { SURFACE }))
-                                                        .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                                                        .active(|style| style.bg(rgb(0xdde3eb)))
+                                                        .bg(rgb(if selected {
+                                                            palette.blue_tint
+                                                        } else {
+                                                            palette.surface
+                                                        }))
+                                                        .hover(move |style| {
+                                                            style.bg(rgb(palette.surface_hover))
+                                                        })
+                                                        .active(move |style| {
+                                                            style.bg(rgb(palette.surface_pressed))
+                                                        })
                                                         .on_click(cx.listener(move |this, _, _, cx| {
                                                             this.select_effort(value.clone());
                                                             cx.notify();
@@ -2853,17 +3554,28 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
             .when(self.page == WorkspacePage::Settings, |root| {
                 root.child(self.settings_page(cx))
             })
+            .when_some(self.project_context_menu, |root, menu| {
+                root.child(
+                    deferred(
+                        anchored()
+                            .position(menu.position)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(self.render_project_context_menu(menu, cx)),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatConversation, ComposerInput, DiscoWorkspace};
+    use super::{AppAppearance, ChatConversation, ComposerInput, DiscoWorkspace};
     use disco_domain::{
         EngineKind, Project, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
     };
     use disco_kernel::{EventJournal, MemoryJournal, ProjectStore, RunProjection};
-    use gpui::{AppContext, TestAppContext};
+    use gpui::{AppContext, TestAppContext, WindowAppearance};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -2874,6 +3586,19 @@ mod tests {
             )),
             "disco"
         );
+    }
+
+    #[test]
+    fn macos_window_appearance_selects_the_matching_palette() {
+        let light = AppAppearance::for_window(WindowAppearance::VibrantLight);
+        let dark = AppAppearance::for_window(WindowAppearance::VibrantDark);
+
+        assert_eq!(light.canvas, 0xffffff);
+        assert_eq!(light.blue, 0x007aff);
+        assert_eq!(dark.canvas, 0x1c1c1e);
+        assert_eq!(dark.blue, 0x0a84ff);
+        assert_ne!(light.sidebar.background, dark.sidebar.background);
+        assert_ne!(light.composer.surface, dark.composer.surface);
     }
 
     #[test]
@@ -2903,6 +3628,22 @@ mod tests {
         assert_eq!(
             DiscoWorkspace::<disco_kernel::MemoryJournal>::model_count_label(6),
             "6 models"
+        );
+    }
+
+    #[test]
+    fn token_counts_use_readable_grouping() {
+        assert_eq!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::token_count_label(14),
+            "14"
+        );
+        assert_eq!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::token_count_label(18_051),
+            "18,051"
+        );
+        assert_eq!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::token_count_label(1_234_567),
+            "1,234,567"
         );
     }
 
@@ -3088,6 +3829,48 @@ mod tests {
                 task_count
             );
             assert_eq!(composer.read(cx).content(), "keep this");
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_navigation_follows_the_visible_project_hierarchy(cx: &mut TestAppContext) {
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer,
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    cx,
+                )
+            })
+        });
+
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, cx| {
+                let first_session = workspace.active_session_id;
+                let project_id = workspace.active_project_id;
+                workspace.new_task_for_project(project_id, cx);
+                let second_session = workspace.active_session_id;
+
+                workspace.move_sidebar_selection(1, cx);
+                assert_eq!(workspace.active_session_id, first_session);
+                assert_eq!(
+                    workspace.sidebar_focused_item,
+                    super::SidebarItem::Task(project_id, first_session)
+                );
+
+                workspace.move_sidebar_selection(-1, cx);
+                assert_eq!(workspace.active_session_id, second_session);
+                workspace.move_sidebar_selection(-1, cx);
+                assert_eq!(workspace.active_session_id, second_session);
+                assert_eq!(
+                    workspace.sidebar_focused_item,
+                    super::SidebarItem::Project(project_id)
+                );
+            });
         });
     }
 }

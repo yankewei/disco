@@ -6,7 +6,8 @@ use gpui::{
     InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
     Point, Render, ShapedLine, SharedString, Style, Styled, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, div, fill, hsla, point, px, relative, rgba, size,
+    UnderlineStyle, Window, WindowAppearance, actions, div, fill, hsla, point, px, relative, rgba,
+    size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -68,7 +69,7 @@ impl ComposerInput {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
-            placeholder: "Ask Codex to build, fix, or explain…".into(),
+            placeholder: "Ask Codex to work in this project…".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -520,8 +521,19 @@ impl Element for ComposerTextElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
+        let dark = matches!(
+            cx.window_appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
         let (display_text, color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(220. / 360., 0.05, 0.55, 1.))
+            (
+                input.placeholder.clone(),
+                if dark {
+                    hsla(220. / 360., 0.04, 0.66, 1.)
+                } else {
+                    hsla(220. / 360., 0.05, 0.55, 1.)
+                },
+            )
         } else if input.secure {
             ("*".repeat(content.len()).into(), style.color)
         } else {
@@ -574,7 +586,11 @@ impl Element for ComposerTextElement {
                         point(bounds.left() + cursor_x, bounds.top()),
                         size(px(2.), bounds.size.height),
                     ),
-                    hsla(218. / 360., 0.91, 0.58, 1.),
+                    if dark {
+                        hsla(211. / 360., 0.95, 0.56, 1.)
+                    } else {
+                        hsla(218. / 360., 0.91, 0.58, 1.)
+                    },
                 )),
             )
         } else {
@@ -590,7 +606,11 @@ impl Element for ComposerTextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3478f638),
+                    if dark {
+                        rgba(0x0a84ff59)
+                    } else {
+                        rgba(0x3478f638)
+                    },
                 )),
                 None,
             )
