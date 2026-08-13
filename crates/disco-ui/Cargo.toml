@@ -15,5 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 unicode-segmentation = "1.13.3"
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

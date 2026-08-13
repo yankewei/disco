@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 macro_rules! identifier {
@@ -41,6 +42,14 @@ macro_rules! identifier {
                 self.0.fmt(formatter)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self)
+            }
+        }
     };
 }
 
@@ -48,6 +57,29 @@ identifier!(EventId);
 identifier!(ProjectId);
 identifier!(RunId);
 identifier!(SessionId);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    pub root_path: PathBuf,
+    pub created_at: DateTime<Utc>,
+    pub last_opened_at: DateTime<Utc>,
+}
+
+impl Project {
+    #[must_use]
+    pub fn new(name: impl Into<String>, root_path: PathBuf) -> Self {
+        let now = Utc::now();
+        Self {
+            id: ProjectId::new(),
+            name: name.into(),
+            root_path,
+            created_at: now,
+            last_opened_at: now,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,10 +144,15 @@ pub enum ApprovalDecision {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RunEventPayload {
     RunStarted {
+        #[serde(default)]
+        project_id: Option<ProjectId>,
         session_id: SessionId,
         engine: EngineKind,
         workspace: Option<String>,
         prompt: String,
+    },
+    CodexThreadAttached {
+        thread_id: String,
     },
     AssistantContentDelta {
         text: String,
@@ -204,6 +241,7 @@ mod tests {
             RunId::new(),
             0,
             RunEventPayload::RunStarted {
+                project_id: Some(ProjectId::new()),
                 session_id: SessionId::new(),
                 engine: EngineKind::Rig,
                 workspace: Some("/tmp/disco".into()),

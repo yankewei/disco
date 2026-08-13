@@ -115,5 +115,17 @@ mod tests {
                 .expect("the stop icon should be readable")
                 .is_some()
         );
+        assert!(
+            assets
+                .load("icons/ui/folder.svg")
+                .expect("the folder icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/chevron-right.svg")
+                .expect("the right chevron icon should be readable")
+                .is_some()
+        );
     }
 }

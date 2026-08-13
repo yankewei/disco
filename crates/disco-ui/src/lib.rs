@@ -5,18 +5,20 @@ mod settings;
 
 pub use composer_input::{ComposerInput, init as init_composer_input};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use composer_input::ComposerSubmitted;
 use disco_codex_engine::{CodexModel, CodexRuntime, CodexTurnResult};
 use disco_domain::{
-    EngineKind, RunEventPayload, RunId, RunStatus, SessionId, TokenUsage, ToolCall,
+    EngineKind, Project, ProjectId, RunEventPayload, RunId, RunStatus, SessionId, TokenUsage,
+    ToolCall,
 };
-use disco_kernel::{ActivityItem, EventJournal, Kernel, RunProjection};
+use disco_kernel::{ActivityItem, EventJournal, Kernel, ProjectStore, RunProjection};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
+    AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, PathPromptOptions, Render, StatefulInteractiveElement, Styled, Window, div, img,
+    px, rgb,
 };
 use serde_json::json;
 use settings::{CodexUiSettings, save_api_key};
@@ -26,17 +28,19 @@ const CODEX_ICON_ASSET: &str = "icons/providers/codex.png";
 const DEEPSEEK_ICON_ASSET: &str = "icons/providers/deepseek.svg";
 const KIMI_ICON_ASSET: &str = "icons/providers/kimi-code.png";
 const CHEVRON_DOWN_ASSET: &str = "icons/ui/chevron-down.svg";
+const CHEVRON_RIGHT_ASSET: &str = "icons/ui/chevron-right.svg";
 const CHEVRON_UP_ASSET: &str = "icons/ui/chevron-up.svg";
 const SETTINGS_ICON_ASSET: &str = "icons/ui/settings.svg";
 const BACK_ICON_ASSET: &str = "icons/ui/back.svg";
 const PROVIDERS_ICON_ASSET: &str = "icons/ui/providers.svg";
 const SEND_ICON_ASSET: &str = "icons/ui/send.svg";
 const STOP_ICON_ASSET: &str = "icons/ui/stop.svg";
+const FOLDER_ICON_ASSET: &str = "icons/ui/folder.svg";
 const CANVAS: u32 = 0xffffff;
-const SIDEBAR: u32 = 0xf3f4f6;
+const SIDEBAR: u32 = 0xf1f1f3;
 const SURFACE: u32 = 0xffffff;
 const SURFACE_SUBTLE: u32 = 0xf5f6f8;
-const SURFACE_HOVER: u32 = 0xe9ebef;
+const SURFACE_HOVER: u32 = 0xe7e8eb;
 const BORDER: u32 = 0xe1e3e7;
 const BORDER_STRONG: u32 = 0xd3d6dc;
 const TEXT: u32 = 0x222327;
@@ -109,9 +113,11 @@ struct ProviderSummary {
     status: &'static str,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ChatConversation {
     session_id: SessionId,
+    codex_thread_id: Option<String>,
+    draft: String,
     turns: Vec<RunProjection>,
 }
 
@@ -119,6 +125,17 @@ impl ChatConversation {
     fn new() -> Self {
         Self {
             session_id: SessionId::new(),
+            codex_thread_id: None,
+            draft: String::new(),
+            turns: Vec::new(),
+        }
+    }
+
+    fn restored(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            codex_thread_id: None,
+            draft: String::new(),
             turns: Vec::new(),
         }
     }
@@ -131,11 +148,17 @@ impl ChatConversation {
         {
             return false;
         }
+        if let Some(thread_id) = &projection.codex_thread_id {
+            self.codex_thread_id = Some(thread_id.clone());
+        }
         self.turns.push(projection);
         true
     }
 
     fn update(&mut self, projection: RunProjection) {
+        if let Some(thread_id) = &projection.codex_thread_id {
+            self.codex_thread_id = Some(thread_id.clone());
+        }
         if let Some(turn) = self
             .turns
             .iter_mut()
@@ -162,14 +185,22 @@ impl ChatConversation {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ProjectState {
+    project: Project,
+    expanded: bool,
+    selected_session_id: Option<SessionId>,
+    tasks: Vec<ChatConversation>,
+}
+
 pub type CodexConnection = Result<(CodexRuntime, Vec<CodexModel>), String>;
 
 pub struct DiscoWorkspace<J: EventJournal> {
     kernel: Kernel<J>,
-    conversation: ChatConversation,
+    projects: Vec<ProjectState>,
+    active_project_id: ProjectId,
+    active_session_id: SessionId,
     composer: Entity<ComposerInput>,
-    workspace_path: PathBuf,
-    workspace_label: String,
     page: WorkspacePage,
     settings_path: PathBuf,
     settings: CodexUiSettings,
@@ -178,7 +209,6 @@ pub struct DiscoWorkspace<J: EventJournal> {
     models: Vec<CodexModel>,
     selected_model_id: Option<String>,
     selected_effort: String,
-    codex_thread_id: Option<String>,
     model_menu_open: bool,
     model_menu_provider: ProviderKind,
     selected_chat_provider: ProviderKind,
@@ -191,10 +221,11 @@ pub struct DiscoWorkspace<J: EventJournal> {
     deepseek_model_input: Entity<ComposerInput>,
     deepseek_api_key_input: Entity<ComposerInput>,
     settings_notice: Option<(bool, String)>,
+    project_notice: Option<String>,
     stop_requested: bool,
 }
 
-impl<J: EventJournal> DiscoWorkspace<J> {
+impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     pub fn new(
         journal: J,
         composer: Entity<ComposerInput>,
@@ -209,6 +240,118 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         })
         .detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+
+        let kernel = Kernel::new(journal);
+        let initial_project = Project::new(Self::project_name(&workspace_path), workspace_path);
+        let (current_project, mut project_notice) =
+            match kernel.register_project(initial_project.clone()) {
+                Ok(project) => (project, None),
+                Err(error) => (initial_project, Some(error.to_string())),
+            };
+        let mut stored_projects = kernel
+            .list_projects()
+            .unwrap_or_else(|_| vec![current_project.clone()]);
+        if !stored_projects
+            .iter()
+            .any(|project| project.id == current_project.id)
+        {
+            stored_projects.insert(0, current_project.clone());
+        }
+        let active_project_id = current_project.id;
+        let mut projects = stored_projects
+            .into_iter()
+            .map(|project| {
+                let is_current = project.id == active_project_id;
+                ProjectState {
+                    project,
+                    expanded: is_current,
+                    selected_session_id: None,
+                    tasks: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut restored_runs = match kernel.restore_all() {
+            Ok(runs) => runs,
+            Err(error) => {
+                project_notice.get_or_insert_with(|| error.to_string());
+                Vec::new()
+            }
+        };
+        for run in &mut restored_runs {
+            if !run.status.is_terminal()
+                && let Ok(interrupted) = kernel.record(
+                    run.run_id,
+                    RunEventPayload::RunFailed {
+                        code: "app_restarted".into(),
+                        message: "This task was interrupted when Disco closed.".into(),
+                        retryable: true,
+                    },
+                )
+            {
+                *run = interrupted;
+            }
+        }
+        for run in restored_runs {
+            let Some(session_id) = run.session_id else {
+                continue;
+            };
+            let project_index = run
+                .project_id
+                .and_then(|project_id| {
+                    projects
+                        .iter()
+                        .position(|project| project.project.id == project_id)
+                })
+                .or_else(|| {
+                    let workspace = Path::new(run.workspace.as_deref()?);
+                    projects
+                        .iter()
+                        .position(|project| project.project.root_path == workspace)
+                });
+            let Some(project_index) = project_index else {
+                continue;
+            };
+            let project = &mut projects[project_index];
+            if let Some(task) = project
+                .tasks
+                .iter_mut()
+                .find(|task| task.session_id == session_id)
+            {
+                task.begin(run);
+            } else {
+                let mut task = ChatConversation::restored(session_id);
+                task.begin(run);
+                project.tasks.push(task);
+            }
+        }
+        for project in &mut projects {
+            project
+                .tasks
+                .sort_by_key(|task| std::cmp::Reverse(task.turns.last().map(|turn| turn.run_id)));
+            project.selected_session_id = project.tasks.first().map(|task| task.session_id);
+        }
+        let active_session_id = if let Some(project) = projects
+            .iter_mut()
+            .find(|project| project.project.id == active_project_id)
+        {
+            if project.tasks.is_empty() {
+                project.tasks.push(ChatConversation::new());
+            }
+            let session_id = project.tasks[0].session_id;
+            project.selected_session_id = Some(session_id);
+            session_id
+        } else {
+            let task = ChatConversation::new();
+            let session_id = task.session_id;
+            projects.push(ProjectState {
+                project: current_project,
+                expanded: true,
+                selected_session_id: Some(session_id),
+                tasks: vec![task],
+            });
+            session_id
+        };
 
         let saved = CodexUiSettings::load(&settings_path).unwrap_or_default();
         let kimi_endpoint_input = cx.new(|cx| {
@@ -271,17 +414,12 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             .and_then(|selected| models.iter().find(|model| model.id == selected))
             .map(|model| model.default_reasoning_effort.clone())
             .unwrap_or_else(|| "medium".into());
-        let workspace_label = workspace_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Local workspace".into());
-
         Self {
-            kernel: Kernel::new(journal),
-            conversation: ChatConversation::new(),
+            kernel,
+            projects,
+            active_project_id,
+            active_session_id,
             composer,
-            workspace_path,
-            workspace_label,
             page: WorkspacePage::Chat,
             settings_path,
             settings: saved,
@@ -290,7 +428,6 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             models,
             selected_model_id,
             selected_effort,
-            codex_thread_id: None,
             model_menu_open: false,
             model_menu_provider: ProviderKind::Codex,
             selected_chat_provider: ProviderKind::Codex,
@@ -303,8 +440,62 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             deepseek_model_input,
             deepseek_api_key_input,
             settings_notice: None,
+            project_notice,
             stop_requested: false,
         }
+    }
+
+    fn project_name(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+
+    fn active_project(&self) -> Option<&ProjectState> {
+        self.projects
+            .iter()
+            .find(|project| project.project.id == self.active_project_id)
+    }
+
+    fn active_project_mut(&mut self) -> Option<&mut ProjectState> {
+        self.projects
+            .iter_mut()
+            .find(|project| project.project.id == self.active_project_id)
+    }
+
+    fn active_task(&self) -> Option<&ChatConversation> {
+        self.active_project()?
+            .tasks
+            .iter()
+            .find(|task| task.session_id == self.active_session_id)
+    }
+
+    fn active_task_mut(&mut self) -> Option<&mut ChatConversation> {
+        let active_session_id = self.active_session_id;
+        self.active_project_mut()?
+            .tasks
+            .iter_mut()
+            .find(|task| task.session_id == active_session_id)
+    }
+
+    fn task_for_run_mut(&mut self, run_id: RunId) -> Option<&mut ChatConversation> {
+        self.projects
+            .iter_mut()
+            .flat_map(|project| project.tasks.iter_mut())
+            .find(|task| task.turns.iter().any(|turn| turn.run_id == run_id))
+    }
+
+    fn run_in_progress(&self) -> bool {
+        // Disco intentionally owns one CodexRuntime/app-server turn at a time.
+        // Keep navigation locked across every project until that turn is terminal.
+        self.projects
+            .iter()
+            .flat_map(|project| &project.tasks)
+            .any(|task| {
+                task.current()
+                    .is_some_and(|turn| !turn.status.is_terminal())
+            })
     }
 
     fn selected_model(&self) -> Option<&CodexModel> {
@@ -414,17 +605,28 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     }
 
     fn start_run(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if !self.conversation.can_begin_turn() {
+        if self.run_in_progress() {
             return;
         }
+        let Some(project) = self.active_project() else {
+            return;
+        };
+        let project_id = project.project.id;
+        let workspace = project.project.root_path.clone();
+        let Some(task) = self.active_task() else {
+            return;
+        };
+        let session_id = task.session_id;
+        let thread_id = task.codex_thread_id.clone();
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         let run_id = RunId::new();
         let started = self.kernel.start_run(
             run_id,
-            self.conversation.session_id,
+            project_id,
+            session_id,
             EngineKind::Codex,
-            Some(self.workspace_path.to_string_lossy().into_owned()),
+            Some(workspace.to_string_lossy().into_owned()),
             prompt.clone(),
         );
         let Ok(projection) = started else {
@@ -432,10 +634,15 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             projection.prompt = Some(prompt);
             projection.status = RunStatus::Failed;
             projection.failure_message = Some("Could not persist the Codex run.".into());
-            self.conversation.begin(projection);
+            if let Some(task) = self.active_task_mut() {
+                task.begin(projection);
+            }
             return;
         };
-        if !self.conversation.begin(projection) {
+        if self
+            .active_task_mut()
+            .is_none_or(|task| !task.begin(projection))
+        {
             return;
         }
 
@@ -459,12 +666,10 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             );
             return;
         };
-        let thread_id = self.codex_thread_id.clone();
-        let workspace = self.workspace_path.clone();
         let effort = self.selected_effort.clone();
         let prompt = self
-            .conversation
-            .current()
+            .active_task()
+            .and_then(ChatConversation::current)
             .and_then(|turn| turn.prompt.clone())
             .unwrap_or_default();
         let request = cx.background_executor().spawn(async move {
@@ -495,7 +700,12 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         self.stop_requested = false;
         match result {
             Ok(result) => {
-                self.codex_thread_id = Some(result.thread_id);
+                self.record(
+                    run_id,
+                    RunEventPayload::CodexThreadAttached {
+                        thread_id: result.thread_id,
+                    },
+                );
                 for activity in result.activities {
                     let detail = activity.detail.clone();
                     let call = ToolCall {
@@ -536,8 +746,10 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     }
 
     fn record(&mut self, run_id: RunId, payload: RunEventPayload) {
-        if let Ok(projection) = self.kernel.record(run_id, payload) {
-            self.conversation.update(projection);
+        if let Ok(projection) = self.kernel.record(run_id, payload)
+            && let Some(task) = self.task_for_run_mut(run_id)
+        {
+            task.update(projection);
         }
     }
 
@@ -553,13 +765,16 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     }
 
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
-        if !self.conversation.can_begin_turn() {
+        if self.run_in_progress() || self.active_task().is_none_or(|task| !task.can_begin_turn()) {
             return;
         }
         let prompt = self
             .composer
             .update(cx, |composer, cx| composer.take_content(cx));
         if let Some(prompt) = prompt {
+            if let Some(task) = self.active_task_mut() {
+                task.draft.clear();
+            }
             self.start_run(prompt, cx);
         }
     }
@@ -567,8 +782,8 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     fn stop_run(&mut self) {
         if self.stop_requested
             || self
-                .conversation
-                .current()
+                .active_task()
+                .and_then(ChatConversation::current)
                 .is_none_or(|turn| turn.status.is_terminal())
         {
             return;
@@ -589,17 +804,189 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         }
     }
 
-    fn new_task(&mut self) {
-        self.conversation = ChatConversation::new();
-        self.codex_thread_id = None;
+    fn new_task_for_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        if self.run_in_progress() {
+            return;
+        }
+        let Some(project_index) = self
+            .projects
+            .iter()
+            .position(|project| project.project.id == project_id)
+        else {
+            return;
+        };
+        let current_draft = self.composer.read(cx).content();
+        if let Some(task) = self.active_task_mut() {
+            task.draft = current_draft;
+        }
+        let task = ChatConversation::new();
+        let session_id = task.session_id;
+        let project = &mut self.projects[project_index];
+        project.expanded = true;
+        project.selected_session_id = Some(session_id);
+        project.tasks.insert(0, task);
+        self.active_project_id = project_id;
+        self.active_session_id = session_id;
+        self.composer
+            .update(cx, |composer, cx| composer.set_content("", cx));
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         self.page = WorkspacePage::Chat;
         self.stop_requested = false;
     }
 
+    fn toggle_project(&mut self, project_id: ProjectId) {
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.project.id == project_id)
+        {
+            project.expanded = !project.expanded;
+        }
+    }
+
+    fn select_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        if self.run_in_progress() && project_id != self.active_project_id {
+            return;
+        }
+        if project_id == self.active_project_id {
+            if let Some(project) = self.active_project_mut() {
+                project.expanded = true;
+            }
+            return;
+        }
+        let existing_session_id = self
+            .projects
+            .iter()
+            .find(|project| project.project.id == project_id)
+            .and_then(|project| {
+                project
+                    .selected_session_id
+                    .or_else(|| project.tasks.first().map(|task| task.session_id))
+            });
+        if let Some(session_id) = existing_session_id {
+            self.select_task(project_id, session_id, cx);
+        } else {
+            self.new_task_for_project(project_id, cx);
+        }
+    }
+
+    fn select_task(
+        &mut self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.run_in_progress() && session_id != self.active_session_id {
+            return;
+        }
+        let Some(project_index) = self
+            .projects
+            .iter()
+            .position(|project| project.project.id == project_id)
+        else {
+            return;
+        };
+        let Some(task_index) = self.projects[project_index]
+            .tasks
+            .iter()
+            .position(|task| task.session_id == session_id)
+        else {
+            return;
+        };
+        if project_id == self.active_project_id && session_id == self.active_session_id {
+            self.projects[project_index].expanded = true;
+            self.projects[project_index].selected_session_id = Some(session_id);
+            return;
+        }
+        let current_draft = self.composer.read(cx).content();
+        if let Some(task) = self.active_task_mut() {
+            task.draft = current_draft;
+        }
+        let draft = self.projects[project_index].tasks[task_index].draft.clone();
+        self.projects[project_index].expanded = true;
+        self.projects[project_index].selected_session_id = Some(session_id);
+        self.active_project_id = project_id;
+        self.active_session_id = session_id;
+        self.page = WorkspacePage::Chat;
+        self.model_menu_open = false;
+        self.thinking_menu_open = false;
+        self.composer
+            .update(cx, |composer, cx| composer.set_content(draft, cx));
+    }
+
+    fn open_project_picker(&mut self, cx: &mut Context<Self>) {
+        if self.run_in_progress() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Project".into()),
+        });
+        cx.spawn(async move |workspace, cx| {
+            let selected = receiver.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    match selected {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                workspace.register_project_path(path, cx);
+                            }
+                        }
+                        Ok(Err(error)) => workspace.project_notice = Some(error.to_string()),
+                        Err(error) => workspace.project_notice = Some(error.to_string()),
+                        Ok(Ok(None)) => {}
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn register_project_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.run_in_progress() {
+            self.project_notice = Some("Finish the running task before opening a project.".into());
+            return;
+        }
+        let root_path = path.canonicalize().unwrap_or(path);
+        if !root_path.is_dir() {
+            self.project_notice = Some("The selected project folder is unavailable.".into());
+            return;
+        }
+        let candidate = Project::new(Self::project_name(&root_path), root_path);
+        match self.kernel.register_project(candidate) {
+            Ok(project) => {
+                self.project_notice = None;
+                let existing_project = self
+                    .projects
+                    .iter_mut()
+                    .find(|existing| existing.project.id == project.id);
+                if let Some(existing) = existing_project {
+                    existing.project = project.clone();
+                    existing.expanded = true;
+                    self.select_project(project.id, cx);
+                } else {
+                    self.projects.insert(
+                        0,
+                        ProjectState {
+                            project: project.clone(),
+                            expanded: true,
+                            selected_session_id: None,
+                            tasks: Vec::new(),
+                        },
+                    );
+                    self.new_task_for_project(project.id, cx);
+                }
+            }
+            Err(error) => self.project_notice = Some(error.to_string()),
+        }
+    }
+
     fn status_label(&self) -> &'static str {
-        let Some(current) = self.conversation.current() else {
+        let Some(current) = self.active_task().and_then(ChatConversation::current) else {
             return if self.runtime.is_some() {
                 "Codex ready"
             } else {
@@ -619,7 +1006,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     }
 
     fn status_color(&self) -> u32 {
-        let Some(current) = self.conversation.current() else {
+        let Some(current) = self.active_task().and_then(ChatConversation::current) else {
             return if self.runtime.is_some() { GREEN } else { RED };
         };
         match current.status {
@@ -780,10 +1167,157 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             )
     }
 
+    fn project_sidebar_group(&self, project: ProjectState, cx: &mut Context<Self>) -> gpui::Div {
+        let project_id = project.project.id;
+        let is_active_project = project_id == self.active_project_id;
+        let project_hover_group = format!("project-row-{project_id}");
+        let task_rows = project
+            .tasks
+            .into_iter()
+            .map(|task| {
+                let session_id = task.session_id;
+                let selected = is_active_project && session_id == self.active_session_id;
+                let title = task
+                    .title_prompt()
+                    .map(Self::compact_title)
+                    .unwrap_or_else(|| "New task".into());
+                let running = task
+                    .current()
+                    .is_some_and(|turn| !turn.status.is_terminal());
+                div()
+                    .id((ElementId::from(session_id.as_uuid()), "task"))
+                    .mx_2()
+                    .h(px(30.))
+                    .pl(px(38.))
+                    .pr_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(RADIUS_SMALL))
+                    .cursor_pointer()
+                    .bg(rgb(if selected { 0xdedfe3 } else { SIDEBAR }))
+                    .hover(move |style| {
+                        style.bg(rgb(if selected { 0xd7d9de } else { SURFACE_HOVER }))
+                    })
+                    .active(|style| style.bg(rgb(0xd1d3d8)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_task(project_id, session_id, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(TYPE_UI))
+                            .font_weight(if selected {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(title),
+                    )
+                    .when(running, |row| {
+                        row.child(
+                            div()
+                                .ml_2()
+                                .size(px(7.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(BLUE)),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id((ElementId::from(project_id.as_uuid()), "project"))
+                    .group(project_hover_group.clone())
+                    .mx_2()
+                    .h(px(30.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(RADIUS_SMALL))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
+                    .active(|style| style.bg(rgb(0xd1d3d8)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_project(project_id, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id((ElementId::from(project_id.as_uuid()), "project-disclosure"))
+                            .size(px(16.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .justify_center()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_project(project_id);
+                                cx.notify();
+                            }))
+                            .child(
+                                img(if project.expanded {
+                                    CHEVRON_DOWN_ASSET
+                                } else {
+                                    CHEVRON_RIGHT_ASSET
+                                })
+                                .size(px(8.)),
+                            ),
+                    )
+                    .child(img(FOLDER_ICON_ASSET).size(px(16.)))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_grow()
+                            .truncate()
+                            .text_size(px(TYPE_UI))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(project.project.name),
+                    )
+                    .when(is_active_project, |row| {
+                        row.child(
+                            div()
+                                .id((ElementId::from(project_id.as_uuid()), "new-task"))
+                                .size(px(20.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.))
+                                .text_size(px(15.))
+                                .text_color(rgb(MUTED))
+                                .opacity(0.)
+                                .group_hover(project_hover_group, |style| style.opacity(1.))
+                                .hover(|style| style.bg(rgb(0xdfe1e5)).text_color(rgb(TEXT)))
+                                .active(|style| style.bg(rgb(0xd4d7dc)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.new_task_for_project(project_id, cx);
+                                    cx.notify();
+                                }))
+                                .child("＋"),
+                        )
+                    }),
+            )
+            .when(project.expanded, |group| group.children(task_rows))
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let prompt = self.conversation.title_prompt().unwrap_or_default();
-        let status = self.status_label();
-        let has_run = !self.conversation.turns().is_empty();
+        let projects = self.projects.clone();
+        let project_groups = projects
+            .into_iter()
+            .map(|project| self.project_sidebar_group(project, cx))
+            .collect::<Vec<_>>();
         div()
             .w(px(APP_SIDEBAR_WIDTH))
             .h_full()
@@ -796,96 +1330,61 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             .child(div().h(px(APP_SIDEBAR_TOP_INSET)))
             .child(
                 div()
-                    .id("new-task")
-                    .mx_3()
-                    .h(px(36.))
+                    .h(px(34.))
                     .px_3()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .rounded(px(RADIUS_MEDIUM))
-                    .bg(rgb(SURFACE))
-                    .border_1()
-                    .border_color(rgb(BORDER_STRONG))
-                    .shadow_xs()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(SURFACE_HOVER)))
-                    .active(|style| style.bg(rgb(0xdde3eb)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.new_task();
-                        cx.notify();
-                    }))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
                             .text_size(px(TYPE_UI))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(div().text_size(px(TYPE_TITLE)).child("＋"))
-                            .child("New Task"),
+                            .text_color(rgb(MUTED))
+                            .child("Projects"),
                     )
                     .child(
                         div()
-                            .text_size(px(TYPE_CAPTION))
+                            .id("add-project")
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_size(px(17.))
                             .text_color(rgb(MUTED))
-                            .child("⌘N"),
+                            .hover(|style| style.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
+                            .active(|style| style.bg(rgb(0xd4d7dc)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_project_picker(cx);
+                                cx.notify();
+                            }))
+                            .child("＋"),
                     ),
             )
+            .when_some(self.project_notice.clone(), |sidebar, notice| {
+                sidebar.child(
+                    div()
+                        .mx_4()
+                        .mb_2()
+                        .text_size(px(TYPE_CAPTION))
+                        .text_color(rgb(RED))
+                        .child(notice),
+                )
+            })
             .child(
                 div()
-                    .px_5()
-                    .pt_4()
-                    .pb_2()
-                    .text_size(px(TYPE_CAPTION))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(MUTED_LIGHT))
-                    .child("RECENT"),
+                    .id("projects-scroll")
+                    .min_h(px(0.))
+                    .flex_grow()
+                    .overflow_y_scroll()
+                    .pb_3()
+                    .children(project_groups),
             )
-            .when(has_run, |sidebar| {
-                sidebar.child(
-                    div()
-                        .mx_3()
-                        .h(px(40.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .rounded(px(RADIUS_MEDIUM))
-                        .bg(rgb(BLUE_TINT))
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(px(TYPE_UI))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(Self::compact_title(prompt)),
-                        )
-                        .child(
-                            div()
-                                .ml_2()
-                                .flex_shrink_0()
-                                .text_size(px(TYPE_CAPTION))
-                                .text_color(rgb(MUTED))
-                                .child(status),
-                        ),
-                )
-            })
-            .when(!has_run, |sidebar| {
-                sidebar.child(
-                    div()
-                        .px_5()
-                        .py_3()
-                        .text_size(px(TYPE_UI))
-                        .text_color(rgb(MUTED))
-                        .child("No conversations yet"),
-                )
-            })
-            .child(div().flex_grow())
             .child(
                 div()
-                    .mx_4()
-                    .py_3()
+                    .mx_2()
+                    .py_2()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -893,36 +1392,16 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                     .border_color(rgb(BORDER))
                     .child(
                         div()
-                            .min_w(px(0.))
+                            .id("open-settings")
+                            .h(px(30.))
+                            .px_2()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .size(px(24.))
-                                    .rounded(px(RADIUS_SMALL))
-                                    .overflow_hidden()
-                                    .child(img(APP_LOGO_ASSET).size_full()),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(TYPE_UI))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(self.workspace_label.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("open-settings")
-                            .size(px(38.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(RADIUS_MEDIUM))
+                            .rounded(px(RADIUS_SMALL))
                             .cursor_pointer()
                             .bg(rgb(if self.page == WorkspacePage::Settings {
-                                BLUE_TINT
+                                0xe3e4e7
                             } else {
                                 SIDEBAR
                             }))
@@ -934,7 +1413,15 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                                 this.thinking_menu_open = false;
                                 cx.notify();
                             }))
-                            .child(img(SETTINGS_ICON_ASSET).size(px(19.))),
+                            .child(img(SETTINGS_ICON_ASSET).size(px(17.)))
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .size(px(22.))
+                            .rounded(px(RADIUS_SMALL))
+                            .overflow_hidden()
+                            .child(img(APP_LOGO_ASSET).size_full()),
                     ),
             )
     }
@@ -1962,17 +2449,27 @@ impl<J: EventJournal> DiscoWorkspace<J> {
     }
 }
 
-impl<J: EventJournal> Render for DiscoWorkspace<J> {
+impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let turns = self.conversation.turns().to_vec();
+        let turns = self
+            .active_task()
+            .map_or_else(Vec::new, |task| task.turns().to_vec());
         let has_run = !turns.is_empty();
         let title = if has_run {
-            Self::compact_title(self.conversation.title_prompt().unwrap_or_default())
+            Self::compact_title(
+                self.active_task()
+                    .and_then(ChatConversation::title_prompt)
+                    .unwrap_or_default(),
+            )
         } else {
             "New conversation".into()
         };
-        let can_submit = !self.composer.read(cx).is_empty() && self.conversation.can_begin_turn();
-        let is_working = !self.conversation.can_begin_turn();
+        let active_task_can_begin = self
+            .active_task()
+            .is_some_and(ChatConversation::can_begin_turn);
+        let can_submit =
+            !self.composer.read(cx).is_empty() && active_task_can_begin && !self.run_in_progress();
+        let is_working = self.run_in_progress();
         let action_enabled = if is_working {
             !self.stop_requested
         } else {
@@ -2274,7 +2771,13 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
                                                                     .opacity(0.82)
                                                             })
                                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                                if this.conversation.can_begin_turn() {
+                                                                if !this.run_in_progress()
+                                                                    && this
+                                                                        .active_task()
+                                                                        .is_some_and(
+                                                                            ChatConversation::can_begin_turn,
+                                                                        )
+                                                                {
                                                                     this.submit_composer(cx);
                                                                 } else {
                                                                     this.stop_run();
@@ -2355,9 +2858,23 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatConversation, DiscoWorkspace};
-    use disco_domain::{RunEventPayload, RunId, RunStatus};
-    use disco_kernel::RunProjection;
+    use super::{ChatConversation, ComposerInput, DiscoWorkspace};
+    use disco_domain::{
+        EngineKind, Project, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
+    };
+    use disco_kernel::{EventJournal, MemoryJournal, ProjectStore, RunProjection};
+    use gpui::{AppContext, TestAppContext};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn project_name_comes_from_the_root_directory() {
+        assert_eq!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::project_name(Path::new(
+                "/Users/example/code/disco"
+            )),
+            "disco"
+        );
+    }
 
     #[test]
     fn conversation_title_is_derived_from_the_real_prompt() {
@@ -2431,5 +2948,146 @@ mod tests {
             DiscoWorkspace::<disco_kernel::MemoryJournal>::terminal_event(false),
             RunEventPayload::RunCompleted
         ));
+    }
+
+    #[gpui::test]
+    fn switching_tasks_preserves_each_draft(cx: &mut TestAppContext) {
+        let marker = RunId::new();
+        let (composer, workspace) = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            let workspace = cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer.clone(),
+                    PathBuf::from(format!("/tmp/disco-settings-{marker}.json")),
+                    PathBuf::from(format!("/tmp/disco-project-{marker}")),
+                    Err("Codex unavailable in test".into()),
+                    cx,
+                )
+            });
+            (composer, workspace)
+        });
+
+        let first_session = cx.update(|cx| {
+            composer.update(cx, |composer, cx| composer.set_content("first draft", cx));
+            workspace.update(cx, |workspace, cx| {
+                let first_session = workspace.active_session_id;
+                workspace.new_task_for_project(workspace.active_project_id, cx);
+                first_session
+            })
+        });
+        cx.update(|cx| {
+            assert_eq!(composer.read(cx).content(), "");
+            composer.update(cx, |composer, cx| composer.set_content("second draft", cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.select_task(workspace.active_project_id, first_session, cx);
+            });
+            assert_eq!(composer.read(cx).content(), "first draft");
+            workspace.update(cx, |workspace, cx| {
+                workspace.select_project(workspace.active_project_id, cx);
+            });
+            assert_eq!(composer.read(cx).content(), "first draft");
+        });
+    }
+
+    #[gpui::test]
+    fn startup_restores_tasks_and_codex_thread_ids(cx: &mut TestAppContext) {
+        let journal = MemoryJournal::default();
+        let project_path = PathBuf::from(format!("/tmp/disco-project-{}", RunId::new()));
+        let project = journal
+            .register_project(Project::new("restored", project_path.clone()))
+            .expect("project should register");
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        for event in [
+            RunEvent::new(
+                run_id,
+                0,
+                RunEventPayload::RunStarted {
+                    project_id: None,
+                    session_id,
+                    engine: EngineKind::Codex,
+                    workspace: Some(project_path.to_string_lossy().into_owned()),
+                    prompt: "Restore this task".into(),
+                },
+            ),
+            RunEvent::new(
+                run_id,
+                1,
+                RunEventPayload::CodexThreadAttached {
+                    thread_id: "thread-restored".into(),
+                },
+            ),
+            RunEvent::new(run_id, 2, RunEventPayload::RunCompleted),
+        ] {
+            journal.append(&event).expect("event should persist");
+        }
+
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    journal,
+                    composer,
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    project_path,
+                    Err("Codex unavailable in test".into()),
+                    cx,
+                )
+            })
+        });
+
+        cx.update(|cx| {
+            let workspace = workspace.read(cx);
+            let task = workspace.active_task().expect("task should restore");
+            assert_eq!(workspace.active_project_id, project.id);
+            assert_eq!(task.session_id, session_id);
+            assert_eq!(task.title_prompt(), Some("Restore this task"));
+            assert_eq!(task.codex_thread_id.as_deref(), Some("thread-restored"));
+        });
+    }
+
+    #[gpui::test]
+    fn reopening_the_active_project_does_not_create_a_task(cx: &mut TestAppContext) {
+        let project_path = std::env::current_dir().expect("working directory should exist");
+        let (composer, workspace) = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            let workspace = cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer.clone(),
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    project_path.clone(),
+                    Err("Codex unavailable in test".into()),
+                    cx,
+                )
+            });
+            (composer, workspace)
+        });
+
+        cx.update(|cx| {
+            composer.update(cx, |composer, cx| composer.set_content("keep this", cx));
+            let (session_id, task_count) = workspace.update(cx, |workspace, cx| {
+                let session_id = workspace.active_session_id;
+                let task_count = workspace
+                    .active_project()
+                    .expect("active project should exist")
+                    .tasks
+                    .len();
+                workspace.register_project_path(project_path, cx);
+                (session_id, task_count)
+            });
+            let workspace = workspace.read(cx);
+            assert_eq!(workspace.active_session_id, session_id);
+            assert_eq!(
+                workspace
+                    .active_project()
+                    .expect("active project should still exist")
+                    .tasks
+                    .len(),
+                task_count
+            );
+            assert_eq!(composer.read(cx).content(), "keep this");
+        });
     }
 }
