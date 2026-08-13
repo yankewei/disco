@@ -5,6 +5,7 @@ use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -48,21 +49,34 @@ pub struct CodexTurnResult {
     pub text: String,
     pub activities: Vec<CodexActivity>,
     pub usage: CodexTokenUsage,
+    pub interrupted: bool,
 }
 
 #[derive(Clone)]
 pub struct CodexRuntime {
     installation: CodexInstallation,
     process: Arc<Mutex<AppServerProcess>>,
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    active_turn: Arc<Mutex<Option<ActiveTurn>>>,
+    interrupt_requested: Arc<AtomicBool>,
+    next_request_id: Arc<AtomicU64>,
 }
 
 impl CodexRuntime {
     pub fn connect(workspace: &Path) -> Result<Self, CodexError> {
         let installation = discover_codex()?;
         let process = AppServerProcess::spawn(&installation.path, workspace)?;
+        let stdin = Arc::clone(&process.stdin);
+        let active_turn = Arc::clone(&process.active_turn);
+        let interrupt_requested = Arc::clone(&process.interrupt_requested);
+        let next_request_id = Arc::clone(&process.next_request_id);
         Ok(Self {
             installation,
             process: Arc::new(Mutex::new(process)),
+            stdin,
+            active_turn,
+            interrupt_requested,
+            next_request_id,
         })
     }
 
@@ -100,6 +114,48 @@ impl CodexRuntime {
                 model,
                 reasoning_effort,
             )
+    }
+
+    pub fn prepare_turn(&self) {
+        self.interrupt_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn interrupt_turn(&self) -> Result<(), CodexError> {
+        self.interrupt_requested.store(true, Ordering::SeqCst);
+        let active_turn = self
+            .active_turn
+            .lock()
+            .map_err(|_| {
+                self.interrupt_requested.store(false, Ordering::SeqCst);
+                CodexError::LockPoisoned
+            })?
+            .clone();
+        let Some(active_turn) = active_turn else {
+            // No turn registered yet: leave the flag set as a pending
+            // interrupt. start_turn consumes it with swap(false) right
+            // after registering, so the turn is interrupted before any
+            // work runs.
+            return Ok(());
+        };
+
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let sent = write_message(
+            &self.stdin,
+            &json!({
+                "id": id,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": active_turn.thread_id,
+                    "turnId": active_turn.turn_id
+                }
+            }),
+        );
+        // The pending-interrupt contract is fulfilled by this direct send
+        // (or failed outright). Never leave a stale flag behind: a later
+        // start_turn swap(false) would auto-interrupt a turn the user did
+        // not ask to stop.
+        self.interrupt_requested.store(false, Ordering::SeqCst);
+        sent
     }
 }
 
@@ -146,10 +202,46 @@ fn codex_candidates() -> Vec<PathBuf> {
 
 struct AppServerProcess {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     stdout: BufReader<ChildStdout>,
     queued: VecDeque<Value>,
-    next_request_id: u64,
+    active_turn: Arc<Mutex<Option<ActiveTurn>>>,
+    interrupt_requested: Arc<AtomicBool>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ActiveTurn {
+    thread_id: String,
+    turn_id: String,
+}
+
+struct ActiveTurnGuard {
+    active_turn: Arc<Mutex<Option<ActiveTurn>>>,
+    turn_id: String,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active_turn) = self.active_turn.lock()
+            && active_turn
+                .as_ref()
+                .is_some_and(|active| active.turn_id == self.turn_id)
+        {
+            *active_turn = None;
+        }
+    }
+}
+
+fn write_message(
+    stdin: &Arc<Mutex<BufWriter<ChildStdin>>>,
+    message: &Value,
+) -> Result<(), CodexError> {
+    let mut stdin = stdin.lock().map_err(|_| CodexError::LockPoisoned)?;
+    serde_json::to_writer(&mut *stdin, message)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
 }
 
 impl AppServerProcess {
@@ -161,7 +253,9 @@ impl AppServerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let stdin = child.stdin.take().ok_or(CodexError::MissingPipe("stdin"))?;
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
+            child.stdin.take().ok_or(CodexError::MissingPipe("stdin"))?,
+        )));
         let stdout = child
             .stdout
             .take()
@@ -175,10 +269,12 @@ impl AppServerProcess {
         }
         let mut process = Self {
             child,
-            stdin: BufWriter::new(stdin),
+            stdin,
             stdout: BufReader::new(stdout),
             queued: VecDeque::new(),
-            next_request_id: 1,
+            active_turn: Arc::new(Mutex::new(None)),
+            interrupt_requested: Arc::new(AtomicBool::new(false)),
+            next_request_id: Arc::new(AtomicU64::new(1)),
         };
         process.request(
             "initialize",
@@ -196,10 +292,7 @@ impl AppServerProcess {
     }
 
     fn write_message(&mut self, message: &Value) -> Result<(), CodexError> {
-        serde_json::to_writer(&mut self.stdin, message)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        Ok(())
+        write_message(&self.stdin, message)
     }
 
     fn notify(&mut self, method: &str, params: Option<Value>) -> Result<(), CodexError> {
@@ -211,8 +304,7 @@ impl AppServerProcess {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         self.write_message(&json!({ "id": id, "method": method, "params": params }))?;
         loop {
             let message = self.read_message()?;
@@ -316,6 +408,25 @@ impl AppServerProcess {
             .and_then(Value::as_str)
             .ok_or(CodexError::MissingField("turn.id"))?
             .to_owned();
+        *self
+            .active_turn
+            .lock()
+            .map_err(|_| CodexError::LockPoisoned)? = Some(ActiveTurn {
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+        });
+        let _active_turn_guard = ActiveTurnGuard {
+            active_turn: Arc::clone(&self.active_turn),
+            turn_id: turn_id.clone(),
+        };
+        if self.interrupt_requested.swap(false, Ordering::SeqCst) {
+            let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+            self.write_message(&json!({
+                "id": id,
+                "method": "turn/interrupt",
+                "params": { "threadId": thread_id, "turnId": turn_id }
+            }))?;
+        }
 
         let mut text = String::new();
         let mut activities = Vec::new();
@@ -388,6 +499,7 @@ impl AppServerProcess {
                         text,
                         activities,
                         usage,
+                        interrupted: status == Some("interrupted"),
                     });
                 }
                 _ => {}
@@ -531,8 +643,9 @@ pub enum CodexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{activity_from_item, parse_models};
+    use super::{ActiveTurn, ActiveTurnGuard, activity_from_item, parse_models};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn model_catalog_comes_from_app_server_fields() {
@@ -572,5 +685,44 @@ mod tests {
         assert_eq!(activity.title, "Updated files");
         assert_eq!(activity.detail, "src/lib.rs, src/main.rs");
         assert!(activity.success);
+    }
+
+    #[test]
+    fn active_turn_guard_clears_matching_turn() {
+        let active_turn: Arc<Mutex<Option<ActiveTurn>>> = Arc::new(Mutex::new(Some(ActiveTurn {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+        })));
+        let guard = ActiveTurnGuard {
+            active_turn: Arc::clone(&active_turn),
+            turn_id: "turn-1".into(),
+        };
+        drop(guard);
+        assert!(
+            active_turn
+                .lock()
+                .expect("test lock should not be poisoned")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn active_turn_guard_preserves_newer_turn() {
+        let active_turn: Arc<Mutex<Option<ActiveTurn>>> = Arc::new(Mutex::new(Some(ActiveTurn {
+            thread_id: "thread-2".into(),
+            turn_id: "turn-2".into(),
+        })));
+        let guard = ActiveTurnGuard {
+            active_turn: Arc::clone(&active_turn),
+            turn_id: "turn-1".into(),
+        };
+        drop(guard);
+        let current = active_turn
+            .lock()
+            .expect("test lock should not be poisoned");
+        assert_eq!(
+            current.as_ref().expect("newer turn should remain").turn_id,
+            "turn-2"
+        );
     }
 }

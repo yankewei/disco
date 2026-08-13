@@ -28,6 +28,10 @@ const KIMI_ICON_ASSET: &str = "icons/providers/kimi-code.png";
 const CHEVRON_DOWN_ASSET: &str = "icons/ui/chevron-down.svg";
 const CHEVRON_UP_ASSET: &str = "icons/ui/chevron-up.svg";
 const SETTINGS_ICON_ASSET: &str = "icons/ui/settings.svg";
+const BACK_ICON_ASSET: &str = "icons/ui/back.svg";
+const PROVIDERS_ICON_ASSET: &str = "icons/ui/providers.svg";
+const SEND_ICON_ASSET: &str = "icons/ui/send.svg";
+const STOP_ICON_ASSET: &str = "icons/ui/stop.svg";
 const CANVAS: u32 = 0xffffff;
 const SIDEBAR: u32 = 0xf3f4f6;
 const SURFACE: u32 = 0xffffff;
@@ -38,9 +42,9 @@ const BORDER_STRONG: u32 = 0xd3d6dc;
 const TEXT: u32 = 0x222327;
 const MUTED: u32 = 0x6e727a;
 const MUTED_LIGHT: u32 = 0x9a9ea6;
-const BLUE: u32 = 0x0a84ff;
-const BLUE_HOVER: u32 = 0x0077ed;
-const BLUE_ACTIVE: u32 = 0x0068d1;
+const BLUE: u32 = 0x007aff;
+const BLUE_HOVER: u32 = 0x006ee6;
+const BLUE_ACTIVE: u32 = 0x0062cc;
 const BLUE_TINT: u32 = 0xeaf3ff;
 const BLUE_INK: u32 = 0x174a7e;
 const GREEN: u32 = 0x28a745;
@@ -54,6 +58,10 @@ const TYPE_CAPTION: f32 = 11.;
 const TYPE_UI: f32 = 12.5;
 const TYPE_BODY: f32 = 13.5;
 const TYPE_TITLE: f32 = 15.;
+const APP_SIDEBAR_WIDTH: f32 = 252.;
+const APP_TOP_BAR_HEIGHT: f32 = 52.;
+const APP_SIDEBAR_TOP_INSET: f32 = 50.;
+const CHAT_COLUMN_WIDTH: f32 = 760.;
 const RADIUS_SMALL: f32 = 6.;
 const RADIUS_MEDIUM: f32 = 9.;
 const RADIUS_LARGE: f32 = 12.;
@@ -183,6 +191,7 @@ pub struct DiscoWorkspace<J: EventJournal> {
     deepseek_model_input: Entity<ComposerInput>,
     deepseek_api_key_input: Entity<ComposerInput>,
     settings_notice: Option<(bool, String)>,
+    stop_requested: bool,
 }
 
 impl<J: EventJournal> DiscoWorkspace<J> {
@@ -294,6 +303,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             deepseek_model_input,
             deepseek_api_key_input,
             settings_notice: None,
+            stop_requested: false,
         }
     }
 
@@ -439,6 +449,8 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             );
             return;
         };
+        runtime.prepare_turn();
+        self.stop_requested = false;
         let Some(model) = self.selected_model_id.clone() else {
             self.record_failure(
                 run_id,
@@ -470,7 +482,17 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         .detach();
     }
 
+    fn terminal_event(interrupted: bool) -> RunEventPayload {
+        // An interrupted codex turn ends as Cancelled, never Completed.
+        if interrupted {
+            RunEventPayload::RunCancelled
+        } else {
+            RunEventPayload::RunCompleted
+        }
+    }
+
     fn finish_run(&mut self, run_id: RunId, result: Result<CodexTurnResult, String>) {
+        self.stop_requested = false;
         match result {
             Ok(result) => {
                 self.codex_thread_id = Some(result.thread_id);
@@ -507,7 +529,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                         },
                     },
                 );
-                self.record(run_id, RunEventPayload::RunCompleted);
+                self.record(run_id, Self::terminal_event(result.interrupted));
             }
             Err(error) => self.record_failure(run_id, "codex_turn_failed", error),
         }
@@ -542,12 +564,38 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         }
     }
 
+    fn stop_run(&mut self) {
+        if self.stop_requested
+            || self
+                .conversation
+                .current()
+                .is_none_or(|turn| turn.status.is_terminal())
+        {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        match runtime.interrupt_turn() {
+            Ok(()) => self.stop_requested = true,
+            Err(_) => {
+                // Do not record a terminal RunFailed here: the turn is still
+                // executing, and a terminal event would orphan its real outcome
+                // (finish_run's events are rejected as EventAfterTerminal) and
+                // flip the UI back to send mode mid-run. Leave the run running;
+                // stop_requested stays false so the stop button stays active
+                // for a retry.
+            }
+        }
+    }
+
     fn new_task(&mut self) {
         self.conversation = ChatConversation::new();
         self.codex_thread_id = None;
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         self.page = WorkspacePage::Chat;
+        self.stop_requested = false;
     }
 
     fn status_label(&self) -> &'static str {
@@ -675,82 +723,60 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             )
             .child(
                 div()
-                    .w_full()
+                    .min_w(px(0.))
+                    .max_w(px(700.))
                     .flex()
-                    .items_start()
+                    .flex_col()
                     .gap_2()
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .rounded(px(RADIUS_MEDIUM))
-                            .overflow_hidden()
-                            .child(img(APP_LOGO_ASSET).size_full()),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .max_w(px(700.))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(TYPE_UI))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Codex"),
-                            )
-                            .when(!assistant.is_empty(), |column| {
-                                column.child(
-                                    div()
-                                        .text_size(px(TYPE_BODY))
-                                        .line_height(px(21.))
-                                        .child(assistant),
-                                )
-                            })
-                            .when(is_working, |column| {
-                                column.child(
-                                    div()
-                                        .text_size(px(TYPE_UI))
-                                        .text_color(rgb(MUTED))
-                                        .child("Working…"),
-                                )
-                            })
-                            .when_some(failure, |column, message| {
-                                column.child(
-                                    div()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded(px(RADIUS_MEDIUM))
-                                        .bg(rgb(0xffeeee))
-                                        .text_size(px(TYPE_UI))
-                                        .text_color(rgb(RED))
-                                        .child(message),
-                                )
-                            })
-                            .when(!activities.is_empty(), |column| {
-                                column.child(
-                                    div()
-                                        .rounded(px(RADIUS_MEDIUM))
-                                        .bg(rgb(SURFACE_SUBTLE))
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .children(activities.iter().map(Self::activity_row)),
-                                )
-                            })
-                            .when(usage.total_tokens > 0, |column| {
-                                column.child(
-                                    div()
-                                        .text_size(px(TYPE_CAPTION))
-                                        .text_color(rgb(MUTED_LIGHT))
-                                        .child(format!(
-                                            "{} input · {} output · {} total tokens",
-                                            usage.input_tokens,
-                                            usage.output_tokens,
-                                            usage.total_tokens
-                                        )),
-                                )
-                            }),
-                    ),
+                    .when(!assistant.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .text_size(px(TYPE_BODY))
+                                .line_height(px(21.))
+                                .child(assistant),
+                        )
+                    })
+                    .when(is_working, |column| {
+                        column.child(
+                            div()
+                                .text_size(px(TYPE_UI))
+                                .text_color(rgb(MUTED))
+                                .child("Working…"),
+                        )
+                    })
+                    .when_some(failure, |column, message| {
+                        column.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded(px(RADIUS_MEDIUM))
+                                .bg(rgb(0xffeeee))
+                                .text_size(px(TYPE_UI))
+                                .text_color(rgb(RED))
+                                .child(message),
+                        )
+                    })
+                    .when(!activities.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .rounded(px(RADIUS_MEDIUM))
+                                .bg(rgb(SURFACE_SUBTLE))
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .children(activities.iter().map(Self::activity_row)),
+                        )
+                    })
+                    .when(usage.total_tokens > 0, |column| {
+                        column.child(
+                            div()
+                                .text_size(px(TYPE_CAPTION))
+                                .text_color(rgb(MUTED_LIGHT))
+                                .child(format!(
+                                    "{} input · {} output · {} total tokens",
+                                    usage.input_tokens, usage.output_tokens, usage.total_tokens
+                                )),
+                        )
+                    }),
             )
     }
 
@@ -759,7 +785,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
         let status = self.status_label();
         let has_run = !self.conversation.turns().is_empty();
         div()
-            .w(px(252.))
+            .w(px(APP_SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -767,7 +793,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             .bg(rgb(SIDEBAR))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .child(div().h(px(50.)))
+            .child(div().h(px(APP_SIDEBAR_TOP_INSET)))
             .child(
                 div()
                     .id("new-task")
@@ -1754,10 +1780,10 @@ impl<J: EventJournal> DiscoWorkspace<J> {
             .bg(rgb(SETTINGS_CANVAS))
             .child(
                 div()
-                    .w(px(208.))
+                    .w(px(APP_SIDEBAR_WIDTH))
                     .h_full()
                     .px_3()
-                    .pt(px(48.))
+                    .pt(px(APP_SIDEBAR_TOP_INSET))
                     .pb_3()
                     .flex()
                     .flex_col()
@@ -1766,42 +1792,35 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                     .bg(rgb(SETTINGS_SIDEBAR))
                     .child(
                         div()
-                            .h(px(28.))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .text_size(px(TYPE_BODY))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Disco"),
-                    )
-                    .child(
-                        div()
                             .id("close-settings")
-                            .mt_3()
                             .w_full()
-                            .h(px(30.))
-                            .px_3()
+                            .h(px(36.))
+                            .px_2()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .rounded(px(RADIUS_SMALL))
+                            .rounded(px(RADIUS_MEDIUM))
                             .cursor_pointer()
+                            .bg(rgb(0xf7f7f8))
+                            .border_1()
+                            .border_color(rgb(0xd5d7db))
                             .text_size(px(TYPE_UI))
-                            .text_color(rgb(MUTED))
-                            .hover(|style| style.bg(rgb(0xdfe2e6)))
-                            .active(|style| style.bg(rgb(0xd2d5da)))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(TEXT))
+                            .hover(|style| style.bg(rgb(0xffffff)))
+                            .active(|style| style.bg(rgb(0xdfe1e5)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.page = WorkspacePage::Chat;
                                 cx.notify();
                             }))
-                            .child("‹")
-                            .child("Back to chat"),
+                            .child(img(BACK_ICON_ASSET).size(px(16.)))
+                            .child("Back to Chat"),
                     )
                     .child(
                         div()
-                            .mt_4()
-                            .px_3()
-                            .pb_1()
+                            .mt_5()
+                            .px_2()
+                            .pb_2()
                             .text_size(px(TYPE_CAPTION))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(MUTED))
@@ -1811,12 +1830,12 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                         div()
                             .id("settings-providers")
                             .w_full()
-                            .h(px(32.))
-                            .px_3()
+                            .h(px(36.))
+                            .px_2()
                             .flex()
                             .items_center()
-                            .gap_3()
-                            .rounded(px(RADIUS_SMALL))
+                            .gap_2()
+                            .rounded(px(RADIUS_MEDIUM))
                             .cursor_pointer()
                             .bg(rgb(SETTINGS_SELECTION))
                             .text_size(px(TYPE_UI))
@@ -1828,15 +1847,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                                 this.settings_notice = None;
                                 cx.notify();
                             }))
-                            .child(
-                                div()
-                                    .size(px(24.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(rgb(SURFACE))
-                                    .child("◈"),
-                            )
+                            .child(img(PROVIDERS_ICON_ASSET).size(px(16.)))
                             .child("Providers"),
                     ),
             )
@@ -1849,7 +1860,7 @@ impl<J: EventJournal> DiscoWorkspace<J> {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(48.))
+                            .h(px(APP_TOP_BAR_HEIGHT))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
@@ -1961,6 +1972,12 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
             "New conversation".into()
         };
         let can_submit = !self.composer.read(cx).is_empty() && self.conversation.can_begin_turn();
+        let is_working = !self.conversation.can_begin_turn();
+        let action_enabled = if is_working {
+            !self.stop_requested
+        } else {
+            can_submit
+        };
         let selected_model_name = self
             .selected_model()
             .map(|model| model.display_name.clone())
@@ -1992,7 +2009,7 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
                     .overflow_hidden()
                     .child(
                         div()
-                            .h(px(52.))
+                            .h(px(APP_TOP_BAR_HEIGHT))
                             .px_5()
                             .flex()
                             .items_center()
@@ -2078,7 +2095,8 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
                             .when(has_run, |scroll| {
                                 scroll.child(
                                     div()
-                                        .max_w(px(820.))
+                                        .w_full()
+                                        .max_w(px(CHAT_COLUMN_WIDTH))
                                         .mx_auto()
                                         .flex()
                                         .flex_col()
@@ -2095,7 +2113,8 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
                             .child(
                                 div()
                                     .relative()
-                                    .max_w(px(860.))
+                                    .w_full()
+                                    .max_w(px(CHAT_COLUMN_WIDTH))
                                     .h(px(104.))
                                     .mx_auto()
                                     .child(
@@ -2212,25 +2231,70 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
                                                     )
                                                     .child(
                                                         div()
-                                                            .id("submit-message")
-                                                            .size(px(40.))
+                                                            .id("composer-action")
+                                                            .size(px(32.))
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
                                                             .rounded_full()
-                                                            .bg(rgb(if can_submit { BLUE } else { SURFACE_HOVER }))
-                                                            .text_size(px(18.))
-                                                            .text_color(rgb(if can_submit { SURFACE } else { MUTED_LIGHT }))
-                                                            .cursor_pointer()
-                                                            .hover(move |style| style.bg(rgb(if can_submit { BLUE_HOVER } else { SURFACE_HOVER })))
-                                                            .active(move |style| style.bg(rgb(if can_submit { BLUE_ACTIVE } else { SURFACE_HOVER })))
-                                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                                if !this.composer.read(cx).is_empty() {
-                                                                    this.submit_composer(cx);
-                                                                    cx.notify();
-                                                                }
+                                                            .bg(rgb(if is_working {
+                                                                0x2c2c2e
+                                                            } else if can_submit {
+                                                                BLUE
+                                                            } else {
+                                                                0xe5e5ea
                                                             }))
-                                                            .child("↑"),
+                                                            .cursor_pointer()
+                                                            .hover(move |style| {
+                                                                style.bg(rgb(if is_working {
+                                                                    if action_enabled {
+                                                                        0x3a3a3c
+                                                                    } else {
+                                                                        0x2c2c2e
+                                                                    }
+                                                                } else if can_submit {
+                                                                    BLUE_HOVER
+                                                                } else {
+                                                                    0xe5e5ea
+                                                                }))
+                                                            })
+                                                            .active(move |style| {
+                                                                style
+                                                                    .bg(rgb(if is_working {
+                                                                        if action_enabled {
+                                                                            0x48484a
+                                                                        } else {
+                                                                            0x2c2c2e
+                                                                        }
+                                                                    } else if can_submit {
+                                                                        BLUE_ACTIVE
+                                                                    } else {
+                                                                        0xe5e5ea
+                                                                    }))
+                                                                    .opacity(0.82)
+                                                            })
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                if this.conversation.can_begin_turn() {
+                                                                    this.submit_composer(cx);
+                                                                } else {
+                                                                    this.stop_run();
+                                                                }
+                                                                cx.notify();
+                                                            }))
+                                                            .when(is_working, |button| {
+                                                                button.child(
+                                                                    img(STOP_ICON_ASSET)
+                                                                        .size(px(12.))
+                                                                        .opacity(if action_enabled { 1. } else { 0.55 }),
+                                                                )
+                                                            })
+                                                            .when(!is_working, |button| {
+                                                                button.child(
+                                                                    img(SEND_ICON_ASSET)
+                                                                        .size(px(14.))
+                                                                        .opacity(if can_submit { 1. } else { 0.42 }),
+                                                                )
+                                                            }),
                                                     ),
                                             ),
                                     )
@@ -2292,7 +2356,7 @@ impl<J: EventJournal> Render for DiscoWorkspace<J> {
 #[cfg(test)]
 mod tests {
     use super::{ChatConversation, DiscoWorkspace};
-    use disco_domain::{RunId, RunStatus};
+    use disco_domain::{RunEventPayload, RunId, RunStatus};
     use disco_kernel::RunProjection;
 
     #[test]
@@ -2355,5 +2419,17 @@ mod tests {
         let third = RunProjection::empty(RunId::new());
         assert!(!conversation.begin(third));
         assert_eq!(conversation.turns().len(), 2);
+    }
+
+    #[test]
+    fn interrupted_runs_end_cancelled_not_completed() {
+        assert!(matches!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::terminal_event(true),
+            RunEventPayload::RunCancelled
+        ));
+        assert!(matches!(
+            DiscoWorkspace::<disco_kernel::MemoryJournal>::terminal_event(false),
+            RunEventPayload::RunCompleted
+        ));
     }
 }

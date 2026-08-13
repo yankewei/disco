@@ -91,5 +91,29 @@ mod tests {
                 .expect("the settings icon should be readable")
                 .is_some()
         );
+        assert!(
+            assets
+                .load("icons/ui/back.svg")
+                .expect("the back icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/providers.svg")
+                .expect("the providers icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/send.svg")
+                .expect("the send icon should be readable")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("icons/ui/stop.svg")
+                .expect("the stop icon should be readable")
+                .is_some()
+        );
     }
 }
