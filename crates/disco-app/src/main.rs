@@ -45,9 +45,14 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| {
+                |window, cx| {
                     let composer = cx.new(ComposerInput::new);
                     cx.new(|cx| {
+                        cx.observe_window_appearance(window, |_, window, cx| {
+                            window.refresh();
+                            cx.notify();
+                        })
+                        .detach();
                         DiscoWorkspace::new(
                             journal,
                             composer,

@@ -4,6 +4,14 @@ Disco is a desktop coding-agent client that presents several model sources throu
 
 ## Language
 
+**Project**:
+A codebase registered in Disco that groups the Tasks working in its root directory.
+_Avoid_: Workspace, repository entry
+
+**Task**:
+An ongoing agent conversation that belongs to one Project and contains one or more Runs.
+_Avoid_: Chat, thread
+
 **Provider**:
 A named source of models and credentials available to a conversation. A Provider does not imply a particular execution implementation.
 _Avoid_: Service, vendor

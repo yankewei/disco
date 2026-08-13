@@ -1,16 +1,17 @@
 //! SQLite-backed event journal.
 
-use disco_domain::{RunEvent, RunId};
-use disco_kernel::{EventJournal, JournalError};
-use rusqlite::{Connection, params};
+use disco_domain::{Project, RunEvent, RunId};
+use disco_kernel::{EventJournal, JournalError, ProjectStore, ProjectStoreError};
+use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::{M, Migrations};
 use std::path::Path;
 use std::sync::Mutex;
 use thiserror::Error;
 
 fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(
-        "CREATE TABLE run_events (
+    Migrations::new(vec![
+        M::up(
+            "CREATE TABLE run_events (
             event_id TEXT PRIMARY KEY NOT NULL,
             run_id TEXT NOT NULL,
             sequence INTEGER NOT NULL,
@@ -19,7 +20,17 @@ fn migrations() -> Migrations<'static> {
             UNIQUE(run_id, sequence)
         );
         CREATE INDEX run_events_by_run ON run_events(run_id, sequence);",
-    )])
+        ),
+        M::up(
+            "CREATE TABLE projects (
+                project_id TEXT PRIMARY KEY NOT NULL,
+                root_path TEXT NOT NULL UNIQUE,
+                last_opened_at TEXT NOT NULL,
+                project_json TEXT NOT NULL
+            );
+            CREATE INDEX projects_by_last_opened ON projects(last_opened_at DESC);",
+        ),
+    ])
 }
 
 pub struct SqliteJournal {
@@ -92,6 +103,89 @@ impl EventJournal for SqliteJournal {
         self.load_events(run_id)
             .map_err(|error| JournalError::new(error.to_string()))
     }
+
+    fn list_run_ids(&self) -> Result<Vec<RunId>, JournalError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| JournalError::new("database lock was poisoned"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id FROM run_events GROUP BY run_id ORDER BY MIN(occurred_at), run_id",
+            )
+            .map_err(|error| JournalError::new(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| JournalError::new(error.to_string()))?;
+        let mut run_ids = Vec::new();
+        for row in rows {
+            let run_id = row.map_err(|error| JournalError::new(error.to_string()))?;
+            run_ids.push(
+                run_id
+                    .parse::<RunId>()
+                    .map_err(|error| JournalError::new(error.to_string()))?,
+            );
+        }
+        Ok(run_ids)
+    }
+}
+
+impl ProjectStore for SqliteJournal {
+    fn list_projects(&self) -> Result<Vec<Project>, ProjectStoreError> {
+        self.load_projects()
+            .map_err(|error| ProjectStoreError::new(error.to_string()))
+    }
+
+    fn register_project(&self, project: Project) -> Result<Project, ProjectStoreError> {
+        self.upsert_project(project)
+            .map_err(|error| ProjectStoreError::new(error.to_string()))
+    }
+}
+
+impl SqliteJournal {
+    fn load_projects(&self) -> Result<Vec<Project>, StorageError> {
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut statement =
+            connection.prepare("SELECT project_json FROM projects ORDER BY last_opened_at DESC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(serde_json::from_str(&row?)?);
+        }
+        Ok(projects)
+    }
+
+    fn upsert_project(&self, mut project: Project) -> Result<Project, StorageError> {
+        let root_path = project.root_path.to_string_lossy().into_owned();
+        let connection = self.connection.lock().map_err(|_| StorageError::Poisoned)?;
+        let existing = connection
+            .query_row(
+                "SELECT project_json FROM projects WHERE root_path = ?1",
+                [&root_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing: Project = serde_json::from_str(&existing)?;
+            project.id = existing.id;
+            project.created_at = existing.created_at;
+        }
+        let project_json = serde_json::to_string(&project)?;
+        connection.execute(
+            "INSERT INTO projects(project_id, root_path, last_opened_at, project_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(root_path) DO UPDATE SET
+                last_opened_at = excluded.last_opened_at,
+                project_json = excluded.project_json",
+            params![
+                project.id.to_string(),
+                root_path,
+                project.last_opened_at.to_rfc3339(),
+                project_json,
+            ],
+        )?;
+        Ok(project)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -111,7 +205,8 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disco_domain::{EngineKind, RunEventPayload, SessionId};
+    use disco_domain::{EngineKind, ProjectId, RunEventPayload, SessionId};
+    use std::path::PathBuf;
 
     #[test]
     fn journal_round_trips_ordered_events() {
@@ -121,6 +216,7 @@ mod tests {
             run_id,
             0,
             RunEventPayload::RunStarted {
+                project_id: Some(ProjectId::new()),
                 session_id: SessionId::new(),
                 engine: EngineKind::Rig,
                 workspace: Some("/tmp/project".into()),
@@ -138,6 +234,10 @@ mod tests {
             journal.load_run(run_id).expect("events should load"),
             vec![started, completed]
         );
+        assert_eq!(
+            journal.list_run_ids().expect("run ids should load"),
+            vec![run_id]
+        );
     }
 
     #[test]
@@ -149,5 +249,22 @@ mod tests {
 
         journal.append(&first).expect("first event should persist");
         assert!(journal.append(&duplicate).is_err());
+    }
+
+    #[test]
+    fn project_catalog_reuses_identity_for_the_same_root() {
+        let journal = SqliteJournal::open_in_memory().expect("journal should open");
+        let root = PathBuf::from("/tmp/disco-project");
+        let first = journal
+            .register_project(Project::new("disco", root.clone()))
+            .expect("project should register");
+        let reopened = journal
+            .register_project(Project::new("Disco", root))
+            .expect("project should reopen");
+        let projects = journal.list_projects().expect("projects should load");
+
+        assert_eq!(reopened.id, first.id);
+        assert_eq!(reopened.name, "Disco");
+        assert_eq!(projects, vec![reopened]);
     }
 }

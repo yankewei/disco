@@ -5,10 +5,10 @@ mod scripted;
 pub use scripted::{ScriptedBatch, ScriptedEngine};
 
 use disco_domain::{
-    ApprovalRequest, EngineKind, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
-    TokenUsage, ToolCall,
+    ApprovalRequest, EngineKind, Project, ProjectId, RunEvent, RunEventPayload, RunId, RunStatus,
+    SessionId, TokenUsage, ToolCall,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -29,15 +29,39 @@ impl JournalError {
 
 pub trait EventJournal: Send + Sync + 'static {
     fn append(&self, event: &RunEvent) -> Result<(), JournalError>;
+    fn list_run_ids(&self) -> Result<Vec<RunId>, JournalError>;
     fn load_run(&self, run_id: RunId) -> Result<Vec<RunEvent>, JournalError>;
 }
 
+#[derive(Debug, Error)]
+#[error("project store failed: {message}")]
+pub struct ProjectStoreError {
+    message: String,
+}
+
+impl ProjectStoreError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait ProjectStore: Send + Sync + 'static {
+    fn list_projects(&self) -> Result<Vec<Project>, ProjectStoreError>;
+    fn register_project(&self, project: Project) -> Result<Project, ProjectStoreError>;
+}
+
 #[derive(Default)]
-pub struct MemoryJournal(Mutex<Vec<RunEvent>>);
+pub struct MemoryJournal {
+    events: Mutex<Vec<RunEvent>>,
+    projects: Mutex<Vec<Project>>,
+}
 
 impl EventJournal for MemoryJournal {
     fn append(&self, event: &RunEvent) -> Result<(), JournalError> {
-        self.0
+        self.events
             .lock()
             .map_err(|_| JournalError::new("memory journal lock was poisoned"))?
             .push(event.clone());
@@ -46,13 +70,54 @@ impl EventJournal for MemoryJournal {
 
     fn load_run(&self, run_id: RunId) -> Result<Vec<RunEvent>, JournalError> {
         Ok(self
-            .0
+            .events
             .lock()
             .map_err(|_| JournalError::new("memory journal lock was poisoned"))?
             .iter()
             .filter(|event| event.run_id == run_id)
             .cloned()
             .collect())
+    }
+
+    fn list_run_ids(&self) -> Result<Vec<RunId>, JournalError> {
+        Ok(self
+            .events
+            .lock()
+            .map_err(|_| JournalError::new("memory journal lock was poisoned"))?
+            .iter()
+            .map(|event| event.run_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+}
+
+impl ProjectStore for MemoryJournal {
+    fn list_projects(&self) -> Result<Vec<Project>, ProjectStoreError> {
+        let mut projects = self
+            .projects
+            .lock()
+            .map_err(|_| ProjectStoreError::new("memory project store lock was poisoned"))?
+            .clone();
+        projects.sort_by_key(|project| std::cmp::Reverse(project.last_opened_at));
+        Ok(projects)
+    }
+
+    fn register_project(&self, project: Project) -> Result<Project, ProjectStoreError> {
+        let mut projects = self
+            .projects
+            .lock()
+            .map_err(|_| ProjectStoreError::new("memory project store lock was poisoned"))?;
+        if let Some(existing) = projects
+            .iter_mut()
+            .find(|existing| existing.root_path == project.root_path)
+        {
+            existing.name = project.name;
+            existing.last_opened_at = project.last_opened_at;
+            return Ok(existing.clone());
+        }
+        projects.push(project.clone());
+        Ok(project)
     }
 }
 
@@ -76,10 +141,12 @@ pub struct ActivityItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunProjection {
     pub run_id: RunId,
+    pub project_id: Option<ProjectId>,
     pub session_id: Option<SessionId>,
     pub engine: Option<EngineKind>,
     pub workspace: Option<String>,
     pub prompt: Option<String>,
+    pub codex_thread_id: Option<String>,
     pub status: RunStatus,
     pub assistant_text: String,
     pub reasoning_text: String,
@@ -95,10 +162,12 @@ impl RunProjection {
     pub fn empty(run_id: RunId) -> Self {
         Self {
             run_id,
+            project_id: None,
             session_id: None,
             engine: None,
             workspace: None,
             prompt: None,
+            codex_thread_id: None,
             status: RunStatus::Queued,
             assistant_text: String::new(),
             reasoning_text: String::new(),
@@ -129,6 +198,7 @@ impl RunProjection {
 
         match &event.payload {
             RunEventPayload::RunStarted {
+                project_id,
                 session_id,
                 engine,
                 workspace,
@@ -137,11 +207,15 @@ impl RunProjection {
                 if self.next_sequence != 0 {
                     return Err(ProjectionError::DuplicateStart);
                 }
+                self.project_id = *project_id;
                 self.session_id = Some(*session_id);
                 self.engine = Some(engine.clone());
                 self.workspace.clone_from(workspace);
                 self.prompt = Some(prompt.clone());
                 self.status = RunStatus::Running;
+            }
+            RunEventPayload::CodexThreadAttached { thread_id } => {
+                self.codex_thread_id = Some(thread_id.clone());
             }
             RunEventPayload::AssistantContentDelta { text } => {
                 self.assistant_text.push_str(text);
@@ -312,6 +386,7 @@ impl<J: EventJournal> Kernel<J> {
     pub fn start_run(
         &self,
         run_id: RunId,
+        project_id: ProjectId,
         session_id: SessionId,
         engine: EngineKind,
         workspace: Option<String>,
@@ -326,6 +401,7 @@ impl<J: EventJournal> Kernel<J> {
             run_id,
             0,
             RunEventPayload::RunStarted {
+                project_id: Some(project_id),
                 session_id,
                 engine,
                 workspace,
@@ -337,6 +413,20 @@ impl<J: EventJournal> Kernel<J> {
         self.journal.append(&event)?;
         projections.insert(run_id, projection.clone());
         Ok(projection)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>, ProjectStoreError>
+    where
+        J: ProjectStore,
+    {
+        self.journal.list_projects()
+    }
+
+    pub fn register_project(&self, project: Project) -> Result<Project, ProjectStoreError>
+    where
+        J: ProjectStore,
+    {
+        self.journal.register_project(project)
     }
 
     pub fn record(
@@ -371,6 +461,14 @@ impl<J: EventJournal> Kernel<J> {
             .insert(run_id, projection.clone());
         Ok(projection)
     }
+
+    pub fn restore_all(&self) -> Result<Vec<RunProjection>, KernelError> {
+        self.journal
+            .list_run_ids()?
+            .into_iter()
+            .map(|run_id| self.restore(run_id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -382,9 +480,11 @@ mod tests {
     fn kernel_builds_a_projection_and_rejects_events_after_completion() {
         let kernel = Kernel::new(MemoryJournal::default());
         let run_id = RunId::new();
+        let project_id = ProjectId::new();
         kernel
             .start_run(
                 run_id,
+                project_id,
                 SessionId::new(),
                 EngineKind::Rig,
                 Some("/workspace".into()),
@@ -404,6 +504,7 @@ mod tests {
             .expect("run should complete");
 
         assert_eq!(completed.status, RunStatus::Completed);
+        assert_eq!(completed.project_id, Some(project_id));
         assert_eq!(completed.assistant_text, "Tests are green.");
         assert!(matches!(
             kernel.record(run_id, RunEventPayload::RunCancelled),
@@ -422,6 +523,7 @@ mod tests {
                 run_id,
                 0,
                 RunEventPayload::RunStarted {
+                    project_id: Some(ProjectId::new()),
                     session_id: SessionId::new(),
                     engine: EngineKind::Rig,
                     workspace: None,
@@ -461,5 +563,47 @@ mod tests {
         assert_eq!(projection.activities.len(), 1);
         assert!(projection.activities[0].completed);
         assert_eq!(projection.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn restore_all_discovers_runs_and_restores_codex_thread_identity() {
+        let kernel = Kernel::new(MemoryJournal::default());
+        let project_id = ProjectId::new();
+        let session_id = SessionId::new();
+        let first_run_id = RunId::new();
+        let second_run_id = RunId::new();
+        for run_id in [first_run_id, second_run_id] {
+            kernel
+                .start_run(
+                    run_id,
+                    project_id,
+                    session_id,
+                    EngineKind::Codex,
+                    Some("/workspace".into()),
+                    "Continue the task",
+                )
+                .expect("run should start");
+            kernel
+                .record(
+                    run_id,
+                    RunEventPayload::CodexThreadAttached {
+                        thread_id: "thread-1".into(),
+                    },
+                )
+                .expect("thread should attach");
+            kernel
+                .record(run_id, RunEventPayload::RunCompleted)
+                .expect("run should complete");
+        }
+
+        let restored = kernel.restore_all().expect("runs should restore");
+
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().all(|run| {
+            run.project_id == Some(project_id)
+                && run.session_id == Some(session_id)
+                && run.codex_thread_id.as_deref() == Some("thread-1")
+                && run.status == RunStatus::Completed
+        }));
     }
 }

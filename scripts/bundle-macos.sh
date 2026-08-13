@@ -36,5 +36,6 @@ cp "${app_icon_source_dir}"/icon_*.png "${iconset_dir}/"
 iconutil --convert icns --output "${resources_dir}/AppIcon.icns" "${iconset_dir}"
 cp -R "${assets_dir}/images" "${resources_dir}/images"
 cp -R "${assets_dir}/icons" "${resources_dir}/icons"
+codesign --force --deep --sign - "${app_dir}"
 
 echo "Built ${app_dir}"
