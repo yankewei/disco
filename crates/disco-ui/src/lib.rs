@@ -19,17 +19,18 @@ use disco_domain::{
 use disco_kernel::{ActivityItem, ActivityKind, EventJournal, Kernel, ProjectStore, RunProjection};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, ClipboardItem, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, PathPromptOptions,
-    Pixels, Point, Render, StatefulInteractiveElement, Styled, Window, WindowAppearance, anchored,
-    deferred, div, img, px, rgb,
+    AppContext, ClipboardItem, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, StatefulInteractiveElement, Styled, Window,
+    WindowAppearance, anchored, deferred, div, img, px, rgb, svg,
 };
 use serde_json::json;
-use settings::{CodexUiSettings, save_api_key};
+use settings::{AppConfig, RemoteProviderSettings};
 
 const CODEX_ICON_ASSET: &str = "icons/providers/codex.png";
 const DEEPSEEK_ICON_ASSET: &str = "icons/providers/deepseek.svg";
 const KIMI_ICON_ASSET: &str = "icons/providers/kimi-code.png";
+const OPENCODE_ICON_ASSET: &str = "icons/providers/opencode.svg";
 const CHEVRON_DOWN_ASSET: &str = "icons/ui/chevron-down.svg";
 const CHEVRON_RIGHT_ASSET: &str = "icons/ui/chevron-right.svg";
 const CHEVRON_UP_ASSET: &str = "icons/ui/chevron-up.svg";
@@ -39,6 +40,8 @@ const PROVIDERS_ICON_ASSET: &str = "icons/ui/providers.svg";
 const SEND_ICON_ASSET: &str = "icons/ui/send.svg";
 const STOP_ICON_ASSET: &str = "icons/ui/stop.svg";
 const FOLDER_ICON_ASSET: &str = "icons/ui/folder.svg";
+const EYE_ICON_ASSET: &str = "icons/ui/eye.svg";
+const EYE_OFF_ICON_ASSET: &str = "icons/ui/eye-off.svg";
 const TYPE_CAPTION: f32 = 11.;
 const TYPE_UI: f32 = 12.5;
 const TYPE_BODY: f32 = 13.5;
@@ -272,6 +275,7 @@ enum ProviderKind {
     Codex,
     KimiCode,
     DeepSeek,
+    OpenCode,
 }
 
 impl ProviderKind {
@@ -280,6 +284,7 @@ impl ProviderKind {
             Self::Codex => "Codex",
             Self::KimiCode => "Kimi Code",
             Self::DeepSeek => "DeepSeek",
+            Self::OpenCode => "OpenCode",
         }
     }
 
@@ -288,6 +293,7 @@ impl ProviderKind {
             Self::Codex => CODEX_ICON_ASSET,
             Self::KimiCode => KIMI_ICON_ASSET,
             Self::DeepSeek => DEEPSEEK_ICON_ASSET,
+            Self::OpenCode => OPENCODE_ICON_ASSET,
         }
     }
 }
@@ -394,10 +400,11 @@ pub struct DiscoWorkspace<J: EventJournal> {
     project_context_menu: Option<ProjectContextMenu>,
     composer: Entity<ComposerInput>,
     page: WorkspacePage,
-    settings_path: PathBuf,
-    settings: CodexUiSettings,
+    config_path: PathBuf,
+    config: AppConfig,
     runtime: Option<CodexRuntime>,
     runtime_error: Option<String>,
+    opencode_version: Option<String>,
     models: Vec<CodexModel>,
     selected_model_id: Option<String>,
     selected_effort: String,
@@ -407,11 +414,12 @@ pub struct DiscoWorkspace<J: EventJournal> {
     thinking_menu_open: bool,
     selected_provider: Option<ProviderKind>,
     kimi_endpoint_input: Entity<ComposerInput>,
-    kimi_model_input: Entity<ComposerInput>,
     kimi_api_key_input: Entity<ComposerInput>,
     deepseek_endpoint_input: Entity<ComposerInput>,
-    deepseek_model_input: Entity<ComposerInput>,
     deepseek_api_key_input: Entity<ComposerInput>,
+    remote_models: Vec<String>,
+    remote_models_loading: bool,
+    remote_models_error: Option<String>,
     settings_notice: Option<(bool, String)>,
     project_notice: Option<String>,
     stop_requested: bool,
@@ -421,9 +429,10 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     pub fn new(
         journal: J,
         composer: Entity<ComposerInput>,
-        settings_path: PathBuf,
+        config_path: PathBuf,
         workspace_path: PathBuf,
         connection: CodexConnection,
+        opencode_version: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&composer, |workspace, _, event: &ComposerSubmitted, cx| {
@@ -545,20 +554,16 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             session_id
         };
 
-        let saved = CodexUiSettings::load(&settings_path).unwrap_or_default();
+        let saved = AppConfig::load(&config_path).unwrap_or_default();
         let kimi_endpoint_input = cx.new(|cx| {
             ComposerInput::new(cx)
                 .with_placeholder("API endpoint")
                 .with_content(saved.kimi_code.endpoint.clone())
         });
-        let kimi_model_input = cx.new(|cx| {
-            ComposerInput::new(cx)
-                .with_placeholder("Model ID")
-                .with_content(saved.kimi_code.model.clone())
-        });
         let kimi_api_key_input = cx.new(|cx| {
             ComposerInput::new(cx)
                 .with_placeholder("Enter a new API key")
+                .with_content(saved.kimi_code.api_key.clone())
                 .secure(true)
         });
         let deepseek_endpoint_input = cx.new(|cx| {
@@ -566,22 +571,16 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                 .with_placeholder("API endpoint")
                 .with_content(saved.deepseek.endpoint.clone())
         });
-        let deepseek_model_input = cx.new(|cx| {
-            ComposerInput::new(cx)
-                .with_placeholder("Model ID")
-                .with_content(saved.deepseek.model.clone())
-        });
         let deepseek_api_key_input = cx.new(|cx| {
             ComposerInput::new(cx)
                 .with_placeholder("Enter a new API key")
+                .with_content(saved.deepseek.api_key.clone())
                 .secure(true)
         });
         for input in [
             &kimi_endpoint_input,
-            &kimi_model_input,
             &kimi_api_key_input,
             &deepseek_endpoint_input,
-            &deepseek_model_input,
             &deepseek_api_key_input,
         ] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
@@ -617,10 +616,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             project_context_menu: None,
             composer,
             page: WorkspacePage::Chat,
-            settings_path,
-            settings: saved,
+            config_path,
+            config: saved,
             runtime,
             runtime_error,
+            opencode_version,
             models,
             selected_model_id,
             selected_effort,
@@ -630,11 +630,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             thinking_menu_open: false,
             selected_provider: Some(ProviderKind::Codex),
             kimi_endpoint_input,
-            kimi_model_input,
             kimi_api_key_input,
             deepseek_endpoint_input,
-            deepseek_model_input,
             deepseek_api_key_input,
+            remote_models: Vec::new(),
+            remote_models_loading: false,
+            remote_models_error: None,
             settings_notice: None,
             project_notice,
             stop_requested: false,
@@ -812,8 +813,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.selected_chat_provider = ProviderKind::Codex;
         self.model_menu_open = false;
         self.thinking_menu_open = false;
-        self.settings.selected_model = self.selected_model_id.clone();
-        if let Err(error) = self.settings.save(&self.settings_path) {
+        self.config.selected_model = self.selected_model_id.clone();
+        if let Err(error) = self.config.save(&self.config_path) {
             self.runtime_error = Some(error);
         }
     }
@@ -823,12 +824,79 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.thinking_menu_open = false;
     }
 
-    fn open_provider_settings(&mut self, provider: ProviderKind) {
+    /// The endpoint and API key inputs plus the persisted settings for a remote
+    /// provider. Returns `None` for providers configured outside Disco.
+    fn remote_provider(
+        &mut self,
+        provider: ProviderKind,
+    ) -> Option<(
+        Entity<ComposerInput>,
+        Entity<ComposerInput>,
+        &mut RemoteProviderSettings,
+    )> {
+        match provider {
+            ProviderKind::KimiCode => Some((
+                self.kimi_endpoint_input.clone(),
+                self.kimi_api_key_input.clone(),
+                &mut self.config.kimi_code,
+            )),
+            ProviderKind::DeepSeek => Some((
+                self.deepseek_endpoint_input.clone(),
+                self.deepseek_api_key_input.clone(),
+                &mut self.config.deepseek,
+            )),
+            ProviderKind::Codex | ProviderKind::OpenCode => None,
+        }
+    }
+
+    fn open_provider_settings(&mut self, provider: ProviderKind, cx: &mut Context<Self>) {
         self.page = WorkspacePage::Settings;
         self.selected_provider = Some(provider);
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         self.settings_notice = None;
+        self.remote_models.clear();
+        self.remote_models_error = None;
+        self.refresh_remote_models(provider, cx);
+    }
+
+    fn refresh_remote_models(&mut self, provider: ProviderKind, cx: &mut Context<Self>) {
+        let Some((endpoint_input, api_key_input, _)) = self.remote_provider(provider) else {
+            return;
+        };
+        let endpoint = endpoint_input.read(cx).content().trim().to_owned();
+        let api_key = api_key_input.read(cx).content().trim().to_owned();
+        if endpoint.is_empty() || api_key.is_empty() {
+            self.remote_models_loading = false;
+            self.remote_models_error =
+                Some("Enter the API endpoint and API key to load models.".into());
+            return;
+        }
+        self.remote_models_loading = true;
+        self.remote_models_error = None;
+        let request = cx
+            .background_executor()
+            .spawn(async move { disco_rig_engine::list_models(&endpoint, &api_key).await });
+        cx.spawn(async move |workspace, cx| {
+            let result = request.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.remote_models_loading = false;
+                    match result {
+                        Ok(models) => workspace.remote_models = models,
+                        Err(error) => workspace.remote_models_error = Some(error),
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn select_remote_model(&mut self, provider: ProviderKind, model: String) {
+        if let Some((_, _, settings)) = self.remote_provider(provider) {
+            settings.model = model;
+        }
     }
 
     fn select_effort(&mut self, effort: String) {
@@ -842,66 +910,31 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn save_remote_provider(&mut self, provider: ProviderKind, cx: &mut Context<Self>) {
-        let (provider_id, endpoint_input, model_input, api_key_input, was_configured) =
-            match provider {
-                ProviderKind::KimiCode => (
-                    "kimi-code",
-                    self.kimi_endpoint_input.clone(),
-                    self.kimi_model_input.clone(),
-                    self.kimi_api_key_input.clone(),
-                    self.settings.kimi_code.credential_configured,
-                ),
-                ProviderKind::DeepSeek => (
-                    "deepseek",
-                    self.deepseek_endpoint_input.clone(),
-                    self.deepseek_model_input.clone(),
-                    self.deepseek_api_key_input.clone(),
-                    self.settings.deepseek.credential_configured,
-                ),
-                ProviderKind::Codex => return,
-            };
-        let endpoint = endpoint_input.read(cx).content().trim().to_owned();
-        let model = model_input.read(cx).content().trim().to_owned();
-        let api_key = api_key_input.read(cx).content().trim().to_owned();
-        if endpoint.is_empty() || model.is_empty() {
-            self.settings_notice = Some((
-                false,
-                "Endpoint and model are required before this provider can be configured.".into(),
-            ));
+        let Some((endpoint_input, api_key_input, provider_settings)) =
+            self.remote_provider(provider)
+        else {
             return;
-        }
-        if api_key.is_empty() && !was_configured {
-            self.settings_notice = Some((
-                false,
-                "Enter an API key. Disco stores it in macOS Keychain.".into(),
-            ));
-            return;
-        }
-        if !api_key.is_empty()
-            && let Err(error) = save_api_key(provider_id, &api_key)
-        {
-            self.settings_notice = Some((false, error));
-            return;
-        }
-
-        let provider_settings = match provider {
-            ProviderKind::KimiCode => &mut self.settings.kimi_code,
-            ProviderKind::DeepSeek => &mut self.settings.deepseek,
-            ProviderKind::Codex => return,
         };
-        provider_settings.endpoint = endpoint;
-        provider_settings.model = model;
-        provider_settings.credential_configured = was_configured || !api_key.is_empty();
-        match self.settings.save(&self.settings_path) {
-            Ok(()) => {
-                api_key_input.update(cx, |input, cx| input.set_content("", cx));
-                self.settings_notice = Some((
-                    true,
-                    "Provider configuration saved. The API key is in macOS Keychain.".into(),
-                ));
+        let endpoint = endpoint_input.read(cx).content().trim().to_owned();
+        let api_key = api_key_input.read(cx).content().trim().to_owned();
+        let notice = if endpoint.is_empty() || provider_settings.model.is_empty() {
+            (
+                false,
+                "The API endpoint and a model selection are required.".into(),
+            )
+        } else if api_key.is_empty() && !provider_settings.is_configured() {
+            (false, "Enter an API key to configure this provider.".into())
+        } else {
+            provider_settings.endpoint = endpoint;
+            if !api_key.is_empty() {
+                provider_settings.api_key = api_key;
             }
-            Err(error) => self.settings_notice = Some((false, error)),
-        }
+            match self.config.save(&self.config_path) {
+                Ok(()) => (true, "Provider configuration saved.".into()),
+                Err(error) => (false, error),
+            }
+        };
+        self.settings_notice = Some(notice);
     }
 
     fn start_run(&mut self, prompt: String, cx: &mut Context<Self>) {
@@ -2139,19 +2172,17 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             )
     }
 
-    fn remote_model_picker_detail(
-        &self,
+    /// The shared layout of a provider detail in the model picker: icon,
+    /// title, description, optional extra content, and the settings button.
+    fn picker_detail_shell(
         provider: ProviderKind,
+        title: &'static str,
+        description: String,
+        extra: Option<impl IntoElement>,
+        button_label: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let palette = AppAppearance::for_window(cx.window_appearance());
-        let settings = match provider {
-            ProviderKind::KimiCode => &self.settings.kimi_code,
-            ProviderKind::DeepSeek => &self.settings.deepseek,
-            ProviderKind::Codex => unreachable!("Codex models come from app-server"),
-        };
-        let configured = settings.credential_configured;
-        let model = settings.model.clone();
         div()
             .size_full()
             .px_5()
@@ -2179,7 +2210,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .mt_3()
                     .text_size(px(TYPE_BODY))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(provider.name()),
+                    .child(title),
             )
             .child(
                 div()
@@ -2188,37 +2219,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .text_size(px(TYPE_UI))
                     .line_height(px(18.))
                     .text_color(rgb(palette.muted))
-                    .child(if configured {
-                        "This provider is configured, but remote execution is not connected in this build. It cannot be selected for a real run yet."
-                    } else {
-                        "Configure the endpoint, model, and API key before this provider can be used."
-                    }),
+                    .child(description),
             )
-            .when(configured && !model.is_empty(), |content| {
-                content.child(
-                    div()
-                        .mt_4()
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(RADIUS_MEDIUM))
-                        .bg(rgb(palette.surface_subtle))
-                        .child(
-                            div()
-                                .text_size(px(TYPE_CAPTION))
-                                .text_color(rgb(palette.muted_light))
-                                .child("Configured model"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .truncate()
-                                .text_size(px(TYPE_UI))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(model),
-                        ),
-                )
-            })
+            .when_some(extra, |content, extra| content.child(extra))
             .child(div().flex_grow())
             .child(
                 div()
@@ -2236,24 +2239,78 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .hover(move |style| style.bg(rgb(palette.surface_hover)))
                     .active(move |style| style.bg(rgb(palette.surface_pressed)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_provider_settings(provider);
+                        this.open_provider_settings(provider, cx);
                         cx.notify();
                     }))
-                    .child(if configured {
-                        "Open provider settings"
-                    } else {
-                        "Configure provider"
-                    }),
+                    .child(button_label),
             )
     }
 
-    fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn remote_model_picker_detail(
+        &mut self,
+        provider: ProviderKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        let (configured, model) = match self.remote_provider(provider) {
+            Some((_, _, settings)) => (settings.is_configured(), settings.model.clone()),
+            None => unreachable!("Codex and OpenCode have their own picker details"),
+        };
+        let model_box = (configured && !model.is_empty()).then(|| {
+            div()
+                .mt_4()
+                .w_full()
+                .px_3()
+                .py_2()
+                .rounded(px(RADIUS_MEDIUM))
+                .bg(rgb(palette.surface_subtle))
+                .child(
+                    div()
+                        .text_size(px(TYPE_CAPTION))
+                        .text_color(rgb(palette.muted_light))
+                        .child("Configured model"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .truncate()
+                        .text_size(px(TYPE_UI))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(model),
+                )
+        });
+        Self::picker_detail_shell(
+            provider,
+            provider.name(),
+            if configured {
+                "This provider is configured, but remote execution is not connected in this build. It cannot be selected for a real run yet."
+            } else {
+                "Configure the endpoint, model, and API key before this provider can be used."
+            }
+            .to_owned(),
+            model_box,
+            if configured {
+                "Open provider settings"
+            } else {
+                "Configure provider"
+            },
+            cx,
+        )
+    }
+
+    fn model_picker(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = AppAppearance::for_window(cx.window_appearance());
         let codex_ready = self.runtime.is_some();
         let codex_count = self.models.len();
         let codex_count_label = Self::model_count_label(codex_count);
-        let kimi_configured = self.settings.kimi_code.credential_configured;
-        let deepseek_configured = self.settings.deepseek.credential_configured;
+        let kimi_configured = self.config.kimi_code.is_configured();
+        let deepseek_configured = self.config.deepseek.is_configured();
+        let opencode_ready = self.opencode_version.is_some();
+        let opencode_detail = self
+            .opencode_version
+            .as_deref()
+            .map(|version| format!("Installed {version}"))
+            .unwrap_or_else(|| "Not installed".into());
         let selected_model_id = self.selected_model_id.clone();
         let model_menu_provider = self.model_menu_provider;
 
@@ -2324,6 +2381,12 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             "Set up".into()
                         },
                         false,
+                        cx,
+                    ))
+                    .child(self.model_picker_provider_row(
+                        ProviderKind::OpenCode,
+                        opencode_detail,
+                        opencode_ready,
                         cx,
                     )),
             )
@@ -2458,8 +2521,29 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     })
                     .when(model_menu_provider == ProviderKind::DeepSeek, |panel| {
                         panel.child(self.remote_model_picker_detail(ProviderKind::DeepSeek, cx))
+                    })
+                    .when(model_menu_provider == ProviderKind::OpenCode, |panel| {
+                        panel.child(self.opencode_model_picker_detail(cx))
                     }),
             )
+    }
+
+    fn opencode_model_picker_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Self::picker_detail_shell(
+            ProviderKind::OpenCode,
+            "OpenCode CLI",
+            if let Some(version) = self.opencode_version.as_deref() {
+                format!(
+                    "Installed version {version}. Models, credentials, and tools come \
+                     from OpenCode's own configuration."
+                )
+            } else {
+                "OpenCode CLI is not installed. Install it to use this provider.".into()
+            },
+            None::<gpui::Div>,
+            "Open provider settings",
+            cx,
+        )
     }
 
     fn provider_row(&self, provider: ProviderSummary, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2611,6 +2695,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         label: &'static str,
         input: Entity<ComposerInput>,
         palette: AppAppearance,
+        trailing: Option<impl IntoElement>,
     ) -> impl IntoElement {
         div()
             .h(px(44.))
@@ -2632,35 +2717,48 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .px_2()
                     .flex()
                     .items_center()
+                    .gap_1()
                     .rounded(px(RADIUS_SMALL))
                     .bg(rgb(palette.surface))
                     .border_1()
                     .border_color(rgb(palette.border_strong))
-                    .child(input),
+                    .child(div().flex_1().child(input))
+                    .when_some(trailing, |row, trailing| row.child(trailing)),
             )
     }
 
     fn remote_provider_detail(
-        &self,
+        &mut self,
         provider: ProviderKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<J> {
         let palette = AppAppearance::for_window(cx.window_appearance());
-        let (endpoint, model, api_key, configured) = match provider {
-            ProviderKind::KimiCode => (
-                self.kimi_endpoint_input.clone(),
-                self.kimi_model_input.clone(),
-                self.kimi_api_key_input.clone(),
-                self.settings.kimi_code.credential_configured,
-            ),
-            ProviderKind::DeepSeek => (
-                self.deepseek_endpoint_input.clone(),
-                self.deepseek_model_input.clone(),
-                self.deepseek_api_key_input.clone(),
-                self.settings.deepseek.credential_configured,
-            ),
-            ProviderKind::Codex => unreachable!("Codex uses its local runtime settings"),
+        let (endpoint, api_key, configured) = match self.remote_provider(provider) {
+            Some((endpoint, api_key, settings)) => (endpoint, api_key, settings.is_configured()),
+            None => unreachable!("Codex and OpenCode have their own provider details"),
         };
+        let masked = api_key.read(cx).is_secure();
+        let toggle_api_key = api_key.clone();
+        let reveal_button = div()
+            .id(("reveal-api-key", provider as usize))
+            .cursor(CursorStyle::PointingHand)
+            .rounded(px(4.))
+            .p_1()
+            .hover(move |style| style.bg(rgb(palette.surface_hover)))
+            .active(move |style| style.bg(rgb(palette.surface_pressed)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                toggle_api_key.update(cx, |input, cx| input.set_secure(!input.is_secure(), cx));
+            }))
+            .child(
+                svg()
+                    .path(if masked {
+                        EYE_ICON_ASSET
+                    } else {
+                        EYE_OFF_ICON_ASSET
+                    })
+                    .size(px(16.))
+                    .text_color(rgb(palette.muted)),
+            );
         div()
             .px_4()
             .py_4()
@@ -2673,9 +2771,19 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(Self::settings_input("API endpoint", endpoint, palette))
-                    .child(Self::settings_input("Model", model, palette))
-                    .child(Self::settings_input("API key", api_key, palette)),
+                    .child(Self::settings_input(
+                        "API endpoint",
+                        endpoint,
+                        palette,
+                        None::<gpui::Div>,
+                    ))
+                    .child(Self::settings_input(
+                        "API key",
+                        api_key,
+                        palette,
+                        Some(reveal_button),
+                    ))
+                    .child(self.remote_model_picker(provider, palette, cx)),
             )
             .child(
                 div()
@@ -2684,59 +2792,198 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .line_height(px(16.))
                     .text_color(rgb(palette.muted))
                     .child(if configured {
-                        "The API key is stored in macOS Keychain. Leave the field blank to keep it."
+                        "The API key is saved. Enter a new one to replace it."
                     } else {
-                        "Endpoint and model are required. The API key is stored only in macOS Keychain."
+                        "Enter the API endpoint and API key, then choose a model."
                     }),
             )
-            .when_some(self.settings_notice.clone(), |content, (success, notice)| {
-                content.child(
+            .when_some(
+                self.settings_notice.clone(),
+                |content, (success, notice)| {
+                    content.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(RADIUS_MEDIUM))
+                            .bg(rgb(if success {
+                                palette.blue_tint
+                            } else {
+                                palette.conversation.failure_surface
+                            }))
+                            .text_size(px(TYPE_UI))
+                            .text_color(rgb(if success { palette.green } else { palette.red }))
+                            .child(notice),
+                    )
+                },
+            )
+            .child(
+                div().flex().items_center().justify_end().pt_1().child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(RADIUS_MEDIUM))
-                        .bg(rgb(if success {
-                            palette.blue_tint
-                        } else {
-                            palette.conversation.failure_surface
+                        .id(("save-provider", provider as usize))
+                        .h(px(28.))
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(RADIUS_SMALL))
+                        .cursor_pointer()
+                        .bg(rgb(palette.blue))
+                        .text_size(px(TYPE_CAPTION))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .hover(move |style| style.bg(rgb(palette.blue_hover)))
+                        .active(move |style| style.bg(rgb(palette.blue_active)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_remote_provider(provider, cx);
+                            cx.notify();
                         }))
-                        .text_size(px(TYPE_UI))
-                        .text_color(rgb(if success {
-                            palette.green
-                        } else {
-                            palette.red
-                        }))
-                        .child(notice),
-                )
-            })
+                        .child("Save"),
+                ),
+            )
+    }
+
+    fn remote_model_picker(
+        &mut self,
+        provider: ProviderKind,
+        palette: AppAppearance,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected_model = match self.remote_provider(provider) {
+            Some((_, _, settings)) => settings.model.clone(),
+            None => unreachable!("Codex and OpenCode have their own picker details"),
+        };
+        div()
+            .pt_1()
+            .flex()
+            .flex_col()
+            .gap_2()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_end()
-                    .pt_1()
+                    .justify_between()
                     .child(
                         div()
-                            .id(("save-provider", provider as usize))
-                            .h(px(28.))
-                            .px_4()
+                            .text_size(px(TYPE_UI))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Model"),
+                    )
+                    .child(
+                        div()
+                            .id(("refresh-models", provider as usize))
+                            .h(px(26.))
+                            .px_2()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(RADIUS_SMALL))
                             .cursor_pointer()
-                            .bg(rgb(palette.blue))
+                            .bg(rgb(palette.settings_control))
                             .text_size(px(TYPE_CAPTION))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffffff))
-                            .hover(move |style| style.bg(rgb(palette.blue_hover)))
-                            .active(move |style| style.bg(rgb(palette.blue_active)))
+                            .font_weight(FontWeight::MEDIUM)
+                            .hover(move |style| style.bg(rgb(palette.surface_hover)))
+                            .active(move |style| style.bg(rgb(palette.surface_pressed)))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_remote_provider(provider, cx);
+                                this.refresh_remote_models(provider, cx);
                                 cx.notify();
                             }))
-                            .child("Save"),
+                            .child(if self.remote_models_loading {
+                                "Fetching…"
+                            } else {
+                                "Refresh"
+                            }),
                     ),
+            )
+            .when_some(self.remote_models_error.clone(), |content, error| {
+                content.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(RADIUS_SMALL))
+                        .bg(rgb(palette.conversation.failure_surface))
+                        .text_size(px(TYPE_CAPTION))
+                        .text_color(rgb(palette.red))
+                        .child(error),
+                )
+            })
+            .when(self.remote_models_loading, |content| {
+                content.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_size(px(TYPE_UI))
+                        .text_color(rgb(palette.muted))
+                        .child("Fetching available models…"),
+                )
+            })
+            .when(
+                !self.remote_models_loading && self.remote_models_error.is_none(),
+                |content| {
+                    if self.remote_models.is_empty() {
+                        content.child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_size(px(TYPE_UI))
+                                .text_color(rgb(palette.muted))
+                                .child("No models loaded yet."),
+                        )
+                    } else {
+                        content.child(
+                            div()
+                                .id(("remote-model-list", provider as usize))
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .children(self.remote_models.iter().enumerate().map(
+                                    |(index, model)| {
+                                        let model_id = model.clone();
+                                        let selected = model_id == selected_model;
+                                        div()
+                                            .id(("remote-model-option", index))
+                                            .h(px(34.))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(RADIUS_SMALL))
+                                            .cursor_pointer()
+                                            .bg(rgb(if selected {
+                                                palette.blue_tint
+                                            } else {
+                                                palette.surface
+                                            }))
+                                            .hover(move |style| {
+                                                style.bg(rgb(palette.surface_hover))
+                                            })
+                                            .active(move |style| {
+                                                style.bg(rgb(palette.surface_pressed))
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select_remote_model(
+                                                    provider,
+                                                    model_id.clone(),
+                                                );
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .text_size(px(TYPE_UI))
+                                                    .text_color(rgb(if selected {
+                                                        palette.text
+                                                    } else {
+                                                        palette.muted
+                                                    }))
+                                                    .child(model.clone()),
+                                            )
+                                    },
+                                )),
+                        )
+                    }
+                },
             )
     }
 
@@ -2927,9 +3174,94 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             )
     }
 
-    fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn opencode_provider_detail(&self, cx: &mut Context<Self>) -> impl IntoElement + use<J> {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        let installed = self.opencode_version.is_some();
+        let status = self
+            .opencode_version
+            .as_deref()
+            .map(|version| format!("Installed version {version}"))
+            .unwrap_or_else(|| "Not installed".into());
+        div()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgb(palette.surface_subtle))
+            .child(
+                div()
+                    .px_1()
+                    .text_size(px(TYPE_UI))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Runtime"),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .rounded(px(RADIUS_LARGE))
+                    .bg(rgb(palette.surface))
+                    .border_1()
+                    .border_color(rgb(palette.settings_separator))
+                    .child(
+                        div()
+                            .h(px(42.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(TYPE_UI))
+                                    .text_color(rgb(palette.muted))
+                                    .child("opencode acp"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().size(px(7.)).rounded_full().bg(rgb(
+                                        if installed {
+                                            palette.green
+                                        } else {
+                                            palette.muted_light
+                                        },
+                                    )))
+                                    .child(
+                                        div()
+                                            .text_size(px(TYPE_UI))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(status),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .text_size(px(TYPE_CAPTION))
+                    .line_height(px(16.))
+                    .text_color(rgb(palette.muted))
+                    .child(if installed {
+                        "Models, credentials, and tools come from OpenCode's own \
+                         configuration; select them inside OpenCode."
+                    } else {
+                        "Install the OpenCode CLI to use it as a provider. \
+                         Models, credentials, and tools come from OpenCode's own \
+                         configuration; select them inside OpenCode."
+                    }),
+            )
+    }
+
+    fn settings_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = AppAppearance::for_window(cx.window_appearance());
         let connected = self.runtime.is_some();
+        let kimi_configured = self.config.kimi_code.is_configured();
+        let deepseek_configured = self.config.deepseek.is_configured();
+        let opencode_configured = self.opencode_version.is_some();
+        let kimi_detail = self.remote_provider_detail(ProviderKind::KimiCode, cx);
+        let deepseek_detail = self.remote_provider_detail(ProviderKind::DeepSeek, cx);
         div()
             .absolute()
             .top(px(0.))
@@ -3089,14 +3421,14 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                             name: "Kimi Code",
                                             description: "OpenAI-compatible API",
                                             icon: KIMI_ICON_ASSET,
-                                            configured: self.settings.kimi_code.credential_configured,
-                                            status: if self.settings.kimi_code.credential_configured {
+                                            configured: kimi_configured,
+                                            status: if kimi_configured {
                                                 "Configured"
                                             } else {
                                                 "Not configured"
                                             },
                                         },
-                                        self.remote_provider_detail(ProviderKind::KimiCode, cx),
+                                        kimi_detail,
                                         cx,
                                     ))
                                     .child(self.provider_accordion_item(
@@ -3105,14 +3437,30 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                             name: "DeepSeek",
                                             description: "OpenAI-compatible API",
                                             icon: DEEPSEEK_ICON_ASSET,
-                                            configured: self.settings.deepseek.credential_configured,
-                                            status: if self.settings.deepseek.credential_configured {
+                                            configured: deepseek_configured,
+                                            status: if deepseek_configured {
                                                 "Configured"
                                             } else {
                                                 "Not configured"
                                             },
                                         },
-                                        self.remote_provider_detail(ProviderKind::DeepSeek, cx),
+                                        deepseek_detail,
+                                        cx,
+                                    ))
+                                    .child(self.provider_accordion_item(
+                                        ProviderSummary {
+                                            kind: ProviderKind::OpenCode,
+                                            name: "OpenCode",
+                                            description: "Local CLI agent (ACP)",
+                                            icon: OPENCODE_ICON_ASSET,
+                                            configured: opencode_configured,
+                                            status: if opencode_configured {
+                                                "Installed"
+                                            } else {
+                                                "Not installed"
+                                            },
+                                        },
+                                        self.opencode_provider_detail(cx),
                                         cx,
                                     )),
                             ),
@@ -3703,6 +4051,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-settings-{marker}.json")),
                     PathBuf::from(format!("/tmp/disco-project-{marker}")),
                     Err("Codex unavailable in test".into()),
+                    None,
                     cx,
                 )
             });
@@ -3773,6 +4122,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
                     project_path,
                     Err("Codex unavailable in test".into()),
+                    None,
                     cx,
                 )
             })
@@ -3800,6 +4150,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
                     project_path.clone(),
                     Err("Codex unavailable in test".into()),
+                    None,
                     cx,
                 )
             });
@@ -3843,6 +4194,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
                     PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
                     Err("Codex unavailable in test".into()),
+                    None,
                     cx,
                 )
             })
@@ -3871,6 +4223,36 @@ mod tests {
                     super::SidebarItem::Project(project_id)
                 );
             });
+        });
+    }
+
+    #[gpui::test]
+    fn api_key_inputs_start_masked(cx: &mut TestAppContext) {
+        let (_, workspace) = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            let workspace = cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer.clone(),
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    None,
+                    cx,
+                )
+            });
+            (composer, workspace)
+        });
+
+        cx.update(|cx| {
+            assert!(workspace.read(cx).kimi_api_key_input.read(cx).is_secure());
+            assert!(
+                workspace
+                    .read(cx)
+                    .deepseek_api_key_input
+                    .read(cx)
+                    .is_secure()
+            );
         });
     }
 }

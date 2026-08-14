@@ -69,7 +69,7 @@ mod tests {
             assets
                 .list("icons/providers")
                 .expect("the provider icon directory should be readable"),
-            ["codex.png", "deepseek.svg", "kimi-code.png"]
+            ["codex.png", "deepseek.svg", "kimi-code.png", "opencode.svg"]
                 .map(SharedString::from)
                 .to_vec()
         );

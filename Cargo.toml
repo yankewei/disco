@@ -5,6 +5,7 @@ members = [
     "crates/disco-codex-engine",
     "crates/disco-domain",
     "crates/disco-kernel",
+    "crates/disco-opencode-engine",
     "crates/disco-protocol",
     "crates/disco-rig-engine",
     "crates/disco-storage",
@@ -21,10 +22,11 @@ repository = "https://github.com/yankewei/disco"
 rust-version = "1.96"
 
 [workspace.dependencies]
+agent-client-protocol = "2.0.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
-keyring = "4.1.0"
+toml = "0.9"
 rig = { version = "0.41.0", default-features = false, features = ["agent", "derive", "rustls"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"

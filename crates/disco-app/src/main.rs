@@ -5,6 +5,7 @@ mod assets;
 use assets::DiscoAssets;
 use directories::ProjectDirs;
 use disco_codex_engine::CodexRuntime;
+use disco_opencode_engine::discover_opencode;
 use disco_storage::SqliteJournal;
 use disco_ui::{ComposerInput, DiscoWorkspace, init_composer_input};
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
@@ -19,17 +20,20 @@ fn main() {
         .compact()
         .init();
 
-    let project_dirs = ProjectDirs::from("dev", "Disco", "disco")
+    let project_dirs = ProjectDirs::from("com", "yankewei", "disco")
         .expect("the operating system should expose an application data directory");
     fs::create_dir_all(project_dirs.data_dir())
         .expect("the Disco application data directory should be writable");
     let journal = SqliteJournal::open(project_dirs.data_dir().join("runs.sqlite3"))
         .expect("the run journal should open");
-    let settings_path = project_dirs.data_dir().join("model-settings.json");
+    let config_path = project_dirs.data_dir().join("config.toml");
     let workspace_path = resolve_workspace_path();
     let codex_connection = CodexRuntime::connect(&workspace_path)
         .and_then(|runtime| runtime.list_models().map(|models| (runtime, models)))
         .map_err(|error| error.to_string());
+    let opencode_version = discover_opencode()
+        .ok()
+        .map(|installation| installation.version);
     Application::new()
         .with_assets(DiscoAssets::discover())
         .run(move |cx: &mut App| {
@@ -56,9 +60,10 @@ fn main() {
                         DiscoWorkspace::new(
                             journal,
                             composer,
-                            settings_path,
+                            config_path,
                             workspace_path,
                             codex_connection,
+                            opencode_version,
                             cx,
                         )
                     })

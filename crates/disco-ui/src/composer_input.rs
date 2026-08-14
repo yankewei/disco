@@ -114,6 +114,10 @@ impl ComposerInput {
         cx.notify();
     }
 
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
     pub fn is_empty(&self) -> bool {
         self.content.trim().is_empty()
     }

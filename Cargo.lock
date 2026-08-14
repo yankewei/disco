@@ -30,6 +30,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-client-protocol"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8"
+dependencies = [
+ "agent-client-protocol-derive",
+ "agent-client-protocol-schema",
+ "async-io",
+ "async-process",
+ "blocking",
+ "futures",
+ "futures-concurrency",
+ "rustc-hash 2.1.3",
+ "rustix 1.1.4",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agent-client-protocol-derive"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3abd4080f51e4f24f5042beb7fb7a66ede29a2dc1c2582c329532e1c27264ddc"
+dependencies = [
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "agent-client-protocol-schema"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c"
+dependencies = [
+ "anyhow",
+ "derive_more 2.1.1",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum 0.28.0",
+ "tracing",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,17 +156,6 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
-name = "apple-native-keyring-store"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
-dependencies = [
- "keyring-core",
- "log",
- "security-framework",
-]
 
 [[package]]
 name = "ar_archive_writer"
@@ -1579,6 +1618,15 @@ checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
 
 [[package]]
 name = "convert_case"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "convert_case"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
@@ -2723,6 +2771,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_more"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
+dependencies = [
+ "convert_case 0.10.0",
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "syn 2.0.119",
+ "unicode-xid",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2821,6 +2892,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "disco-codex-engine",
+ "disco-opencode-engine",
  "disco-storage",
  "disco-ui",
  "gpui",
@@ -2851,6 +2923,16 @@ version = "0.1.0"
 dependencies = [
  "disco-domain",
  "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "disco-opencode-engine"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "futures",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -2900,10 +2982,12 @@ dependencies = [
  "disco-codex-engine",
  "disco-domain",
  "disco-kernel",
+ "disco-rig-engine",
  "gpui",
- "keyring",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
  "unicode-segmentation",
 ]
 
@@ -3517,6 +3601,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-concurrency"
+version = "7.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175cd8cca9e1d45b87f18ffa75088f2099e3c4fe5e2f83e42de112560bea8ea6"
+dependencies = [
+ "fixedbitset",
+ "futures-core",
+ "futures-lite 2.6.1",
+ "pin-project",
+ "smallvec",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3834,7 +3931,7 @@ dependencies = [
  "core-video",
  "cosmic-text",
  "ctor",
- "derive_more",
+ "derive_more 0.99.20",
  "embed-resource",
  "etagere",
  "filedescriptor",
@@ -3945,7 +4042,7 @@ dependencies = [
  "async-compression",
  "async-fs",
  "bytes",
- "derive_more",
+ "derive_more 0.99.20",
  "futures",
  "gpui_util",
  "http",
@@ -4865,27 +4962,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0f9d9652540055ac4fded998a73aca97d965899077ab1212587437da44196ff"
 dependencies = [
  "bitflags 1.3.2",
-]
-
-[[package]]
-name = "keyring"
-version = "4.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72585bb6cc9bc370d1d545b7e23fcce71dfd4461c5e15275e3cf51bdfd9a980a"
-dependencies = [
- "apple-native-keyring-store",
- "keyring-core",
- "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
-]
-
-[[package]]
-name = "keyring-core"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
-dependencies = [
- "log",
 ]
 
 [[package]]
@@ -8287,25 +8363,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
-name = "secret-service"
-version = "5.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a62d7f86047af0077255a29494136b9aaaf697c76ff70b8e49cded4e2623c14"
-dependencies = [
- "aes",
- "cbc",
- "futures-util",
- "generic-array",
- "getrandom 0.2.17",
- "hkdf",
- "num",
- "once_cell",
- "serde",
- "sha2 0.10.9",
- "zbus",
-]
-
-[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8563,6 +8620,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
@@ -9534,6 +9597,21 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned 1.1.1",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
 version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
@@ -9554,6 +9632,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -9914,6 +10001,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unicode_categories"
@@ -10573,19 +10666,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
-name = "windows-native-keyring-store"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
-dependencies = [
- "byteorder",
- "keyring-core",
- "regex",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
 name = "windows-numerics"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11169,17 +11249,6 @@ dependencies = [
  "zbus_macros",
  "zbus_names",
  "zvariant",
-]
-
-[[package]]
-name = "zbus-secret-service-keyring-store"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ccede190ba363386a24e8021c7f3848393976609ec9f5d1f8c6c09ef37075b4"
-dependencies = [
- "keyring-core",
- "secret-service",
- "zbus",
 ]
 
 [[package]]
