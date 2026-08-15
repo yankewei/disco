@@ -5,3 +5,10 @@ DerivedData/
 
 # 测试覆盖率产物
 *.profraw
+dist/
+
+# Rust daemon 构建产物
+disco-daemon/target/
+
+# 旧架构 Xcode 构建产物
+macos/build/
