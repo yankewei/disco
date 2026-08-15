@@ -17,6 +17,7 @@ use disco_domain::{
     ToolCall,
 };
 use disco_kernel::{ActivityItem, ActivityKind, EventJournal, Kernel, ProjectStore, RunProjection};
+use disco_opencode_engine::{OpenCodeModel, OpenCodeRuntime, OpenCodeTurnResult, connect as connect_opencode};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AppContext, ClipboardItem, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
@@ -312,6 +313,7 @@ struct ProviderSummary {
 struct ChatConversation {
     session_id: SessionId,
     codex_thread_id: Option<String>,
+    opencode_session_id: Option<String>,
     draft: String,
     turns: Vec<RunProjection>,
 }
@@ -321,6 +323,7 @@ impl ChatConversation {
         Self {
             session_id: SessionId::new(),
             codex_thread_id: None,
+            opencode_session_id: None,
             draft: String::new(),
             turns: Vec::new(),
         }
@@ -330,6 +333,7 @@ impl ChatConversation {
         Self {
             session_id,
             codex_thread_id: None,
+            opencode_session_id: None,
             draft: String::new(),
             turns: Vec::new(),
         }
@@ -404,7 +408,11 @@ pub struct DiscoWorkspace<J: EventJournal> {
     config: AppConfig,
     runtime: Option<CodexRuntime>,
     runtime_error: Option<String>,
+    opencode_runtime: Option<OpenCodeRuntime>,
     opencode_version: Option<String>,
+    opencode_models: Vec<OpenCodeModel>,
+    opencode_models_error: Option<String>,
+    selected_opencode_model_id: Option<String>,
     models: Vec<CodexModel>,
     selected_model_id: Option<String>,
     selected_effort: String,
@@ -433,6 +441,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         workspace_path: PathBuf,
         connection: CodexConnection,
         opencode_version: Option<String>,
+        opencode_models: Result<Vec<OpenCodeModel>, String>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&composer, |workspace, _, event: &ComposerSubmitted, cx| {
@@ -443,6 +452,13 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
 
         let kernel = Kernel::new(journal);
+        // The ACP runtime is only connected when OpenCode is installed; tests pass
+        // `opencode_version: None` and stay free of subprocess side effects.
+        let opencode_runtime = if opencode_version.is_some() {
+            connect_opencode(&workspace_path).ok()
+        } else {
+            None
+        };
         let initial_project = Project::new(Self::project_name(&workspace_path), workspace_path);
         let (current_project, mut project_notice) =
             match kernel.register_project(initial_project.clone()) {
@@ -605,6 +621,15 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .and_then(|selected| models.iter().find(|model| model.id == selected))
             .map(|model| model.default_reasoning_effort.clone())
             .unwrap_or_else(|| "medium".into());
+        let (opencode_models, opencode_models_error) = match opencode_models {
+            Ok(models) => (models, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let selected_opencode_model_id = saved
+            .selected_opencode_model
+            .clone()
+            .filter(|saved| opencode_models.iter().any(|model| model.id == *saved))
+            .or_else(|| opencode_models.first().map(|model| model.id.clone()));
         let sidebar_focus_handle = cx.focus_handle().tab_stop(true);
         Self {
             kernel,
@@ -620,7 +645,11 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             config: saved,
             runtime,
             runtime_error,
+            opencode_runtime,
             opencode_version,
+            opencode_models,
+            opencode_models_error,
+            selected_opencode_model_id,
             models,
             selected_model_id,
             selected_effort,
@@ -814,6 +843,33 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         self.config.selected_model = self.selected_model_id.clone();
+        self.persist_config();
+    }
+
+    fn selected_opencode_model(&self) -> Option<&OpenCodeModel> {
+        let selected = self.selected_opencode_model_id.as_deref()?;
+        self.opencode_models
+            .iter()
+            .find(|model| model.id == selected)
+    }
+
+    fn select_opencode_model(&mut self, model_id: String) {
+        if !self
+            .opencode_models
+            .iter()
+            .any(|model| model.id == model_id)
+        {
+            return;
+        }
+        self.selected_opencode_model_id = Some(model_id);
+        self.selected_chat_provider = ProviderKind::OpenCode;
+        self.model_menu_open = false;
+        self.thinking_menu_open = false;
+        self.config.selected_opencode_model = self.selected_opencode_model_id.clone();
+        self.persist_config();
+    }
+
+    fn persist_config(&mut self) {
         if let Err(error) = self.config.save(&self.config_path) {
             self.runtime_error = Some(error);
         }
@@ -954,11 +1010,17 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         let run_id = RunId::new();
+        let engine = match self.selected_chat_provider {
+            ProviderKind::OpenCode => EngineKind::Acp {
+                implementation: "opencode".into(),
+            },
+            _ => EngineKind::Codex,
+        };
         let started = self.kernel.start_run(
             run_id,
             project_id,
             session_id,
-            EngineKind::Codex,
+            engine,
             Some(workspace.to_string_lossy().into_owned()),
             prompt.clone(),
         );
@@ -978,7 +1040,19 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         {
             return;
         }
+        match self.selected_chat_provider {
+            ProviderKind::OpenCode => self.start_opencode_turn(run_id, &workspace, cx),
+            _ => self.start_codex_turn(run_id, thread_id, &workspace, cx),
+        }
+    }
 
+    fn start_codex_turn(
+        &mut self,
+        run_id: RunId,
+        thread_id: Option<String>,
+        workspace: &Path,
+        cx: &mut Context<Self>,
+    ) {
         let Some(runtime) = self.runtime.clone() else {
             self.record_failure(
                 run_id,
@@ -1005,6 +1079,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .and_then(ChatConversation::current)
             .and_then(|turn| turn.prompt.clone())
             .unwrap_or_default();
+        let workspace = workspace.to_owned();
         let request = cx.background_executor().spawn(async move {
             runtime.run_turn(thread_id.as_deref(), &workspace, &prompt, &model, &effort)
         });
@@ -1018,6 +1093,78 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                 .ok();
         })
         .detach();
+    }
+
+    fn start_opencode_turn(&mut self, run_id: RunId, workspace: &Path, cx: &mut Context<Self>) {
+        let Some(runtime) = self.opencode_runtime.clone() else {
+            self.record_failure(
+                run_id,
+                "opencode_not_available",
+                self.opencode_models_error
+                    .clone()
+                    .unwrap_or_else(|| "OpenCode CLI is not available.".into()),
+            );
+            return;
+        };
+        let session = match self.ensure_opencode_session(workspace) {
+            Ok(session) => session,
+            Err(error) => {
+                self.record_failure(run_id, "opencode_session_failed", error);
+                return;
+            }
+        };
+        let Some(model) = self.selected_opencode_model_id.clone() else {
+            self.record_failure(
+                run_id,
+                "opencode_model_not_available",
+                "No OpenCode model selected.".into(),
+            );
+            return;
+        };
+        runtime.prepare_turn();
+        self.stop_requested = false;
+        let prompt = self
+            .active_task()
+            .and_then(ChatConversation::current)
+            .and_then(|turn| turn.prompt.clone())
+            .unwrap_or_default();
+        let request = cx.background_executor().spawn(async move {
+            runtime
+                .run_turn(&session, &prompt, &model)
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |workspace, cx| {
+            let result = request.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.finish_opencode_run(run_id, result);
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Returns the active task's ACP session, creating one on first use. ACP
+    /// sessions die with the `opencode acp` process, so they are held in memory
+    /// only and recreated after an app restart.
+    fn ensure_opencode_session(&mut self, workspace: &Path) -> Result<String, String> {
+        if let Some(session) = self
+            .active_task()
+            .and_then(|task| task.opencode_session_id.clone())
+        {
+            return Ok(session);
+        }
+        let Some(runtime) = self.opencode_runtime.as_ref() else {
+            return Err("OpenCode CLI is not available.".into());
+        };
+        let session = runtime
+            .new_session(workspace)
+            .map_err(|error| error.to_string())?;
+        if let Some(task) = self.active_task_mut() {
+            task.opencode_session_id = Some(session.clone());
+        }
+        Ok(session)
     }
 
     fn terminal_event(interrupted: bool) -> RunEventPayload {
@@ -1078,6 +1225,53 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         }
     }
 
+    fn finish_opencode_run(&mut self, run_id: RunId, result: Result<OpenCodeTurnResult, String>) {
+        self.stop_requested = false;
+        match result {
+            Ok(result) => {
+                for activity in result.activities {
+                    let detail = activity.detail.clone();
+                    let call = ToolCall {
+                        call_id: activity.id.clone(),
+                        name: activity.title,
+                        arguments: json!({ "detail": detail }),
+                    };
+                    self.record(run_id, RunEventPayload::ToolRequested { call });
+                    self.record(
+                        run_id,
+                        RunEventPayload::ToolCompleted {
+                            call_id: activity.id,
+                            success: activity.success,
+                            output: activity.detail,
+                        },
+                    );
+                }
+                if !result.text.is_empty() {
+                    self.record(
+                        run_id,
+                        RunEventPayload::AssistantContentDelta { text: result.text },
+                    );
+                }
+                // ACP usage is context-window semantics (tokens consumed vs
+                // window size) and carries no input/output split, so only the
+                // total is reported; the usage label renders it as a plain
+                // token count.
+                self.record(
+                    run_id,
+                    RunEventPayload::UsageUpdated {
+                        usage: TokenUsage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            total_tokens: result.usage.used,
+                        },
+                    },
+                );
+                self.record(run_id, Self::terminal_event(result.interrupted));
+            }
+            Err(error) => self.record_failure(run_id, "opencode_turn_failed", error),
+        }
+    }
+
     fn record(&mut self, run_id: RunId, payload: RunEventPayload) {
         if let Ok(projection) = self.kernel.record(run_id, payload)
             && let Some(task) = self.task_for_run_mut(run_id)
@@ -1121,20 +1315,38 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         {
             return;
         }
-        let Some(runtime) = self.runtime.as_ref() else {
-            return;
-        };
-        match runtime.interrupt_turn() {
-            Ok(()) => self.stop_requested = true,
-            Err(_) => {
-                // Do not record a terminal RunFailed here: the turn is still
-                // executing, and a terminal event would orphan its real outcome
-                // (finish_run's events are rejected as EventAfterTerminal) and
-                // flip the UI back to send mode mid-run. Leave the run running;
-                // stop_requested stays false so the stop button stays active
-                // for a retry.
+        match self.selected_chat_provider {
+            ProviderKind::OpenCode => {
+                let Some(runtime) = self.opencode_runtime.as_ref() else {
+                    return;
+                };
+                let Some(session) = self
+                    .active_task()
+                    .and_then(|task| task.opencode_session_id.as_deref())
+                    .map(str::to_owned)
+                else {
+                    return;
+                };
+                if runtime.cancel_turn(&session).is_err() {
+                    return;
+                }
+            }
+            _ => {
+                let Some(runtime) = self.runtime.as_ref() else {
+                    return;
+                };
+                if runtime.interrupt_turn().is_err() {
+                    // Do not record a terminal RunFailed here: the turn is still
+                    // executing, and a terminal event would orphan its real outcome
+                    // (finish_run's events are rejected as EventAfterTerminal) and
+                    // flip the UI back to send mode mid-run. Leave the run running;
+                    // stop_requested stays false so the stop button stays active
+                    // for a retry.
+                    return;
+                }
             }
         }
+        self.stop_requested = true;
     }
 
     fn new_task_for_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
@@ -1732,16 +1944,24 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                             )
                         })
                         .when(usage.total_tokens > 0, |column| {
+                            // Engines that only report a cumulative count (ACP
+                            // context usage) have no input/output split to show.
+                            let label =
+                                if usage.input_tokens == 0 && usage.output_tokens == 0 {
+                                    Self::token_count_label(usage.total_tokens)
+                                } else {
+                                    format!(
+                                        "{} input · {} output",
+                                        Self::token_count_label(usage.input_tokens),
+                                        Self::token_count_label(usage.output_tokens)
+                                    )
+                                };
                             column.child(
                                 div()
                                     .pt_1()
                                     .text_size(px(TYPE_CAPTION))
                                     .text_color(rgb(palette.muted_light))
-                                    .child(format!(
-                                        "{} input · {} output",
-                                        Self::token_count_label(usage.input_tokens),
-                                        Self::token_count_label(usage.output_tokens)
-                                    )),
+                                    .child(label),
                             )
                         }),
                 )
@@ -2223,27 +2443,34 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             )
             .when_some(extra, |content, extra| content.child(extra))
             .child(div().flex_grow())
-            .child(
-                div()
-                    .id(("chat-provider-settings", provider as usize))
-                    .h(px(30.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(RADIUS_SMALL))
-                    .cursor_pointer()
-                    .bg(rgb(palette.settings_control))
-                    .text_size(px(TYPE_UI))
-                    .font_weight(FontWeight::MEDIUM)
-                    .hover(move |style| style.bg(rgb(palette.surface_hover)))
-                    .active(move |style| style.bg(rgb(palette.surface_pressed)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_provider_settings(provider, cx);
-                        cx.notify();
-                    }))
-                    .child(button_label),
-            )
+            .child(Self::picker_settings_button(provider, button_label, cx))
+    }
+
+    fn picker_settings_button(
+        provider: ProviderKind,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        div()
+            .id(("chat-provider-settings", provider as usize))
+            .h(px(30.))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(RADIUS_SMALL))
+            .cursor_pointer()
+            .bg(rgb(palette.settings_control))
+            .text_size(px(TYPE_UI))
+            .font_weight(FontWeight::MEDIUM)
+            .hover(move |style| style.bg(rgb(palette.surface_hover)))
+            .active(move |style| style.bg(rgb(palette.surface_pressed)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_provider_settings(provider, cx);
+                cx.notify();
+            }))
+            .child(label)
     }
 
     fn remote_model_picker_detail(
@@ -2306,11 +2533,14 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         let kimi_configured = self.config.kimi_code.is_configured();
         let deepseek_configured = self.config.deepseek.is_configured();
         let opencode_ready = self.opencode_version.is_some();
-        let opencode_detail = self
-            .opencode_version
-            .as_deref()
-            .map(|version| format!("Installed {version}"))
-            .unwrap_or_else(|| "Not installed".into());
+        let opencode_detail = if !self.opencode_models.is_empty() {
+            Self::model_count_label(self.opencode_models.len())
+        } else {
+            self.opencode_version
+                .as_deref()
+                .map(|version| format!("Installed {version}"))
+                .unwrap_or_else(|| "Not installed".into())
+        };
         let selected_model_id = self.selected_model_id.clone();
         let model_menu_provider = self.model_menu_provider;
 
@@ -2529,21 +2759,147 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
     }
 
     fn opencode_model_picker_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Self::picker_detail_shell(
-            ProviderKind::OpenCode,
-            "OpenCode CLI",
-            if let Some(version) = self.opencode_version.as_deref() {
-                format!(
-                    "Installed version {version}. Models, credentials, and tools come \
-                     from OpenCode's own configuration."
-                )
-            } else {
-                "OpenCode CLI is not installed. Install it to use this provider.".into()
-            },
-            None::<gpui::Div>,
-            "Open provider settings",
-            cx,
-        )
+        let palette = AppAppearance::for_window(cx.window_appearance());
+        if self.opencode_models.is_empty() {
+            let description = match (
+                self.opencode_version.as_deref(),
+                self.opencode_models_error.as_deref(),
+            ) {
+                (Some(version), Some(error)) => format!(
+                    "Installed version {version}, but the model list could not be loaded: {error}"
+                ),
+                (Some(version), None) => {
+                    format!("Installed version {version}, but OpenCode returned no models.")
+                }
+                (None, _) => {
+                    "OpenCode CLI is not installed. Install it to use this provider.".into()
+                }
+            };
+            return Self::picker_detail_shell(
+                ProviderKind::OpenCode,
+                "OpenCode CLI",
+                description,
+                None::<gpui::Div>,
+                "Open provider settings",
+                cx,
+            )
+            .into_any_element();
+        }
+        let selected_id = self.selected_opencode_model_id.clone();
+        let count_label = Self::model_count_label(self.opencode_models.len());
+        let version_label = self.opencode_version.as_deref().unwrap_or("installed");
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(52.))
+                    .flex_shrink_0()
+                    .px_5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(
+                        div()
+                            .text_size(px(TYPE_UI))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("OpenCode models"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CAPTION))
+                            .text_color(rgb(palette.muted_light))
+                            .child(format!("{count_label} · v{version_label}")),
+                    ),
+            )
+            .child(
+                div()
+                    .id("opencode-model-list")
+                    .min_h(px(0.))
+                    .flex_grow()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .children(
+                        self.opencode_models
+                            .iter()
+                            .enumerate()
+                            .map(|(index, model)| {
+                                let selected = selected_id.as_deref() == Some(model.id.as_str());
+                                let id = model.id.clone();
+                                div()
+                                    .id(("opencode-model-option", index))
+                                    .min_h(px(46.))
+                                    .px_3()
+                                    .py_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .rounded(px(RADIUS_MEDIUM))
+                                    .cursor_pointer()
+                                    .bg(rgb(if selected {
+                                        palette.blue_tint
+                                    } else {
+                                        palette.surface
+                                    }))
+                                    .hover(move |style| style.bg(rgb(palette.surface_subtle)))
+                                    .active(move |style| style.bg(rgb(palette.surface_hover)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_opencode_model(id.clone());
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .flex_grow()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(TYPE_UI))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(model.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(TYPE_CAPTION))
+                                                    .text_color(rgb(palette.muted))
+                                                    .child(model.id.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .ml_3()
+                                            .w(px(18.))
+                                            .flex_shrink_0()
+                                            .text_size(px(TYPE_UI))
+                                            .text_color(rgb(palette.blue))
+                                            .child(if selected { "✓" } else { "" }),
+                                    )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(palette.border))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Self::picker_settings_button(
+                        ProviderKind::OpenCode,
+                        "Open provider settings",
+                        cx,
+                    )),
+            )
+            .into_any_element()
     }
 
     fn provider_row(&self, provider: ProviderSummary, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3244,12 +3600,27 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                     .line_height(px(16.))
                     .text_color(rgb(palette.muted))
                     .child(if installed {
-                        "Models, credentials, and tools come from OpenCode's own \
-                         configuration; select them inside OpenCode."
+                        match (
+                            self.opencode_models_error.as_deref(),
+                            self.selected_opencode_model(),
+                        ) {
+                            (Some(error), _) => {
+                                format!("The model list could not be loaded: {error}")
+                            }
+                            (None, Some(model)) => format!(
+                                "{} available · selected: {}. Models, credentials, and \
+                                 tools come from OpenCode's own configuration; change \
+                                 the selection from the model menu.",
+                                Self::model_count_label(self.opencode_models.len()),
+                                model.name
+                            ),
+                            (None, None) => "OpenCode returned no models.".into(),
+                        }
                     } else {
                         "Install the OpenCode CLI to use it as a provider. \
                          Models, credentials, and tools come from OpenCode's own \
                          configuration; select them inside OpenCode."
+                            .into()
                     }),
             )
     }
@@ -3497,10 +3868,16 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
         } else {
             can_submit
         };
-        let selected_model_name = self
-            .selected_model()
-            .map(|model| model.display_name.clone())
-            .unwrap_or_else(|| "Codex unavailable".into());
+        let selected_model_name = match self.selected_chat_provider {
+            ProviderKind::OpenCode => self
+                .selected_opencode_model()
+                .map(|model| model.name.clone())
+                .unwrap_or_else(|| "OpenCode unavailable".into()),
+            _ => self
+                .selected_model()
+                .map(|model| model.display_name.clone())
+                .unwrap_or_else(|| "Codex unavailable".into()),
+        };
         let selected_chat_provider = self.selected_chat_provider;
         let effort_options = self
             .selected_model()
@@ -3731,9 +4108,13 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                                             ),
                                                                     ),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .id("thinking-menu-trigger")
+                                                            .when(
+                                                                selected_chat_provider
+                                                                    == ProviderKind::Codex,
+                                                                |controls| {
+                                                                    controls.child(
+                                                                        div()
+                                                                            .id("thinking-menu-trigger")
                                                                     .h(px(28.))
                                                                     .px_2()
                                                                     .flex()
@@ -3774,7 +4155,8 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                                                                                     .h(px(6.)),
                                                                             ),
                                                                     ),
-                                                            ),
+                                                                    )
+                                                                }),
                                                     )
                                                     .child(
                                                         div()
@@ -3918,7 +4300,9 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppAppearance, ChatConversation, ComposerInput, DiscoWorkspace};
+    use super::{
+        AppAppearance, AppConfig, ChatConversation, ComposerInput, DiscoWorkspace, OpenCodeModel,
+    };
     use disco_domain::{
         EngineKind, Project, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
     };
@@ -4052,6 +4436,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-project-{marker}")),
                     Err("Codex unavailable in test".into()),
                     None,
+                    Ok(Vec::new()),
                     cx,
                 )
             });
@@ -4123,6 +4508,7 @@ mod tests {
                     project_path,
                     Err("Codex unavailable in test".into()),
                     None,
+                    Ok(Vec::new()),
                     cx,
                 )
             })
@@ -4151,6 +4537,7 @@ mod tests {
                     project_path.clone(),
                     Err("Codex unavailable in test".into()),
                     None,
+                    Ok(Vec::new()),
                     cx,
                 )
             });
@@ -4195,6 +4582,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
                     Err("Codex unavailable in test".into()),
                     None,
+                    Ok(Vec::new()),
                     cx,
                 )
             })
@@ -4238,6 +4626,7 @@ mod tests {
                     PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
                     Err("Codex unavailable in test".into()),
                     None,
+                    Ok(Vec::new()),
                     cx,
                 )
             });
@@ -4253,6 +4642,120 @@ mod tests {
                     .read(cx)
                     .is_secure()
             );
+        });
+    }
+
+    fn test_opencode_models() -> Vec<OpenCodeModel> {
+        vec![
+            OpenCodeModel {
+                id: "opencode-go/deepseek-v4-flash".into(),
+                name: "DeepSeek V4 Flash (2x usage)".into(),
+            },
+            OpenCodeModel {
+                id: "kimi-for-coding/k3".into(),
+                name: "Kimi K3".into(),
+            },
+        ]
+    }
+
+    #[gpui::test]
+    fn opencode_selection_falls_back_to_the_first_model(cx: &mut TestAppContext) {
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer,
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    None,
+                    Ok(test_opencode_models()),
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| {
+            let workspace = workspace.read(cx);
+            assert_eq!(
+                workspace.selected_opencode_model_id.as_deref(),
+                Some("opencode-go/deepseek-v4-flash")
+            );
+            assert_eq!(
+                workspace
+                    .selected_opencode_model()
+                    .map(|model| model.name.as_str()),
+                Some("DeepSeek V4 Flash (2x usage)")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn opencode_selection_keeps_the_saved_model_when_still_available(cx: &mut TestAppContext) {
+        let config_path = PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new()));
+        let mut config = AppConfig::default();
+        config.selected_opencode_model = Some("kimi-for-coding/k3".into());
+        config.save(&config_path).expect("the config should save");
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer,
+                    config_path,
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    None,
+                    Ok(test_opencode_models()),
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| {
+            let workspace = workspace.read(cx);
+            assert_eq!(
+                workspace.selected_opencode_model_id.as_deref(),
+                Some("kimi-for-coding/k3")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_an_opencode_model_persists_it(cx: &mut TestAppContext) {
+        let config_path = PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new()));
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer,
+                    config_path.clone(),
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    None,
+                    Ok(test_opencode_models()),
+                    cx,
+                )
+            })
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, _| {
+                workspace.select_opencode_model("kimi-for-coding/k3".into());
+                assert_eq!(
+                    workspace.selected_opencode_model_id.as_deref(),
+                    Some("kimi-for-coding/k3")
+                );
+                assert_eq!(
+                    workspace.selected_chat_provider,
+                    super::ProviderKind::OpenCode
+                );
+                assert!(!workspace.model_menu_open);
+                let saved = AppConfig::load(&config_path).expect("the config should load");
+                assert_eq!(
+                    saved.selected_opencode_model.as_deref(),
+                    Some("kimi-for-coding/k3")
+                );
+            });
         });
     }
 }

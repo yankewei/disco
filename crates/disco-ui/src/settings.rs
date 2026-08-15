@@ -22,6 +22,7 @@ impl RemoteProviderSettings {
 #[serde(default)]
 pub struct AppConfig {
     pub selected_model: Option<String>,
+    pub selected_opencode_model: Option<String>,
     pub kimi_code: RemoteProviderSettings,
     pub deepseek: RemoteProviderSettings,
 }
@@ -85,6 +86,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         let config = AppConfig {
             selected_model: Some("gpt-codex".into()),
+            selected_opencode_model: Some("opencode-go/gpt-5.6-luna".into()),
             kimi_code: RemoteProviderSettings {
                 endpoint: "https://api.kimi.com/v1".into(),
                 model: "kimi-k2".into(),

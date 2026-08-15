@@ -5,7 +5,7 @@ mod assets;
 use assets::DiscoAssets;
 use directories::ProjectDirs;
 use disco_codex_engine::CodexRuntime;
-use disco_opencode_engine::discover_opencode;
+use disco_opencode_engine::{discover_opencode, list_models};
 use disco_storage::SqliteJournal;
 use disco_ui::{ComposerInput, DiscoWorkspace, init_composer_input};
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
@@ -31,9 +31,14 @@ fn main() {
     let codex_connection = CodexRuntime::connect(&workspace_path)
         .and_then(|runtime| runtime.list_models().map(|models| (runtime, models)))
         .map_err(|error| error.to_string());
-    let opencode_version = discover_opencode()
-        .ok()
-        .map(|installation| installation.version);
+    let opencode_installation = discover_opencode().ok();
+    let opencode_version = opencode_installation
+        .as_ref()
+        .map(|installation| installation.version.clone());
+    let opencode_models = match opencode_installation.as_ref() {
+        Some(installation) => list_models(installation).map_err(|error| error.to_string()),
+        None => Err("OpenCode CLI is not installed".into()),
+    };
     Application::new()
         .with_assets(DiscoAssets::discover())
         .run(move |cx: &mut App| {
@@ -64,6 +69,7 @@ fn main() {
                             workspace_path,
                             codex_connection,
                             opencode_version,
+                            opencode_models,
                             cx,
                         )
                     })
