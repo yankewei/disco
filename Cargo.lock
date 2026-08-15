@@ -2891,6 +2891,7 @@ name = "disco-acp-engine"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "disco-domain",
  "futures",
  "thiserror 2.0.20",
 ]
@@ -2912,6 +2913,7 @@ dependencies = [
 name = "disco-codex-engine"
 version = "0.1.0"
 dependencies = [
+ "disco-domain",
  "serde_json",
  "thiserror 2.0.20",
 ]
@@ -2992,6 +2994,7 @@ dependencies = [
  "disco-opencode-engine",
  "disco-rig-engine",
  "gpui",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "tempfile",
@@ -7197,6 +7200,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

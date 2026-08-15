@@ -6,9 +6,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use disco_domain::{ActivityInfo, TokenUsage, TurnEvent};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -104,15 +106,46 @@ impl CodexRuntime {
         model: &str,
         reasoning_effort: &str,
     ) -> Result<CodexTurnResult, CodexError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = self.run_turn_streaming(
+            existing_thread_id,
+            workspace,
+            prompt,
+            model,
+            reasoning_effort,
+            &tx,
+        );
+        // The streaming call is synchronous, so every event is already queued
+        // by the time it returns. Drop the sender before draining so the
+        // receiver observes a disconnected channel instead of blocking on a
+        // sender that lives on this very stack frame.
+        drop(tx);
+        result.and_then(|()| turn_result_from_events(&rx))
+    }
+
+    /// Runs one prompt turn, emitting [`TurnEvent`]s on `events` as the
+    /// app-server reports progress, and returns once the turn settles.
+    /// Transport failures come back as `Err`; a turn the server itself marks
+    /// failed is reported as [`TurnEvent::Failed`] instead.
+    pub fn run_turn_streaming(
+        &self,
+        existing_thread_id: Option<&str>,
+        workspace: &Path,
+        prompt: &str,
+        model: &str,
+        reasoning_effort: &str,
+        events: &Sender<TurnEvent>,
+    ) -> Result<(), CodexError> {
         self.process
             .lock()
             .map_err(|_| CodexError::LockPoisoned)?
-            .run_turn(
+            .run_turn_streaming(
                 existing_thread_id,
                 workspace,
                 prompt,
                 model,
                 reasoning_effort,
+                events,
             )
     }
 
@@ -365,14 +398,15 @@ impl AppServerProcess {
         self.write_message(&json!({ "id": id, "result": result }))
     }
 
-    fn run_turn(
+    fn run_turn_streaming(
         &mut self,
         existing_thread_id: Option<&str>,
         workspace: &Path,
         prompt: &str,
         model: &str,
         reasoning_effort: &str,
-    ) -> Result<CodexTurnResult, CodexError> {
+        events: &Sender<TurnEvent>,
+    ) -> Result<(), CodexError> {
         let thread_id = if let Some(thread_id) = existing_thread_id {
             thread_id.to_owned()
         } else {
@@ -392,6 +426,9 @@ impl AppServerProcess {
                 .ok_or(CodexError::MissingField("thread.id"))?
                 .to_owned()
         };
+        let _ = events.send(TurnEvent::ThreadAttached {
+            thread_id: thread_id.clone(),
+        });
 
         let response = self.request(
             "turn/start",
@@ -428,9 +465,7 @@ impl AppServerProcess {
             }))?;
         }
 
-        let mut text = String::new();
-        let mut activities = Vec::new();
-        let mut usage = CodexTokenUsage::default();
+        let mut saw_message_delta = false;
         loop {
             let message = if let Some(message) = self.queued.pop_front() {
                 message
@@ -451,38 +486,57 @@ impl AppServerProcess {
             match method {
                 "item/agentMessage/delta" if matching_turn => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                        text.push_str(delta);
+                        saw_message_delta = true;
+                        let _ = events.send(TurnEvent::AssistantDelta {
+                            text: delta.to_owned(),
+                        });
                     }
                 }
                 "item/completed" if matching_turn => {
                     if let Some(item) = params.get("item") {
-                        if text.is_empty()
+                        if !saw_message_delta
                             && item.get("type").and_then(Value::as_str) == Some("agentMessage")
                             && let Some(final_text) = item.get("text").and_then(Value::as_str)
                         {
-                            text.push_str(final_text);
+                            saw_message_delta = true;
+                            let _ = events.send(TurnEvent::AssistantDelta {
+                                text: final_text.to_owned(),
+                            });
                         }
                         if let Some(activity) = activity_from_item(item) {
-                            activities.push(activity);
+                            let _ = events.send(TurnEvent::ActivityStarted {
+                                activity: ActivityInfo {
+                                    id: activity.id.clone(),
+                                    title: activity.title,
+                                    detail: activity.detail.clone(),
+                                },
+                            });
+                            let _ = events.send(TurnEvent::ActivityCompleted {
+                                id: activity.id,
+                                success: activity.success,
+                                output: activity.detail,
+                            });
                         }
                     }
                 }
                 "thread/tokenUsage/updated" if matching_turn => {
                     if let Some(last) = params.pointer("/tokenUsage/last") {
-                        usage = CodexTokenUsage {
-                            input_tokens: last
-                                .get("inputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            output_tokens: last
-                                .get("outputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            total_tokens: last
-                                .get("totalTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                        };
+                        let _ = events.send(TurnEvent::UsageUpdated {
+                            usage: TokenUsage {
+                                input_tokens: last
+                                    .get("inputTokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                output_tokens: last
+                                    .get("outputTokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                                total_tokens: last
+                                    .get("totalTokens")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                            },
+                        });
                     }
                 }
                 "turn/completed" if matching_turn => {
@@ -492,20 +546,88 @@ impl AppServerProcess {
                             .pointer("/turn/error/message")
                             .and_then(Value::as_str)
                             .unwrap_or("Codex turn failed");
-                        return Err(CodexError::TurnFailed(message.into()));
+                        let _ = events.send(TurnEvent::Failed {
+                            code: "codex_turn_failed".into(),
+                            // Match the persisted message the old blocking
+                            // contract produced via CodexError's Display.
+                            message: format!("{TURN_FAILED_PREFIX}{message}"),
+                        });
+                        return Ok(());
                     }
-                    return Ok(CodexTurnResult {
-                        thread_id,
-                        text,
-                        activities,
-                        usage,
+                    let _ = events.send(TurnEvent::Finished {
                         interrupted: status == Some("interrupted"),
                     });
+                    return Ok(());
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// Display prefix baked into [`CodexError::TurnFailed`]; applied to
+/// [`TurnEvent::Failed`] messages at the emit site so persisted failure text
+/// keeps the original blocking contract.
+const TURN_FAILED_PREFIX: &str = "Codex turn failed: ";
+
+/// Rebuilds the blocking [`CodexTurnResult`] from a finished streaming turn,
+/// keeping the original `run_turn` contract on top of the event loop.
+fn turn_result_from_events(
+    rx: &std::sync::mpsc::Receiver<TurnEvent>,
+) -> Result<CodexTurnResult, CodexError> {
+    let mut result = CodexTurnResult {
+        thread_id: String::new(),
+        text: String::new(),
+        activities: Vec::new(),
+        usage: CodexTokenUsage::default(),
+        interrupted: false,
+    };
+    let mut pending_titles: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for event in rx {
+        match event {
+            TurnEvent::ThreadAttached { thread_id } => result.thread_id = thread_id,
+            TurnEvent::AssistantDelta { text } => result.text.push_str(&text),
+            TurnEvent::ActivityStarted { activity } => {
+                pending_titles.insert(activity.id, activity.title);
+            }
+            TurnEvent::ActivityCompleted {
+                id,
+                success,
+                output,
+            } => {
+                result.activities.push(CodexActivity {
+                    title: pending_titles
+                        .remove(&id)
+                        .unwrap_or_else(|| "Activity".into()),
+                    id,
+                    detail: output,
+                    success,
+                });
+            }
+            TurnEvent::UsageUpdated { usage } => {
+                result.usage = CodexTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_tokens: usage.total_tokens,
+                };
+            }
+            TurnEvent::Finished { interrupted } => {
+                result.interrupted = interrupted;
+                // Engines never emit events after a terminal one; stop here so
+                // the loop does not rely on the channel being disconnected.
+                break;
+            }
+            TurnEvent::Failed { message, .. } => {
+                // The emit site prepends the Display prefix for persistence;
+                // strip it back off so TurnFailed's Display does not double it.
+                let raw = message.strip_prefix(TURN_FAILED_PREFIX).unwrap_or(&message);
+                return Err(CodexError::TurnFailed(raw.to_string()));
+            }
+            TurnEvent::ReasoningDelta { .. } => {}
+        }
+    }
+    Ok(result)
 }
 
 impl Drop for AppServerProcess {
@@ -643,9 +765,76 @@ pub enum CodexError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveTurn, ActiveTurnGuard, activity_from_item, parse_models};
+    use super::{
+        ActiveTurn, ActiveTurnGuard, activity_from_item, parse_models, turn_result_from_events,
+    };
+    use disco_domain::{ActivityInfo, TokenUsage, TurnEvent};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn turn_result_rebuilds_from_streaming_events() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(TurnEvent::ThreadAttached {
+            thread_id: "thread-1".into(),
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::AssistantDelta {
+            text: "Hello ".into(),
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::AssistantDelta {
+            text: "world".into(),
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::ActivityStarted {
+            activity: ActivityInfo {
+                id: "cmd-1".into(),
+                title: "Ran command".into(),
+                detail: "cargo test".into(),
+            },
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::ActivityCompleted {
+            id: "cmd-1".into(),
+            success: true,
+            output: "cargo test".into(),
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::UsageUpdated {
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+            },
+        })
+        .expect("channel should be open");
+        tx.send(TurnEvent::Finished { interrupted: false })
+            .expect("channel should be open");
+        drop(tx);
+
+        let result = turn_result_from_events(&rx).expect("events should rebuild a result");
+        assert_eq!(result.thread_id, "thread-1");
+        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.activities.len(), 1);
+        assert_eq!(result.activities[0].title, "Ran command");
+        assert_eq!(result.usage.total_tokens, 30);
+        assert!(!result.interrupted);
+    }
+
+    #[test]
+    fn turn_result_surfaces_failed_turns_as_errors() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(TurnEvent::Failed {
+            code: "codex_turn_failed".into(),
+            message: "model overloaded".into(),
+        })
+        .expect("channel should be open");
+        drop(tx);
+
+        let error = turn_result_from_events(&rx).expect_err("failed turn should error");
+        assert!(error.to_string().contains("model overloaded"));
+    }
 
     #[test]
     fn model_catalog_comes_from_app_server_fields() {

@@ -1,6 +1,7 @@
 //! Native GPUI client for a locally installed Codex app-server.
 
 mod composer_input;
+mod markdown;
 mod settings;
 
 pub use composer_input::{ComposerInput, init as init_composer_input};
@@ -11,19 +12,20 @@ use std::{
 };
 
 use composer_input::ComposerSubmitted;
-use disco_codex_engine::{CodexModel, CodexRuntime, CodexTurnResult};
+use disco_codex_engine::{CodexModel, CodexRuntime};
 use disco_domain::{
-    EngineKind, Project, ProjectId, RunEventPayload, RunId, RunStatus, SessionId, TokenUsage,
-    ToolCall,
+    EngineKind, Project, ProjectId, RunEventPayload, RunId, RunStatus, SessionId, ToolCall,
+    TurnEvent,
 };
 use disco_kernel::{ActivityItem, ActivityKind, EventJournal, Kernel, ProjectStore, RunProjection};
-use disco_opencode_engine::{OpenCodeModel, OpenCodeRuntime, OpenCodeTurnResult, connect as connect_opencode};
+use disco_opencode_engine::{OpenCodeModel, OpenCodeRuntime, connect as connect_opencode};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, ClipboardItem, Context, CursorStyle, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    PathPromptOptions, Pixels, Point, Render, StatefulInteractiveElement, Styled, Window,
-    WindowAppearance, anchored, deferred, div, img, px, rgb, svg,
+    AppContext, AsyncApp, ClipboardItem, Context, CursorStyle, ElementId, Entity, FocusHandle,
+    Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, WindowAppearance, anchored, deferred,
+    div, img, px, rgb, svg,
 };
 use serde_json::json;
 use settings::{AppConfig, RemoteProviderSettings};
@@ -51,6 +53,8 @@ const APP_SIDEBAR_WIDTH: f32 = 252.;
 const APP_TOP_BAR_HEIGHT: f32 = 52.;
 const APP_SIDEBAR_TOP_INSET: f32 = 50.;
 const CHAT_COLUMN_WIDTH: f32 = 760.;
+const CHAT_BUBBLE_MAX_WIDTH: f32 = 600.;
+const CHAT_BUBBLE_RADIUS: f32 = 20.;
 const RADIUS_SMALL: f32 = 6.;
 const RADIUS_MEDIUM: f32 = 9.;
 const RADIUS_LARGE: f32 = 12.;
@@ -225,7 +229,6 @@ impl ComposerAppearance {
 struct ConversationAppearance {
     secondary_surface: u32,
     secondary_separator: u32,
-    identity: u32,
     secondary_text: u32,
     warning: u32,
     failure_surface: u32,
@@ -235,7 +238,6 @@ impl ConversationAppearance {
     const MACOS_LIGHT: Self = Self {
         secondary_surface: 0xf5f5f6,
         secondary_separator: 0xe3e3e6,
-        identity: 0x303135,
         secondary_text: 0x6f7278,
         warning: 0xe49322,
         failure_surface: 0xfff2f2,
@@ -244,7 +246,6 @@ impl ConversationAppearance {
     const MACOS_DARK: Self = Self {
         secondary_surface: 0x28282b,
         secondary_separator: 0x3a3a3f,
-        identity: 0xe8e8ec,
         secondary_text: 0x9a9aa2,
         warning: 0xff9f0a,
         failure_surface: 0x462427,
@@ -399,6 +400,8 @@ pub struct DiscoWorkspace<J: EventJournal> {
     projects: Vec<ProjectState>,
     active_project_id: ProjectId,
     active_session_id: SessionId,
+    chat_scroll: ScrollHandle,
+    chat_scroll_pending: bool,
     sidebar_focus_handle: FocusHandle,
     sidebar_focused_item: SidebarItem,
     project_context_menu: Option<ProjectContextMenu>,
@@ -431,6 +434,18 @@ pub struct DiscoWorkspace<J: EventJournal> {
     settings_notice: Option<(bool, String)>,
     project_notice: Option<String>,
     stop_requested: bool,
+    /// Runs whose thinking-section expansion was toggled away from its
+    /// default (working runs default expanded, terminal runs collapsed).
+    /// Membership means "inverted", not "expanded".
+    thinking_toggle_overrides: std::collections::HashSet<RunId>,
+    /// Runs whose activity-section expansion was toggled away from its
+    /// default; same "inverted, not expanded" semantics as
+    /// [`thinking_toggle_overrides`].
+    activity_toggle_overrides: std::collections::HashSet<RunId>,
+    /// Parsed markdown blocks per run, keyed by a hash of the assistant text,
+    /// so unchanged text is not re-parsed on every frame.
+    markdown_blocks_cache:
+        std::collections::HashMap<RunId, (u64, std::sync::Arc<Vec<markdown::Block>>)>,
 }
 
 impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
@@ -636,6 +651,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             projects,
             active_project_id,
             active_session_id,
+            chat_scroll: ScrollHandle::new(),
+            chat_scroll_pending: true,
             sidebar_focus_handle,
             sidebar_focused_item: SidebarItem::Task(active_project_id, active_session_id),
             project_context_menu: None,
@@ -668,6 +685,9 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             settings_notice: None,
             project_notice,
             stop_requested: false,
+            thinking_toggle_overrides: std::collections::HashSet::new(),
+            activity_toggle_overrides: std::collections::HashSet::new(),
+            markdown_blocks_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -1040,6 +1060,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         {
             return;
         }
+        // Anchor the new turn on the live edge of the transcript.
+        self.chat_scroll_pending = true;
         match self.selected_chat_provider {
             ProviderKind::OpenCode => self.start_opencode_turn(run_id, &workspace, cx),
             _ => self.start_codex_turn(run_id, thread_id, &workspace, cx),
@@ -1080,14 +1102,28 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .and_then(|turn| turn.prompt.clone())
             .unwrap_or_default();
         let workspace = workspace.to_owned();
-        let request = cx.background_executor().spawn(async move {
-            runtime.run_turn(thread_id.as_deref(), &workspace, &prompt, &model, &effort)
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<TurnEvent>();
+        let engine = cx.background_executor().spawn(async move {
+            runtime.run_turn_streaming(
+                thread_id.as_deref(),
+                &workspace,
+                &prompt,
+                &model,
+                &effort,
+                &events_tx,
+            )
         });
         cx.spawn(async move |workspace, cx| {
-            let result = request.await.map_err(|error| error.to_string());
+            consume_turn_events(&workspace, run_id, events_rx, cx).await;
+            // The sender drops when the engine task settles, so the event
+            // drain above is complete by the time this awaits returns.
+            let result = engine.await.map_err(|error| error.to_string());
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.finish_run(run_id, result);
+                    if let Err(error) = result {
+                        workspace.record_failure(run_id, "codex_turn_failed", error);
+                    }
+                    workspace.stop_requested = false;
                     cx.notify();
                 })
                 .ok();
@@ -1128,16 +1164,21 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             .and_then(ChatConversation::current)
             .and_then(|turn| turn.prompt.clone())
             .unwrap_or_default();
-        let request = cx.background_executor().spawn(async move {
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<TurnEvent>();
+        let engine = cx.background_executor().spawn(async move {
             runtime
-                .run_turn(&session, &prompt, &model)
+                .run_turn_streaming(&session, &prompt, &model, events_tx)
                 .map_err(|error| error.to_string())
         });
         cx.spawn(async move |workspace, cx| {
-            let result = request.await;
+            consume_turn_events(&workspace, run_id, events_rx, cx).await;
+            let result = engine.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    workspace.finish_opencode_run(run_id, result);
+                    if let Err(error) = result {
+                        workspace.record_failure(run_id, "opencode_turn_failed", error);
+                    }
+                    workspace.stop_requested = false;
                     cx.notify();
                 })
                 .ok();
@@ -1176,100 +1217,41 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         }
     }
 
-    fn finish_run(&mut self, run_id: RunId, result: Result<CodexTurnResult, String>) {
-        self.stop_requested = false;
-        match result {
-            Ok(result) => {
-                self.record(
-                    run_id,
-                    RunEventPayload::CodexThreadAttached {
-                        thread_id: result.thread_id,
-                    },
-                );
-                for activity in result.activities {
-                    let detail = activity.detail.clone();
-                    let call = ToolCall {
-                        call_id: activity.id.clone(),
-                        name: activity.title,
-                        arguments: json!({ "detail": detail }),
-                    };
-                    self.record(run_id, RunEventPayload::ToolRequested { call });
-                    self.record(
-                        run_id,
-                        RunEventPayload::ToolCompleted {
-                            call_id: activity.id,
-                            success: activity.success,
-                            output: activity.detail,
-                        },
-                    );
-                }
-                if !result.text.is_empty() {
-                    self.record(
-                        run_id,
-                        RunEventPayload::AssistantContentDelta { text: result.text },
-                    );
-                }
-                self.record(
-                    run_id,
-                    RunEventPayload::UsageUpdated {
-                        usage: TokenUsage {
-                            input_tokens: result.usage.input_tokens,
-                            output_tokens: result.usage.output_tokens,
-                            total_tokens: result.usage.total_tokens,
-                        },
-                    },
-                );
-                self.record(run_id, Self::terminal_event(result.interrupted));
+    fn apply_turn_event(&mut self, run_id: RunId, event: TurnEvent) {
+        let payload = match event {
+            TurnEvent::ThreadAttached { thread_id } => {
+                RunEventPayload::CodexThreadAttached { thread_id }
             }
-            Err(error) => self.record_failure(run_id, "codex_turn_failed", error),
+            TurnEvent::ReasoningDelta { text } => RunEventPayload::ReasoningDelta { text },
+            TurnEvent::AssistantDelta { text } => RunEventPayload::AssistantContentDelta { text },
+            TurnEvent::ActivityStarted { activity } => RunEventPayload::ToolRequested {
+                call: ToolCall {
+                    call_id: activity.id,
+                    name: activity.title,
+                    arguments: json!({ "detail": activity.detail }),
+                },
+            },
+            TurnEvent::ActivityCompleted {
+                id,
+                success,
+                output,
+            } => RunEventPayload::ToolCompleted {
+                call_id: id,
+                success,
+                output,
+            },
+            TurnEvent::UsageUpdated { usage } => RunEventPayload::UsageUpdated { usage },
+            TurnEvent::Finished { interrupted } => Self::terminal_event(interrupted),
+            TurnEvent::Failed { code, message } => RunEventPayload::RunFailed {
+                code,
+                message,
+                retryable: true,
+            },
+        };
+        if payload.terminal_status().is_some() {
+            self.stop_requested = false;
         }
-    }
-
-    fn finish_opencode_run(&mut self, run_id: RunId, result: Result<OpenCodeTurnResult, String>) {
-        self.stop_requested = false;
-        match result {
-            Ok(result) => {
-                for activity in result.activities {
-                    let detail = activity.detail.clone();
-                    let call = ToolCall {
-                        call_id: activity.id.clone(),
-                        name: activity.title,
-                        arguments: json!({ "detail": detail }),
-                    };
-                    self.record(run_id, RunEventPayload::ToolRequested { call });
-                    self.record(
-                        run_id,
-                        RunEventPayload::ToolCompleted {
-                            call_id: activity.id,
-                            success: activity.success,
-                            output: activity.detail,
-                        },
-                    );
-                }
-                if !result.text.is_empty() {
-                    self.record(
-                        run_id,
-                        RunEventPayload::AssistantContentDelta { text: result.text },
-                    );
-                }
-                // ACP usage is context-window semantics (tokens consumed vs
-                // window size) and carries no input/output split, so only the
-                // total is reported; the usage label renders it as a plain
-                // token count.
-                self.record(
-                    run_id,
-                    RunEventPayload::UsageUpdated {
-                        usage: TokenUsage {
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            total_tokens: result.usage.used,
-                        },
-                    },
-                );
-                self.record(run_id, Self::terminal_event(result.interrupted));
-            }
-            Err(error) => self.record_failure(run_id, "opencode_turn_failed", error),
-        }
+        self.record(run_id, payload);
     }
 
     fn record(&mut self, run_id: RunId, payload: RunEventPayload) {
@@ -1338,7 +1320,8 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                 if runtime.interrupt_turn().is_err() {
                     // Do not record a terminal RunFailed here: the turn is still
                     // executing, and a terminal event would orphan its real outcome
-                    // (finish_run's events are rejected as EventAfterTerminal) and
+                    // (the engine's terminal events are rejected as
+                    // EventAfterTerminal) and
                     // flip the UI back to send mode mid-run. Leave the run running;
                     // stop_requested stays false so the stop button stays active
                     // for a retry.
@@ -1375,6 +1358,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
         self.composer
             .update(cx, |composer, cx| composer.set_content("", cx));
+        self.chat_scroll_pending = true;
         self.model_menu_open = false;
         self.thinking_menu_open = false;
         self.page = WorkspacePage::Chat;
@@ -1455,6 +1439,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         self.active_project_id = project_id;
         self.active_session_id = session_id;
         self.sidebar_focused_item = SidebarItem::Task(project_id, session_id);
+        self.chat_scroll_pending = true;
         self.page = WorkspacePage::Chat;
         self.model_menu_open = false;
         self.thinking_menu_open = false;
@@ -1643,29 +1628,37 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             )
     }
 
-    fn status_label(&self) -> &'static str {
+    fn status_label(&self) -> String {
+        let provider = self.selected_chat_provider.name();
         let Some(current) = self.active_task().and_then(ChatConversation::current) else {
-            return if self.runtime.is_some() {
-                "Codex ready"
+            return if self.selected_runtime_ready() {
+                format!("{provider} ready")
             } else {
-                "Codex unavailable"
+                format!("{provider} unavailable")
             };
         };
         match current.status {
-            RunStatus::Queued => "Queued",
-            RunStatus::Running => "Codex working",
-            RunStatus::WaitingForTool => "Running tool",
-            RunStatus::WaitingForApproval => "Approval required",
-            RunStatus::WaitingForUserInput => "Input required",
-            RunStatus::Completed => "Completed",
-            RunStatus::Failed => "Failed",
-            RunStatus::Cancelled => "Cancelled",
+            RunStatus::Queued => "Queued".to_string(),
+            RunStatus::Running => format!("{provider} working"),
+            RunStatus::WaitingForTool => "Running tool".to_string(),
+            RunStatus::WaitingForApproval => "Approval required".to_string(),
+            RunStatus::WaitingForUserInput => "Input required".to_string(),
+            RunStatus::Completed => "Completed".to_string(),
+            RunStatus::Failed => "Failed".to_string(),
+            RunStatus::Cancelled => "Cancelled".to_string(),
+        }
+    }
+
+    fn selected_runtime_ready(&self) -> bool {
+        match self.selected_chat_provider {
+            ProviderKind::OpenCode => self.opencode_runtime.is_some(),
+            _ => self.runtime.is_some(),
         }
     }
 
     fn status_color(&self, palette: AppAppearance) -> u32 {
         let Some(current) = self.active_task().and_then(ChatConversation::current) else {
-            return if self.runtime.is_some() {
+            return if self.selected_runtime_ready() {
                 palette.green
             } else {
                 palette.red
@@ -1718,6 +1711,51 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
         formatted
     }
 
+    /// Returns the parsed markdown blocks for a run's assistant text, caching
+    /// the parse result so per-frame redraws (streaming deltas, hover,
+    /// composer input) never re-parse unchanged text. The element tree is
+    /// still rebuilt each frame; parsing is the expensive part.
+    fn markdown_blocks(
+        &mut self,
+        run_id: RunId,
+        text: &str,
+    ) -> std::sync::Arc<Vec<markdown::Block>> {
+        let hash = markdown::text_hash(text);
+        if let Some((cached_hash, blocks)) = self.markdown_blocks_cache.get(&run_id)
+            && *cached_hash == hash
+        {
+            return blocks.clone();
+        }
+        let blocks = std::sync::Arc::new(markdown::parse_blocks(text));
+        self.markdown_blocks_cache
+            .insert(run_id, (hash, blocks.clone()));
+        blocks
+    }
+
+    /// Toggles a per-run entry in one of the toggle-override sets.
+    fn toggle_run_override(overrides: &mut std::collections::HashSet<RunId>, run_id: RunId) {
+        if !overrides.remove(&run_id) {
+            overrides.insert(run_id);
+        }
+    }
+
+    /// Drops per-run transient state (toggle overrides, markdown cache) for
+    /// runs that no longer appear in any task, so it cannot outlive its run.
+    fn prune_transient_run_state(&mut self) {
+        let known_run_ids: std::collections::HashSet<RunId> = self
+            .projects
+            .iter()
+            .flat_map(|project| project.tasks.iter())
+            .flat_map(|task| task.turns().iter().map(|turn| turn.run_id))
+            .collect();
+        self.thinking_toggle_overrides
+            .retain(|run_id| known_run_ids.contains(run_id));
+        self.activity_toggle_overrides
+            .retain(|run_id| known_run_ids.contains(run_id));
+        self.markdown_blocks_cache
+            .retain(|run_id, _| known_run_ids.contains(run_id));
+    }
+
     fn activity_row(item: &ActivityItem, palette: AppAppearance) -> impl IntoElement {
         let appearance = palette.conversation;
         let indicator = if item.completed {
@@ -1767,82 +1805,120 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
             )
     }
 
-    fn conversation_turn(turn: RunProjection, palette: AppAppearance) -> impl IntoElement {
+    fn conversation_turn(
+        &mut self,
+        turn: RunProjection,
+        palette: AppAppearance,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let appearance = palette.conversation;
+        let run_id = turn.run_id;
         let prompt = turn.prompt.unwrap_or_default();
         let is_working = !turn.status.is_terminal();
         let assistant = turn.assistant_text;
         let reasoning = turn.reasoning_text;
+        let usage = turn.usage;
         let activities = turn
             .activities
             .into_iter()
             .filter(|item| item.kind != ActivityKind::Failure)
             .collect::<Vec<_>>();
-        let usage = turn.usage;
         let failure = turn.failure_message;
         let has_response = !assistant.is_empty()
             || !reasoning.is_empty()
             || !activities.is_empty()
             || failure.is_some()
-            || usage.total_tokens > 0
             || is_working;
+
+        // Collapse logic: terminal runs default collapsed, working runs default expanded
+        let thinking_expanded = if is_working {
+            !self.thinking_toggle_overrides.contains(&run_id) // expanded unless overridden
+        } else {
+            self.thinking_toggle_overrides.contains(&run_id) // collapsed unless overridden
+        };
+        let activities_expanded = if is_working {
+            !self.activity_toggle_overrides.contains(&run_id)
+        } else {
+            self.activity_toggle_overrides.contains(&run_id)
+        };
+
+        let activity_count = activities.len();
+        let reasoning_preview: String = reasoning.chars().take(60).collect();
+        // Parse the assistant markdown at most once per text revision; the
+        // element tree below is rebuilt every frame from the cached blocks.
+        let assistant_blocks = if assistant.is_empty() {
+            None
+        } else {
+            Some(self.markdown_blocks(run_id, &assistant))
+        };
 
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap(px(16.))
             .child(
-                div()
-                    .max_w(px(700.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(TYPE_UI))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(appearance.identity))
-                            .child("You"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(TYPE_BODY))
-                            .line_height(px(22.))
-                            .text_color(rgb(palette.text))
-                            .child(prompt),
-                    ),
+                div().w_full().flex().justify_end().child(
+                    div()
+                        .max_w(px(CHAT_BUBBLE_MAX_WIDTH))
+                        .px(px(14.))
+                        .py(px(9.))
+                        .rounded(px(CHAT_BUBBLE_RADIUS))
+                        .bg(rgb(appearance.secondary_surface))
+                        .text_size(px(TYPE_BODY))
+                        .line_height(px(22.))
+                        .text_color(rgb(palette.text))
+                        .child(prompt),
+                ),
             )
-            .when(has_response, |turn| {
-                turn.child(
+            .when(has_response, |turn_el| {
+                turn_el.child(
                     div()
                         .min_w(px(0.))
-                        .max_w(px(700.))
+                        .w_full()
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(TYPE_UI))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(appearance.identity))
-                                .child("Disco"),
-                        )
+                        // -- Collapsible Thinking section --
                         .when(!reasoning.is_empty(), |column| {
                             column.child(
                                 div()
                                     .rounded(px(RADIUS_MEDIUM))
                                     .bg(rgb(appearance.secondary_surface))
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
+                                    .overflow_hidden()
                                     .child(
                                         div()
+                                            .id((
+                                                ElementId::from(run_id.as_uuid()),
+                                                "thinking-toggle",
+                                            ))
                                             .flex()
                                             .items_center()
                                             .gap_2()
+                                            .px_3()
+                                            .py_2()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                Self::toggle_run_override(
+                                                    &mut this.thinking_toggle_overrides,
+                                                    run_id,
+                                                );
+                                                if this.thinking_toggle_overrides.len() > 256 {
+                                                    this.prune_transient_run_state();
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                svg()
+                                                    .size(px(12.))
+                                                    .flex_none()
+                                                    .path(if thinking_expanded {
+                                                        CHEVRON_DOWN_ASSET
+                                                    } else {
+                                                        CHEVRON_RIGHT_ASSET
+                                                    })
+                                                    .text_color(rgb(appearance.secondary_text)),
+                                            )
                                             .child(div().size(px(6.)).rounded_full().bg(rgb(
                                                 if is_working {
                                                     palette.blue
@@ -1856,17 +1932,37 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                                     .font_weight(FontWeight::MEDIUM)
                                                     .text_color(rgb(appearance.secondary_text))
                                                     .child("Thinking"),
+                                            )
+                                            .when(
+                                                !thinking_expanded && !reasoning_preview.is_empty(),
+                                                |header| {
+                                                    header.child(
+                                                        div()
+                                                            .text_size(px(TYPE_CAPTION))
+                                                            .text_color(rgb(palette.muted_light))
+                                                            .truncate()
+                                                            .child(format!(
+                                                                "{}…",
+                                                                reasoning_preview
+                                                            )),
+                                                    )
+                                                },
                                             ),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(px(TYPE_BODY))
-                                            .line_height(px(21.))
-                                            .text_color(rgb(appearance.secondary_text))
-                                            .child(reasoning),
-                                    ),
+                                    .when(thinking_expanded, |container| {
+                                        container.child(
+                                            div()
+                                                .px_3()
+                                                .pb_2()
+                                                .text_size(px(TYPE_BODY))
+                                                .line_height(px(21.))
+                                                .text_color(rgb(appearance.secondary_text))
+                                                .child(reasoning),
+                                        )
+                                    }),
                             )
                         })
+                        // -- Collapsible Activities section --
                         .when(!activities.is_empty(), |column| {
                             column.child(
                                 div()
@@ -1875,36 +1971,71 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .bg(rgb(appearance.secondary_surface))
                                     .child(
                                         div()
+                                            .id((
+                                                ElementId::from(run_id.as_uuid()),
+                                                "activity-toggle",
+                                            ))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
                                             .px_3()
-                                            .pt_2()
-                                            .pb_1()
-                                            .text_size(px(TYPE_CAPTION))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(appearance.secondary_text))
-                                            .child("Activity"),
+                                            .py_2()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                Self::toggle_run_override(
+                                                    &mut this.activity_toggle_overrides,
+                                                    run_id,
+                                                );
+                                                if this.activity_toggle_overrides.len() > 256 {
+                                                    this.prune_transient_run_state();
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                svg()
+                                                    .size(px(12.))
+                                                    .flex_none()
+                                                    .path(if activities_expanded {
+                                                        CHEVRON_DOWN_ASSET
+                                                    } else {
+                                                        CHEVRON_RIGHT_ASSET
+                                                    })
+                                                    .text_color(rgb(appearance.secondary_text)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(TYPE_CAPTION))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(appearance.secondary_text))
+                                                    .child("Activity"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(TYPE_CAPTION))
+                                                    .text_color(rgb(palette.muted_light))
+                                                    .child(format!("{} items", activity_count)),
+                                            ),
                                     )
-                                    .children(activities.iter().enumerate().map(
-                                        |(index, item)| {
-                                            div()
-                                                .when(index > 0, |row| {
-                                                    row.border_t_1().border_color(rgb(
-                                                        appearance.secondary_separator
-                                                    ))
-                                                })
-                                                .child(Self::activity_row(item, palette))
-                                        },
-                                    )),
+                                    .when(activities_expanded, |container| {
+                                        container.children(activities.iter().enumerate().map(
+                                            |(index, item)| {
+                                                div()
+                                                    .when(index > 0, |row| {
+                                                        row.border_t_1().border_color(rgb(
+                                                            appearance.secondary_separator,
+                                                        ))
+                                                    })
+                                                    .child(Self::activity_row(item, palette))
+                                            },
+                                        ))
+                                    }),
                             )
                         })
-                        .when(!assistant.is_empty(), |column| {
-                            column.child(
-                                div()
-                                    .text_size(px(TYPE_BODY))
-                                    .line_height(px(22.))
-                                    .text_color(rgb(palette.text))
-                                    .child(assistant),
-                            )
+                        // -- Assistant response (always visible, markdown rendered) --
+                        .when_some(assistant_blocks, |column, blocks| {
+                            column.child(markdown::render_blocks(&blocks, palette))
                         })
+                        // -- Working indicator --
                         .when(is_working, |column| {
                             column.child(
                                 div()
@@ -1917,6 +2048,7 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                                     .child("Working…"),
                             )
                         })
+                        // -- Failure message --
                         .when_some(failure, |column, message| {
                             column.child(
                                 div()
@@ -1946,16 +2078,15 @@ impl<J: EventJournal + ProjectStore> DiscoWorkspace<J> {
                         .when(usage.total_tokens > 0, |column| {
                             // Engines that only report a cumulative count (ACP
                             // context usage) have no input/output split to show.
-                            let label =
-                                if usage.input_tokens == 0 && usage.output_tokens == 0 {
-                                    Self::token_count_label(usage.total_tokens)
-                                } else {
-                                    format!(
-                                        "{} input · {} output",
-                                        Self::token_count_label(usage.input_tokens),
-                                        Self::token_count_label(usage.output_tokens)
-                                    )
-                                };
+                            let label = if usage.input_tokens == 0 && usage.output_tokens == 0 {
+                                Self::token_count_label(usage.total_tokens)
+                            } else {
+                                format!(
+                                    "{} input · {} output",
+                                    Self::token_count_label(usage.input_tokens),
+                                    Self::token_count_label(usage.output_tokens)
+                                )
+                            };
                             column.child(
                                 div()
                                     .pt_1()
@@ -3848,6 +3979,12 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
             .active_task()
             .map_or_else(Vec::new, |task| task.turns().to_vec());
         let has_run = !turns.is_empty();
+        // Children of a scroll container measure against unbounded width, so
+        // percentage widths never constrain text. Resolve the chat column to
+        // concrete pixels from the viewport instead.
+        let chat_column_width = (window.viewport_size().width - px(APP_SIDEBAR_WIDTH) - px(56.))
+            .min(px(CHAT_COLUMN_WIDTH))
+            .max(px(240.));
         let title = if has_run {
             Self::compact_title(
                 self.active_task()
@@ -3863,6 +4000,20 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
         let can_submit =
             !self.composer.read(cx).is_empty() && active_task_can_begin && !self.run_in_progress();
         let is_working = self.run_in_progress();
+        // Message-scroller behavior: a pending jump (new turn, task switch,
+        // restore) lands the viewport on the live edge, and while a run streams
+        // we keep following the live edge only while the reader stayed there.
+        // Scrolling away releases the follow so the reader is never moved
+        // against their intent; scrolling back re-engages it.
+        let chat_distance_from_bottom =
+            self.chat_scroll.offset().y + self.chat_scroll.max_offset().height;
+        let chat_at_bottom = chat_distance_from_bottom.abs() <= px(32.);
+        if self.chat_scroll_pending {
+            self.chat_scroll_pending = false;
+            self.chat_scroll.scroll_to_bottom();
+        } else if is_working && has_run && chat_at_bottom {
+            self.chat_scroll.scroll_to_bottom();
+        }
         let action_enabled = if is_working {
             !self.stop_requested
         } else {
@@ -3949,12 +4100,23 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                     )
                     .child(
                         div()
-                            .id("chat-scroll")
+                            .relative()
                             .min_h(px(0.))
                             .flex_grow()
-                            .overflow_y_scroll()
-                            .px_7()
-                            .py_5()
+                            .child(
+                                div()
+                                    .id("chat-scroll")
+                                    .track_scroll(&self.chat_scroll)
+                                    .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                                        // Re-evaluate the live-edge state so the
+                                        // scroll-to-end control tracks the reader.
+                                        cx.notify();
+                                    }))
+                                    .min_h(px(0.))
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .px_7()
+                                    .py_5()
                             .when(!has_run, |scroll| {
                                 scroll.child(
                                     div()
@@ -3993,20 +4155,59 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
                             })
                             .when(has_run, |scroll| {
                                 scroll.child(
+                                    {
+                                        let mut chat_content = div()
+                                            .w(chat_column_width)
+                                            .mx_auto()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_8();
+                                        for turn in turns {
+                                            chat_content = chat_content.child(
+                                                self.conversation_turn(turn, palette, cx),
+                                            );
+                                        }
+                                        chat_content
+                                    },
+                                )
+                            })
+                            )
+                            .when(has_run && !chat_at_bottom, |region| {
+                                region.child(
                                     div()
-                                        .w_full()
-                                        .max_w(px(CHAT_COLUMN_WIDTH))
-                                        .mx_auto()
+                                        .absolute()
+                                        .bottom(px(14.))
+                                        .left_0()
+                                        .right_0()
                                         .flex()
-                                        .flex_col()
-                                        .gap_6()
-                                        .children(
-                                            turns.into_iter().map(move |turn| {
-                                                Self::conversation_turn(turn, palette)
-                                            }),
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .id("chat-scroll-to-bottom")
+                                                .size(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_full()
+                                                .bg(rgb(palette.surface))
+                                                .border_1()
+                                                .border_color(rgb(palette.border_strong))
+                                                .shadow_md()
+                                                .cursor_pointer()
+                                                .hover(move |style| {
+                                                    style.bg(rgb(palette.surface_hover))
+                                                })
+                                                .active(move |style| {
+                                                    style.bg(rgb(palette.surface_pressed))
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.chat_scroll.scroll_to_bottom();
+                                                    cx.notify();
+                                                }))
+                                                .child(img(CHEVRON_DOWN_ASSET).size(px(14.))),
                                         ),
                                 )
-                            }),
+                            })
                     )
                     .child(
                         div()
@@ -4298,13 +4499,84 @@ impl<J: EventJournal + ProjectStore> Render for DiscoWorkspace<J> {
     }
 }
 
+/// Drains streaming [`TurnEvent`]s from an engine turn onto the workspace
+/// projection. Polls with a short timer so the foreground thread is never
+/// blocked; the loop ends once the engine drops its sender, which happens only
+/// after every queued event has been consumed.
+///
+/// Each poll cycle drains every queued event in one workspace update, merging
+/// consecutive assistant/reasoning deltas into a single event. A burst of
+/// per-token deltas therefore costs one journal write and one redraw per
+/// cycle instead of one per token.
+async fn consume_turn_events<J: EventJournal + ProjectStore>(
+    workspace: &WeakEntity<DiscoWorkspace<J>>,
+    run_id: RunId,
+    events: std::sync::mpsc::Receiver<TurnEvent>,
+    cx: &mut AsyncApp,
+) {
+    loop {
+        let mut batch: Vec<TurnEvent> = Vec::new();
+        let mut disconnected = false;
+        loop {
+            match events.try_recv() {
+                Ok(event) => push_coalesced(&mut batch, event),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty()
+            && workspace
+                .update(cx, |workspace, cx| {
+                    for event in batch {
+                        workspace.apply_turn_event(run_id, event);
+                    }
+                    cx.notify();
+                })
+                .is_err()
+        {
+            break;
+        }
+        if disconnected {
+            break;
+        }
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(30))
+            .await;
+    }
+}
+
+/// Appends `event` to `batch`, merging it into the trailing event when both
+/// are text deltas of the same kind so consecutive deltas persist as one
+/// journal event.
+fn push_coalesced(batch: &mut Vec<TurnEvent>, event: TurnEvent) {
+    if let Some(last) = batch.last_mut() {
+        match (last, &event) {
+            (TurnEvent::AssistantDelta { text: acc }, TurnEvent::AssistantDelta { text }) => {
+                acc.push_str(text);
+                return;
+            }
+            (TurnEvent::ReasoningDelta { text: acc }, TurnEvent::ReasoningDelta { text }) => {
+                acc.push_str(text);
+                return;
+            }
+            _ => {}
+        }
+    }
+    batch.push(event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppAppearance, AppConfig, ChatConversation, ComposerInput, DiscoWorkspace, OpenCodeModel,
+        push_coalesced,
     };
     use disco_domain::{
-        EngineKind, Project, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
+        ActivityInfo, EngineKind, Project, RunEvent, RunEventPayload, RunId, RunStatus, SessionId,
+        TokenUsage, TurnEvent,
     };
     use disco_kernel::{EventJournal, MemoryJournal, ProjectStore, RunProjection};
     use gpui::{AppContext, TestAppContext, WindowAppearance};
@@ -4421,6 +4693,159 @@ mod tests {
             DiscoWorkspace::<disco_kernel::MemoryJournal>::terminal_event(false),
             RunEventPayload::RunCompleted
         ));
+    }
+
+    #[test]
+    fn consecutive_deltas_coalesce_into_one_event_per_kind() {
+        let mut batch = Vec::new();
+        push_coalesced(&mut batch, TurnEvent::AssistantDelta { text: "a".into() });
+        push_coalesced(&mut batch, TurnEvent::AssistantDelta { text: "b".into() });
+        push_coalesced(&mut batch, TurnEvent::ReasoningDelta { text: "t".into() });
+        push_coalesced(&mut batch, TurnEvent::AssistantDelta { text: "c".into() });
+        push_coalesced(&mut batch, TurnEvent::Finished { interrupted: false });
+        assert_eq!(
+            batch,
+            vec![
+                TurnEvent::AssistantDelta { text: "ab".into() },
+                TurnEvent::ReasoningDelta { text: "t".into() },
+                TurnEvent::AssistantDelta { text: "c".into() },
+                TurnEvent::Finished { interrupted: false },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn turn_events_project_onto_durable_run_events(cx: &mut TestAppContext) {
+        let workspace = cx.update(|cx| {
+            let composer = cx.new(ComposerInput::new);
+            cx.new(|cx| {
+                DiscoWorkspace::new(
+                    MemoryJournal::default(),
+                    composer,
+                    PathBuf::from(format!("/tmp/disco-settings-{}.json", RunId::new())),
+                    PathBuf::from(format!("/tmp/disco-project-{}", RunId::new())),
+                    Err("Codex unavailable in test".into()),
+                    None,
+                    Ok(Vec::new()),
+                    cx,
+                )
+            })
+        });
+
+        let run_id = RunId::new();
+        let interrupted_run_id = RunId::new();
+        let failed_run_id = RunId::new();
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, _| {
+                for id in [run_id, interrupted_run_id, failed_run_id] {
+                    workspace
+                        .kernel
+                        .start_run(
+                            id,
+                            workspace.active_project_id,
+                            workspace.active_session_id,
+                            EngineKind::Codex,
+                            None,
+                            "Stream this",
+                        )
+                        .expect("run should start");
+                }
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::ThreadAttached {
+                        thread_id: "thread-9".into(),
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::ReasoningDelta {
+                        text: "Thinking ".into(),
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::AssistantDelta {
+                        text: "Hello ".into(),
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::AssistantDelta {
+                        text: "world".into(),
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::ActivityStarted {
+                        activity: ActivityInfo {
+                            id: "call-1".into(),
+                            title: "Read file".into(),
+                            detail: "src/main.rs".into(),
+                        },
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::ActivityCompleted {
+                        id: "call-1".into(),
+                        success: true,
+                        output: "fn main".into(),
+                    },
+                );
+                workspace.apply_turn_event(
+                    run_id,
+                    TurnEvent::UsageUpdated {
+                        usage: TokenUsage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            total_tokens: 15,
+                        },
+                    },
+                );
+                workspace.apply_turn_event(run_id, TurnEvent::Finished { interrupted: false });
+                workspace.apply_turn_event(
+                    interrupted_run_id,
+                    TurnEvent::Finished { interrupted: true },
+                );
+                workspace.apply_turn_event(
+                    failed_run_id,
+                    TurnEvent::Failed {
+                        code: "codex_turn_failed".into(),
+                        message: "Codex turn failed: boom".into(),
+                    },
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let workspace = workspace.read(cx);
+            let projection = workspace
+                .kernel
+                .restore(run_id)
+                .expect("completed run should restore");
+            assert_eq!(projection.status, RunStatus::Completed);
+            assert_eq!(projection.codex_thread_id.as_deref(), Some("thread-9"));
+            assert_eq!(projection.assistant_text, "Hello world");
+            assert_eq!(projection.reasoning_text, "Thinking ");
+            assert_eq!(projection.usage.total_tokens, 15);
+            assert_eq!(projection.activities.len(), 1);
+
+            let interrupted = workspace
+                .kernel
+                .restore(interrupted_run_id)
+                .expect("interrupted run should restore");
+            assert_eq!(interrupted.status, RunStatus::Cancelled);
+
+            let failed = workspace
+                .kernel
+                .restore(failed_run_id)
+                .expect("failed run should restore");
+            assert_eq!(failed.status, RunStatus::Failed);
+            assert_eq!(
+                failed.failure_message.as_deref(),
+                Some("Codex turn failed: boom")
+            );
+        });
     }
 
     #[gpui::test]

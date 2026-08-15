@@ -209,6 +209,48 @@ impl RunEventPayload {
     }
 }
 
+/// A tool/plan activity description an engine surfaces mid-turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivityInfo {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+}
+
+/// Streaming events an engine emits while a turn executes. Engines send these
+/// over a channel so the UI can project partial progress before the turn
+/// settles; each variant maps onto a durable [`RunEventPayload`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnEvent {
+    ThreadAttached {
+        thread_id: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    ActivityStarted {
+        activity: ActivityInfo,
+    },
+    ActivityCompleted {
+        id: String,
+        success: bool,
+        output: String,
+    },
+    UsageUpdated {
+        usage: TokenUsage,
+    },
+    Finished {
+        interrupted: bool,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunEvent {
     pub id: EventId,

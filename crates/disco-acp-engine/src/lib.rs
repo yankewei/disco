@@ -28,9 +28,10 @@ use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, ActiveSession, Agent, Client, ConnectionTo, SessionMessage,
 };
+use disco_domain::{ActivityInfo, TokenUsage, TurnEvent};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,6 +143,13 @@ enum Command {
         model: String,
         reply: std::sync::mpsc::Sender<Result<AcpTurnResult, AcpError>>,
     },
+    RunTurnStreaming {
+        session_id: String,
+        prompt: String,
+        model: String,
+        events: std::sync::mpsc::Sender<TurnEvent>,
+        reply: std::sync::mpsc::Sender<Result<(), AcpError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -221,6 +229,32 @@ impl AcpRuntime {
                 session_id: session_id.to_owned(),
                 prompt: prompt.to_owned(),
                 model: model.to_owned(),
+                reply: reply_tx,
+            })
+            .map_err(|_| AcpError::Disconnected("connection thread ended".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| AcpError::Disconnected("connection thread ended".into()))?
+    }
+
+    /// Runs one prompt turn against an existing ACP session, emitting
+    /// [`TurnEvent`]s on `events` as `session/update` notifications arrive.
+    /// The reply settles with `Ok(())` once the turn reaches a stop reason;
+    /// transport and protocol failures come back as `Err`.
+    pub fn run_turn_streaming(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        model: &str,
+        events: std::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<(), AcpError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.command_tx
+            .unbounded_send(Command::RunTurnStreaming {
+                session_id: session_id.to_owned(),
+                prompt: prompt.to_owned(),
+                model: model.to_owned(),
+                events,
                 reply: reply_tx,
             })
             .map_err(|_| AcpError::Disconnected("connection thread ended".into()))?;
@@ -325,6 +359,25 @@ async fn command_loop(
                 .await;
                 let _ = reply.send(result);
             }
+            Command::RunTurnStreaming {
+                session_id,
+                prompt,
+                model,
+                events,
+                reply,
+            } => {
+                let result = run_turn_streaming(
+                    &connection,
+                    &spec,
+                    &mut sessions,
+                    &session_id,
+                    &prompt,
+                    &model,
+                    &events,
+                )
+                .await;
+                let _ = reply.send(result);
+            }
         }
     }
     Ok(())
@@ -395,6 +448,168 @@ async fn run_turn(
         usage,
         interrupted,
     })
+}
+
+/// Runs one prompt turn, emitting [`TurnEvent`]s as `session/update`
+/// notifications arrive, and settles once the agent reports a stop reason.
+async fn run_turn_streaming(
+    connection: &ConnectionTo<Agent>,
+    spec: &AcpSpec,
+    sessions: &mut HashMap<SessionId, ActiveSession<'static, Agent>>,
+    session_id: &str,
+    prompt: &str,
+    model: &str,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<(), AcpError> {
+    let session = sessions
+        .get_mut(&SessionId::new(session_id))
+        .ok_or_else(|| AcpError::UnknownSession(session_id.to_owned()))?;
+    let (config_id, config_value) = (spec.model_config)(model);
+    connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            SessionId::new(session_id),
+            config_id,
+            config_value,
+        ))
+        .block_task()
+        .await?;
+    session.send_prompt(prompt)?;
+
+    let mut known_tools: HashSet<String> = HashSet::new();
+    let mut plan_count = 0usize;
+
+    loop {
+        match session.read_update().await? {
+            SessionMessage::SessionMessage(dispatch) => {
+                MatchDispatch::new(dispatch)
+                    .if_notification(async |notification: SessionNotification| {
+                        emit_update(
+                            notification.update,
+                            events,
+                            &mut known_tools,
+                            &mut plan_count,
+                        );
+                        Ok(())
+                    })
+                    .await
+                    .otherwise_ignore()?;
+            }
+            SessionMessage::StopReason(reason) => {
+                let _ = events.send(TurnEvent::Finished {
+                    interrupted: matches!(reason, StopReason::Cancelled),
+                });
+                break;
+            }
+            // Future SDK message kinds are ignored; the turn ends on StopReason.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Maps one typed ACP `session/update` notification onto streaming
+/// [`TurnEvent`]s. Pure and unit-testable.
+fn emit_update(
+    update: SessionUpdate,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+    known_tools: &mut HashSet<String>,
+    plan_count: &mut usize,
+) {
+    match update {
+        SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::Text(chunk),
+            ..
+        }) => {
+            let _ = events.send(TurnEvent::AssistantDelta { text: chunk.text });
+        }
+        SessionUpdate::AgentThoughtChunk(ContentChunk {
+            content: ContentBlock::Text(chunk),
+            ..
+        }) => {
+            let _ = events.send(TurnEvent::ReasoningDelta { text: chunk.text });
+        }
+        SessionUpdate::Plan(Plan { entries, .. }) => {
+            let detail = entries
+                .iter()
+                .map(|entry| entry.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let id = format!("plan-{plan_count}");
+            *plan_count += 1;
+            let _ = events.send(TurnEvent::ActivityStarted {
+                activity: ActivityInfo {
+                    id: id.clone(),
+                    title: "Execution plan".into(),
+                    detail: detail.clone(),
+                },
+            });
+            let _ = events.send(TurnEvent::ActivityCompleted {
+                id,
+                success: true,
+                output: detail,
+            });
+        }
+        SessionUpdate::ToolCall(tool_call) => {
+            let id = tool_call.tool_call_id.to_string();
+            if known_tools.insert(id.clone()) {
+                let _ = events.send(TurnEvent::ActivityStarted {
+                    activity: ActivityInfo {
+                        id: id.clone(),
+                        title: tool_call.title,
+                        detail: tool_call_text(&tool_call.content),
+                    },
+                });
+            }
+            if matches!(
+                tool_call.status,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            ) {
+                let _ = events.send(TurnEvent::ActivityCompleted {
+                    id,
+                    success: tool_call.status == ToolCallStatus::Completed,
+                    output: tool_call_text(&tool_call.content),
+                });
+            }
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let id = update.tool_call_id.to_string();
+            if known_tools.insert(id.clone()) {
+                let _ = events.send(TurnEvent::ActivityStarted {
+                    activity: ActivityInfo {
+                        id: id.clone(),
+                        title: update
+                            .fields
+                            .title
+                            .unwrap_or_else(|| "Tool call".to_owned()),
+                        detail: tool_call_text(
+                            update.fields.content.as_deref().unwrap_or_default(),
+                        ),
+                    },
+                });
+            }
+            if let Some(status) = update.fields.status
+                && matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+            {
+                let _ = events.send(TurnEvent::ActivityCompleted {
+                    id,
+                    success: status == ToolCallStatus::Completed,
+                    output: tool_call_text(update.fields.content.as_deref().unwrap_or_default()),
+                });
+            }
+        }
+        SessionUpdate::UsageUpdate(UsageUpdate { used, .. }) => {
+            // ACP usage is context-window semantics with no input/output
+            // split, so only the total is surfaced.
+            let _ = events.send(TurnEvent::UsageUpdated {
+                usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: used,
+                },
+            });
+        }
+        _ => {}
+    }
 }
 
 /// Applies one typed ACP `session/update` notification to the running projection.
@@ -515,12 +730,14 @@ pub enum AcpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpActivity, AcpTokenUsage, apply_update, tool_call_text};
+    use super::{AcpActivity, AcpTokenUsage, apply_update, emit_update, tool_call_text};
     use agent_client_protocol::schema::v1::{
         Content, ContentBlock, ContentChunk, Cost, Plan, PlanEntry, PlanEntryPriority,
         PlanEntryStatus, SessionUpdate, TextContent, ToolCall, ToolCallContent, ToolCallStatus,
         ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
     };
+    use disco_domain::TurnEvent;
+    use std::collections::HashSet;
 
     fn text_chunk(content: &str) -> SessionUpdate {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
@@ -530,6 +747,116 @@ mod tests {
 
     fn projection() -> (String, Vec<AcpActivity>, AcpTokenUsage) {
         (String::new(), Vec::new(), AcpTokenUsage::default())
+    }
+
+    fn drain(update: SessionUpdate) -> Vec<TurnEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut known_tools = HashSet::new();
+        let mut plan_count = 0;
+        emit_update(update, &tx, &mut known_tools, &mut plan_count);
+        drop(tx);
+        rx.iter().collect()
+    }
+
+    #[test]
+    fn streaming_chunks_become_assistant_deltas() {
+        let events = drain(text_chunk("Hello "));
+        assert_eq!(
+            events,
+            vec![TurnEvent::AssistantDelta {
+                text: "Hello ".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_thought_chunks_become_reasoning_deltas() {
+        let events = drain(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("Let me think")),
+        )));
+        assert_eq!(
+            events,
+            vec![TurnEvent::ReasoningDelta {
+                text: "Let me think".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_tool_calls_start_once_and_complete_on_terminal_status() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut known_tools = HashSet::new();
+        let mut plan_count = 0;
+        emit_update(
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "Ran tests").status(ToolCallStatus::InProgress),
+            ),
+            &tx,
+            &mut known_tools,
+            &mut plan_count,
+        );
+        emit_update(
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(vec![ToolCallContent::Content(Content::new(
+                        ContentBlock::Text(TextContent::new("3 passed")),
+                    ))]),
+            )),
+            &tx,
+            &mut known_tools,
+            &mut plan_count,
+        );
+        drop(tx);
+        let events: Vec<TurnEvent> = rx.iter().collect();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            TurnEvent::ActivityStarted { activity } if activity.id == "call-1" && activity.title == "Ran tests"
+        ));
+        assert_eq!(
+            events[1],
+            TurnEvent::ActivityCompleted {
+                id: "call-1".into(),
+                success: true,
+                output: "3 passed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_usage_reports_only_the_total() {
+        let events = drain(SessionUpdate::UsageUpdate(UsageUpdate::new(53000, 200000)));
+        assert_eq!(
+            events,
+            vec![TurnEvent::UsageUpdated {
+                usage: disco_domain::TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 53000,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn streaming_plan_starts_and_completes_one_activity() {
+        let events = drain(SessionUpdate::Plan(Plan::new(vec![PlanEntry::new(
+            "Run tests",
+            PlanEntryPriority::High,
+            PlanEntryStatus::Pending,
+        )])));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            TurnEvent::ActivityStarted { activity } if activity.title == "Execution plan"
+        ));
+        assert!(matches!(
+            &events[1],
+            TurnEvent::ActivityCompleted { success: true, output, .. } if output.contains("Run tests")
+        ));
     }
 
     #[test]
