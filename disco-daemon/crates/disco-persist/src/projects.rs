@@ -25,6 +25,32 @@ impl Database {
         })
     }
 
+    /// Get a single project by ID.
+    pub fn get_project(&self, project_id: Uuid) -> Result<Option<Project>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name, path, created_at FROM projects WHERE id = ?1")
+            .context("Failed to prepare get_project query")?;
+
+        let mut rows = stmt
+            .query_map(rusqlite::params![project_id.to_string()], |row| {
+                let id_str: String = row.get(0)?;
+                Ok(Project {
+                    id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .context("Failed to query project")?;
+
+        match rows.next() {
+            Some(Ok(project)) => Ok(Some(project)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     /// List all projects ordered by creation date (newest first).
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn.lock().unwrap();

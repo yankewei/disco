@@ -105,13 +105,17 @@ async fn handle_run_start(
     // Register the run
     app.active_runs.lock().await.insert(run_id, cancel.clone());
 
-    // Look up the session to get the vendor
-    let vendor = app
+    // Look up the session to get the vendor and project_id
+    let session = app
         .db
         .get_session(session_id)
         .ok()
-        .flatten()
-        .map(|s| s.vendor);
+        .flatten();
+    let vendor = session.as_ref().map(|s| s.vendor);
+    let workspace_path = session
+        .as_ref()
+        .and_then(|s| app.db.get_project(s.project_id).ok().flatten())
+        .map(|p| p.path);
 
     // Get the appropriate provider
     let provider = match app.get_provider(vendor).await {
@@ -224,7 +228,7 @@ async fn handle_run_start(
         );
 
         let mut stream = agent
-            .run(chat_messages, cancel.clone(), run_id, session_id, None)
+            .run(chat_messages, cancel.clone(), run_id, session_id, workspace_path)
             .await;
         let mut full_response = String::new();
         let mut accumulated_usage: Option<TokenUsage> = None;
