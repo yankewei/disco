@@ -67,8 +67,12 @@ struct SettingsView: View {
         }
         .onChange(of: appState.providerConfigs) { _, _ in
             // 验证保存完成后，从“待配置”中移除
-            appState.pendingVendors = appState.pendingVendors.filter {
-                !$0.isConfigured(appState.config(for: $0))
+            // 延迟到下一个 run loop 发布，避免在视图更新事务内修改
+            // 同一个被观察对象的状态（SwiftUI 运行时警告）。
+            Task { @MainActor in
+                appState.pendingVendors = appState.pendingVendors.filter {
+                    !$0.isConfigured(appState.config(for: $0))
+                }
             }
         }
     }

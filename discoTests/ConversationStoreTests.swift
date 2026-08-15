@@ -377,13 +377,6 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.threadID)
     }
 
-    private func waitUntilStreamingFinishes(_ store: ConversationStore) async throws {
-        for _ in 0..<100 where store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        XCTAssertFalse(store.isStreaming)
-    }
-
     private func waitUntil(
         _ store: ConversationStore,
         condition: (ConversationStore) -> Bool
@@ -393,6 +386,21 @@ final class ConversationStoreTests: XCTestCase {
         }
         XCTAssertTrue(condition(store))
     }
+}
+
+/// 等待一次运行结束。
+///
+/// send() 的状态突变延迟到下一个 run loop 执行，因此先等待运行启动
+/// （或已经结束），再等待流式结束。
+@MainActor
+func waitUntilStreamingFinishes(_ store: ConversationStore) async throws {
+    for _ in 0..<100 where !store.isStreaming {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    for _ in 0..<100 where store.isStreaming {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertFalse(store.isStreaming)
 }
 
 private actor StreamRecorder {

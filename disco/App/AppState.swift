@@ -52,6 +52,11 @@ final class AppState: ObservableObject {
     var hasAPIKey: Bool { providerConfigs[activeVendor]?.hasAPIKey ?? false }
     var isActiveVendorConfigured: Bool { activeVendor.isConfigured(providerConfigs[activeVendor]) }
 
+    /// 是否通过守护进程路由请求（守护进程已连接并完成初始化握手）。
+    private var useDaemon: Bool {
+        daemonClient.state == .connected && isDaemonAvailable
+    }
+
     private let keyStores: [ProviderVendor: APIKeyStoring]
     private let defaults: UserDefaults
     private let persistence: any ConversationPersisting
@@ -64,6 +69,17 @@ final class AppState: ObservableObject {
     private var discoveredModelCatalogs: [ProviderVendor: [ModelCatalogEntry]] = [:]
     /// 用户按模型填写的上下文窗口覆盖值，不随模型目录刷新删除。
     private var contextWindowOverrides: [ProviderVendor: [String: Int]] = [:]
+
+    // MARK: - 守护进程（Phase 1：并行通信路径）
+
+    /// 守护进程客户端（通过 Unix 域套接字与 Rust daemon 通信）。
+    let daemonClient = DaemonClient()
+    /// 守护进程进程管理器（启动/停止 daemon 二进制）。
+    let daemonProcessManager = DaemonProcessManager()
+    /// 守护进程连接状态（供 UI 观察）。
+    @Published private(set) var daemonConnectionState: DaemonClient.State = .disconnected
+    /// 守护进程是否可用（已连接并完成初始化握手）。
+    @Published private(set) var isDaemonAvailable = false
 
     var selectedConversation: ConversationSession? {
         guard let selectedConversationID else { return conversations.first }
@@ -225,6 +241,9 @@ final class AppState: ObservableObject {
         if activeVendor.isConfigured(providerConfigs[activeVendor]) {
             refreshRuntimes(stopActiveStreams: true)
         }
+
+        // Phase 1：启动守护进程连接（异步，不阻塞 UI）
+        Task { await startDaemonIfNeeded() }
     }
 
     // MARK: - 多服务商配置
@@ -298,6 +317,21 @@ final class AppState: ObservableObject {
         persistReasoningEffort(reasoningEffort, for: vendor)
         defaults.set(verifiedAt.timeIntervalSince1970, forKey: vendor.verifiedAtDefaultsKey)
         authError = nil
+
+        // Phase 2：守护进程可用时，同步服务商配置到守护进程
+        if useDaemon {
+            Task { [weak self] in
+                guard let self else { return }
+                let resolvedKey = (try? self.resolvedAPIKey(vendor: vendor, apiKey: apiKey)) ?? ""
+                _ = try? await self.daemonClient.configureProvider(
+                    vendor: vendor.rawValue,
+                    baseURL: providerBaseURL,
+                    apiKey: resolvedKey,
+                    model: trimmedModel,
+                    thinkingEnabled: thinkingEnabled
+                )
+            }
+        }
 
         if vendor == activeVendor {
             // 保存当前使用的服务商：同步 legacy 键并重建运行时
@@ -732,6 +766,21 @@ final class AppState: ObservableObject {
         conversations.insert(conversation, at: 0)
         selectedConversationID = conversation.id
         persistEmptyProjectConversation(conversation)
+
+        // Phase 2：守护进程可用时，在守护进程中创建会话
+        if useDaemon, let projectID {
+            let vendor = activeVendor
+            let model = providerConfigs[vendor]?.model ?? ""
+            Task { [weak self] in
+                guard let self else { return }
+                _ = try? await self.daemonClient.createSession(
+                    projectID: projectID,
+                    vendor: vendor.rawValue,
+                    model: model
+                )
+            }
+        }
+
         return conversation.id
     }
 
@@ -758,6 +807,14 @@ final class AppState: ObservableObject {
             storageError = "无法删除本地会话：\(error.localizedDescription)"
         }
 
+        // Phase 2：守护进程可用时，同步删除守护进程中的会话
+        if useDaemon {
+            Task { [weak self] in
+                guard let self else { return }
+                _ = try? await self.daemonClient.deleteSession(sessionID: id)
+            }
+        }
+
         if conversations.isEmpty {
             let conversation = makeConversation()
             conversation.store.configure(runtime: makeRuntime(for: conversation))
@@ -777,7 +834,7 @@ final class AppState: ObservableObject {
         threadID: String? = nil,
         contextState: ConversationContextState = ConversationContextState()
     ) -> ConversationSession {
-        ConversationSession(
+        let session = ConversationSession(
             id: id,
             createdAt: createdAt,
             updatedAt: updatedAt,
@@ -795,6 +852,9 @@ final class AppState: ObservableObject {
                 contextState: contextState
             )
         }
+        // Phase 3：注入守护进程客户端，用于审批响应
+        session.store.configure(daemonClient: daemonClient)
+        return session
     }
 
     private func persistEmptyProjectConversation(_ conversation: ConversationSession) {
@@ -1021,6 +1081,55 @@ final class AppState: ObservableObject {
             throw APIConfigurationError.invalidBaseURL
         }
         return url
+    }
+
+    // MARK: - 守护进程管理（Phase 1）
+
+    /// 启动守护进程并建立连接。
+    ///
+    /// Phase 1 策略：
+    /// - 尝试启动守护进程（如果不存在则静默降级）
+    /// - 连接到套接字并执行初始化握手
+    /// - 失败时记录日志，不影响现有功能
+    private func startDaemonIfNeeded() async {
+        // 检查是否已经有守护进程在运行
+        let socketPath = daemonProcessManager.daemonSocketPath()
+
+        do {
+            // 尝试确保守护进程运行（如果二进制不存在会抛出 daemonNotFound）
+            try await daemonProcessManager.ensureDaemonRunning()
+        } catch let error as DaemonError where error == .daemonNotFound {
+            // 守护进程二进制尚未编译：Phase 1 预期行为，静默降级
+            daemonConnectionState = .failed("守护进程未安装")
+            return
+        } catch {
+            // 其他启动错误：记录但不阻塞
+            daemonConnectionState = .failed(error.localizedDescription)
+            return
+        }
+
+        // 连接到守护进程
+        do {
+            try await daemonClient.connect(socketPath: socketPath)
+            daemonConnectionState = daemonClient.state
+
+            // 执行初始化握手
+            _ = try await daemonClient.initialize()
+            isDaemonAvailable = true
+        } catch {
+            daemonConnectionState = daemonClient.state
+            isDaemonAvailable = false
+        }
+    }
+
+    /// 停止守护进程并断开连接。
+    ///
+    /// 未接线：当前应用退出时未调用，daemon 进程由系统回收（Phase 1 预留）。
+    func stopDaemon() {
+        daemonClient.disconnect()
+        daemonProcessManager.stopDaemon()
+        daemonConnectionState = .disconnected
+        isDaemonAvailable = false
     }
 }
 

@@ -13,6 +13,8 @@ struct ChatView: View {
     @State private var shouldFollowLatestMessage = true
     @State private var isUserScrolling = false
     @State private var presentedInteractionID: PendingUserInteraction.ID?
+    /// 防抖滚动任务：合并同一帧内的多次滚动请求，避免在 onChange 调用栈内同步 scrollTo
+    @State private var scrollTask: Task<Void, Never>?
 
     private static let latestMessageAnchor = "latest-message-anchor"
 
@@ -29,6 +31,20 @@ struct ChatView: View {
     private var project: ProjectSnapshot? {
         guard let projectID else { return nil }
         return appState.projects.first { $0.id == projectID }
+    }
+
+    /// 防抖滚动到底部：合并同一帧内的多次请求，并在下一 run loop 异步执行。
+    ///
+    /// 流式消息时 `messages` 高频变化，若在 `onChange` 调用栈内同步 `scrollTo`，
+    /// 滚动回调会在此期间修改视图状态，触发 SwiftUI 运行时警告
+    /// （"Publishing changes from within view updates"）。
+    private func scheduleScrollToLatest(_ proxy: ScrollViewProxy) {
+        scrollTask?.cancel()
+        scrollTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled else { return }
+            proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+        }
     }
 
     private var projectUnavailable: Bool {
@@ -87,12 +103,38 @@ struct ChatView: View {
                                 )
                                 .id(message.id)
                             }
+
+                            // 工具执行状态（Phase 3：守护进程路径）
+                            ForEach(store.toolExecutions) { execution in
+                                ToolExecutionView(execution: execution)
+                            }
                         }
 
                         ForEach(store.interactionRecords) { record in
                             UserInteractionCard(record: record) {
                                 presentedInteractionID = record.id
                             }
+                        }
+
+                        // 守护进程审批对话框（Phase 3）
+                        if let approval = store.pendingApproval {
+                            ApprovalDialogView(
+                                approval: approval,
+                                onApprove: {
+                                    store.respondToApproval(decision: "approve_once")
+                                },
+                                onApproveForSession: {
+                                    store.respondToApproval(decision: "approve_for_session")
+                                },
+                                onDecline: {
+                                    store.respondToApproval(decision: "decline")
+                                }
+                            )
+                            .transition(
+                                reduceMotion
+                                    ? .opacity
+                                    : .opacity.combined(with: .move(edge: .bottom))
+                            )
                         }
 
                         Color.clear
@@ -108,26 +150,42 @@ struct ChatView: View {
                 .onScrollGeometryChange(for: Bool.self) { geometry in
                     geometry.visibleRect.maxY >= geometry.contentSize.height - 24
                 } action: { _, isAtLatest in
-                    isAtLatestMessage = isAtLatest
-                    if isAtLatest {
-                        shouldFollowLatestMessage = true
-                    } else if isUserScrolling {
-                        shouldFollowLatestMessage = false
+                    // 滚动几何回调可能在布局/视图更新期间触发，延迟到下一个
+                    // run loop 写入状态，避免 SwiftUI 运行时警告
+                    // （"Publishing changes from within view updates"）。
+                    Task { @MainActor in
+                        isAtLatestMessage = isAtLatest
+                        if isAtLatest {
+                            shouldFollowLatestMessage = true
+                        } else if isUserScrolling {
+                            shouldFollowLatestMessage = false
+                        }
                     }
                 }
                 .onScrollPhaseChange { _, phase in
-                    isUserScrolling = phase.isScrolling && phase != .animating
+                    let isScrolling = phase.isScrolling && phase != .animating
+                    Task { @MainActor in
+                        isUserScrolling = isScrolling
+                    }
                 }
                 .onChange(of: store.messages) {
                     guard shouldFollowLatestMessage else { return }
-                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                    scheduleScrollToLatest(proxy)
                 }
                 .onChange(of: store.interactionRecords) {
                     guard shouldFollowLatestMessage else { return }
-                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                    scheduleScrollToLatest(proxy)
+                }
+                .onChange(of: store.toolExecutions) {
+                    guard shouldFollowLatestMessage else { return }
+                    scheduleScrollToLatest(proxy)
+                }
+                .onChange(of: store.pendingApproval?.approvalId) {
+                    guard shouldFollowLatestMessage else { return }
+                    scheduleScrollToLatest(proxy)
                 }
                 .onAppear {
-                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                    scheduleScrollToLatest(proxy)
                 }
                 .overlay(alignment: .bottom) {
                     if !isAtLatestMessage && !shouldFollowLatestMessage {
@@ -1275,9 +1333,10 @@ private struct ComposerView: View {
             .disabled(!isConfigured)
             .onKeyPress(.return, phases: .down) { keyPress in
                 if keyPress.modifiers.contains(.command) {
-                    return store.isStreaming ? .handled : .ignored
+                    store.draft.append("\n")
+                    return .handled
                 }
-                store.draft.append("\n")
+                store.send()
                 return .handled
             }
 
@@ -1300,7 +1359,7 @@ private struct ComposerView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 } else if isConfigured {
-                    Text("⌘↩︎ 发送")
+                    Text("↩︎ 发送")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 } else if projectUnavailable {
@@ -1523,7 +1582,7 @@ private struct ComposerView: View {
                     .background(DiscoTheme.accent, in: Circle())
             }
             .buttonStyle(DiscoPressButtonStyle())
-            .keyboardShortcut(.return, modifiers: [.command])
+            .keyboardShortcut(.return)
             .disabled(!store.canSend)
             .opacity(store.canSend ? 1 : 0.38)
             .help("发送")

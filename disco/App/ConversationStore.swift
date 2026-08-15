@@ -21,6 +21,15 @@ struct UserInputDraft: Equatable {
     var customQuestionIDs: Set<String> = []
 }
 
+/// 工具执行在 UI 时间线中的展示模型。
+struct ToolExecutionDisplay: Identifiable, Equatable {
+    let id: String  // toolCallId
+    let toolName: String
+    let arguments: String
+    var output: String?
+    var isCompleted: Bool = false
+}
+
 @MainActor
 final class ConversationStore: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
@@ -37,9 +46,19 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var lastSuccessfulCompaction: ContextCompactionSnapshot?
     /// 当前进行中的压缩记录；nil 表示没有压缩在跑。
     @Published private(set) var activeCompaction: ContextCompactionSnapshot?
+    /// 当前待处理的守护进程审批请求；nil 表示无审批等待。
+    @Published var pendingApproval: DaemonApprovalRequestedData?
+    /// 当前运行中活跃/已完成的工具执行记录（守护进程路径）。
+    @Published private(set) var toolExecutions: [ToolExecutionDisplay] = []
+
+    /// 守护进程客户端引用（Phase 3：审批响应需要直接调用 daemonClient）。
+    private var daemonClient: DaemonClient?
 
     private var runtime: (any AgentRuntime)?
     private var requestTask: Task<Void, Never>?
+    /// 发送前的同步占位标志：防止同一次视图更新内重复点击触发两次发送
+    /// （状态突变已延迟到下一个 run loop，详见 send()）。
+    private var isSendStarting = false
     private var compactionTask: Task<Void, Never>?
     private var persistenceTask: Task<Void, Never>?
     private var activeRunID: RunID?
@@ -164,6 +183,11 @@ final class ConversationStore: ObservableObject {
         return oldRuntime
     }
 
+    /// 设置守护进程客户端引用（Phase 3：用于审批响应）。
+    func configure(daemonClient: DaemonClient?) {
+        self.daemonClient = daemonClient
+    }
+
     /// 更新订阅会话的线程 id（CodexRuntime 首次运行时回调）。
     /// 立即持久化，保证重启后能 thread/resume 续接上下文。
     func updateThreadID(_ id: String) {
@@ -172,10 +196,24 @@ final class ConversationStore: ObservableObject {
         persistImmediately()
     }
 
+    /// 发送消息。
+    ///
+    /// 状态突变延迟到下一个 MainActor run loop 执行，避免在输入框/按钮事件
+    /// 触发的视图更新事务内同步发布（SwiftUI 运行时警告
+    /// "Publishing changes from within view updates"）。
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let runtime, !text.isEmpty, !isStreaming else { return }
+        guard let runtime, !text.isEmpty, !isStreaming, !isSendStarting else { return }
+        isSendStarting = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isSendStarting = false }
+            guard !self.isStreaming else { return }
+            self.startRun(text: text, runtime: runtime)
+        }
+    }
 
+    private func startRun(text: String, runtime: any AgentRuntime) {
         interactionRecords.removeAll { record in
             switch record.status {
             case .resolved, .cancelled: true
@@ -208,6 +246,9 @@ final class ConversationStore: ObservableObject {
                     )
                 ) {
                     guard !Task.isCancelled, activeRunID == runID else { return }
+                    // 让状态发布发生在全新的 MainActor job 中，避免在
+                    // 视图更新事务内同步修改被观察状态。
+                    await Task.yield()
                     handle(event, assistantID: assistantID)
                 }
             } catch {
@@ -270,6 +311,175 @@ final class ConversationStore: ObservableObject {
         }
     }
 
+    // MARK: - 守护进程事件处理（Phase 2）
+
+    /// 处理守护进程推送的事件，映射到与 AgentEvent 相同的内部状态变更。
+    ///
+    /// 当运行通过守护进程路由时（`useDaemon == true`），事件流来自守护进程通知
+    /// 而非本地 AgentRuntime。此方法将守护进程事件翻译为与 `handle(_:assistantID:)`
+    /// 等价的状态更新，确保 UI 层无需区分数据来源。
+    /// 注意：当前没有调用方（daemon 事件流尚未接线），审批/工具执行等
+    /// 守护进程事件暂不可达（Phase 2/3 预留）。
+    func handleDaemonNotification(_ event: DaemonEvent, assistantID: UUID) {
+        switch event.eventName {
+        case "message.delta":
+            guard let data = try? event.decoded(as: DaemonMessageDeltaData.self) else { return }
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].appendText(data.delta)
+            schedulePersistence()
+
+        case "reasoning.delta":
+            guard let data = try? event.decoded(as: DaemonReasoningDeltaData.self) else { return }
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].appendReasoning(data.delta)
+            schedulePersistence()
+
+        case "context.usage":
+            guard let data = try? event.decoded(as: DaemonContextUsageData.self) else { return }
+            let currentUsage = TokenUsageSnapshot(
+                inputTokens: data.current.input,
+                cachedInputTokens: data.current.cachedInput,
+                outputTokens: data.current.output,
+                reasoningOutputTokens: data.current.reasoningOutput,
+                totalTokens: data.current.total
+            )
+            let accumulatedUsage: TokenUsageSnapshot?
+            if let accumulated = data.accumulated {
+                accumulatedUsage = TokenUsageSnapshot(
+                    inputTokens: accumulated.input,
+                    cachedInputTokens: accumulated.cachedInput,
+                    outputTokens: accumulated.output,
+                    reasoningOutputTokens: accumulated.reasoningOutput,
+                    totalTokens: accumulated.total
+                )
+            } else {
+                accumulatedUsage = nil
+            }
+            let source: ContextUsageSnapshot.Source
+            switch data.source {
+            case "codex": source = .codex
+            case "estimate": source = .estimate
+            default: source = .provider
+            }
+            contextUsage = ContextUsageSnapshot(
+                current: currentUsage,
+                accumulated: accumulatedUsage,
+                contextWindow: data.contextWindow,
+                source: source
+            )
+
+        case "context.compaction":
+            guard let data = try? event.decoded(as: DaemonContextCompactionData.self) else { return }
+            let runtimeKind: RuntimeKind = data.runtimeKind == "codex" ? .codex : .generic
+            let trigger: ContextCompactionSnapshot.Trigger
+            switch data.trigger {
+            case "automatic": trigger = .automatic
+            case "overflow_recovery": trigger = .overflowRecovery
+            default: trigger = .manual
+            }
+            let status: ContextCompactionSnapshot.Status
+            switch data.status {
+            case "running": status = .running
+            case "completed": status = .completed
+            default: status = .failed
+            }
+            let snapshot = ContextCompactionSnapshot(
+                id: data.id,
+                runtimeKind: runtimeKind,
+                trigger: trigger,
+                status: status,
+                startedAt: Date.now,
+                completedAt: status != .running ? Date.now : nil,
+                beforeTokens: data.beforeTokens,
+                afterTokens: data.afterTokens
+            )
+            let update = ContextCompactionUpdate(snapshot: snapshot)
+            handleCompactionUpdate(update)
+
+        case "run.state":
+            guard let data = try? event.decoded(as: DaemonRunStateData.self) else { return }
+            switch data.state {
+            case "connecting": runState = .connecting
+            case "running": runState = .running
+            case "waiting_for_tool": runState = .waitingForTool
+            case "waiting_for_approval": runState = .waitingForApproval
+            case "waiting_for_user_input": runState = .waitingForUserInput
+            case "cancelling": runState = .cancelling
+            default: break
+            }
+
+        case "run.completed":
+            runState = .completed
+            if let runID = activeRunID {
+                finishRun(runID)
+            }
+
+        case "run.failed":
+            if let data = try? event.decoded(as: DaemonRunFailedData.self) {
+                errorMessage = data.error.message
+            } else {
+                errorMessage = "运行失败。"
+            }
+            runState = .failed
+            cancelPendingInteractions()
+            removeEmptyPlaceholder(assistantID)
+            if let runID = activeRunID {
+                finishRun(runID)
+            }
+
+        case "run.cancelled":
+            runState = .cancelled
+            cancelPendingInteractions()
+            if let runID = activeRunID {
+                finishRun(runID)
+            }
+
+        // MARK: - 工具执行事件（Phase 3）
+
+        case "tool.started":
+            guard let data = try? event.decoded(as: DaemonToolStartedData.self) else { return }
+            let execution = ToolExecutionDisplay(
+                id: data.toolCallId,
+                toolName: data.toolName,
+                arguments: data.arguments
+            )
+            toolExecutions.append(execution)
+
+        case "tool.completed":
+            guard let data = try? event.decoded(as: DaemonToolCompletedData.self) else { return }
+            if let index = toolExecutions.firstIndex(where: { $0.id == data.toolCallId }) {
+                toolExecutions[index].output = data.output
+                toolExecutions[index].isCompleted = true
+            } else {
+                // 可能错过了 started 事件，直接添加已完成记录
+                let execution = ToolExecutionDisplay(
+                    id: data.toolCallId,
+                    toolName: data.toolName,
+                    arguments: "",
+                    output: data.output,
+                    isCompleted: true
+                )
+                toolExecutions.append(execution)
+            }
+
+        // MARK: - 审批事件（Phase 3）
+
+        case "approval.requested":
+            guard let data = try? event.decoded(as: DaemonApprovalRequestedData.self) else { return }
+            pendingApproval = data
+            runState = .waitingForApproval
+
+        case "approval.resolved":
+            guard let data = try? event.decoded(as: DaemonApprovalResolvedData.self) else { return }
+            if pendingApproval?.approvalId == data.approvalId {
+                pendingApproval = nil
+            }
+
+        default:
+            break
+        }
+    }
+
     private func appendInteraction(_ interaction: PendingUserInteraction) {
         guard !interactionRecords.contains(where: { $0.id == interaction.id }) else { return }
         interactionRecords.append(UserInteractionRecord(
@@ -324,6 +534,7 @@ final class ConversationStore: ObservableObject {
         persistImmediately()
         activeRunID = nil
         requestTask = nil
+        toolExecutions.removeAll()
     }
 
     func stop() {
@@ -356,6 +567,8 @@ final class ConversationStore: ObservableObject {
         activeCompaction = nil
         interactionRecords.removeAll()
         userInputDrafts.removeAll()
+        pendingApproval = nil
+        toolExecutions.removeAll()
         runState = .idle
         persistImmediately()
     }
@@ -446,6 +659,20 @@ final class ConversationStore: ObservableObject {
                 }) else { return }
                 interactionRecords[index].status = .failed(error.localizedDescription)
             }
+        }
+    }
+
+    /// 响应守护进程路径的审批请求（Phase 3）。
+    ///
+    /// 未接线：pendingApproval 只能由 handleDaemonNotification 设置，
+    /// 在事件流消费前此方法不会被触发。
+    func respondToApproval(decision: String) {
+        guard let approval = pendingApproval else { return }
+        pendingApproval = nil
+        guard let client = daemonClient,
+              let approvalUUID = UUID(uuidString: approval.approvalId) else { return }
+        Task {
+            try? await client.approve(approvalID: approvalUUID, decision: decision)
         }
     }
 
@@ -544,6 +771,7 @@ final class ConversationStore: ObservableObject {
             }
         }
         userInputDrafts.removeAll()
+        pendingApproval = nil
     }
 
     private func schedulePersistence() {

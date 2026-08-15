@@ -83,6 +83,7 @@
 			buildConfigurationList = 0484530E302235F30062D366 /* Build configuration list for PBXNativeTarget "disco" */;
 			buildPhases = (
 				048452FF302235F10062D366 /* Sources */,
+				D1DAE0010000000000000001 /* Build Rust Daemon */,
 				04845300302235F10062D366 /* Frameworks */,
 				04845301302235F10062D366 /* Resources */,
 			);
@@ -183,6 +184,28 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		D1DAE0010000000000000001 /* Build Rust Daemon */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Daemon";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -e\n\n# Xcode 的脚本环境 PATH 不含 rustup 的 cargo，手动补全\nif ! command -v cargo >/dev/null 2>&1 && [ -x \"${HOME}/.cargo/bin/cargo\" ]; then\n    export PATH=\"${HOME}/.cargo/bin:${PATH}\"\nfi\n\nDAEMON_DIR=\"${SRCROOT}/disco-daemon\"\n\nif [ \"${CONFIGURATION}\" = \"Release\" ]; then\n    CARGO_FLAGS=\"--release\"\n    CARGO_TARGET=\"release\"\nelse\n    CARGO_TARGET=\"debug\"\nfi\n\necho \"Building disco-daemon (${CARGO_TARGET})...\"\ncd \"${DAEMON_DIR}\"\ncargo build ${CARGO_FLAGS}\n\nDAEMON_BIN=\"${DAEMON_DIR}/target/${CARGO_TARGET}/disco-daemon\"\nRESOURCES_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources\"\nmkdir -p \"${RESOURCES_DIR}\"\ncp \"${DAEMON_BIN}\" \"${RESOURCES_DIR}/disco-daemon\"\necho \"Copied disco-daemon to ${RESOURCES_DIR}/disco-daemon\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		048452FF302235F10062D366 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -247,7 +270,7 @@
 				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -311,7 +334,7 @@
 				DEVELOPMENT_TEAM = 3BUD4GCZCQ;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -334,6 +357,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -366,6 +390,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;

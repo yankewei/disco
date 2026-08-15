@@ -1,0 +1,18 @@
+[package]
+name = "disco-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+disco-protocol = { path = "../disco-protocol" }
+disco-providers = { path = "../disco-providers" }
+disco-tools = { path = "../disco-tools" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

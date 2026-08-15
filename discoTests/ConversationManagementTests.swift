@@ -20,9 +20,7 @@ final class ConversationManagementTests: XCTestCase {
         firstConversation.store.draft = "Hi"
         firstConversation.store.send()
 
-        for _ in 0..<100 where firstConversation.store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(firstConversation.store)
 
         let secondID = appState.createConversation()
         XCTAssertEqual(appState.conversations.count, 2)
@@ -53,9 +51,7 @@ final class ConversationManagementTests: XCTestCase {
         conversation.store.draft = "保存这段对话"
         conversation.store.send()
 
-        for _ in 0..<100 where conversation.store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(conversation.store)
 
         let restoredAppState = AppState(
             keychain: InMemoryAuthStore(),
@@ -94,9 +90,7 @@ final class ConversationManagementTests: XCTestCase {
         ))
         firstConversation.store.draft = "第一段对话"
         firstConversation.store.send()
-        for _ in 0..<100 where firstConversation.store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(firstConversation.store)
 
         let secondID = appState.createConversation()
         let secondConversation = try XCTUnwrap(appState.selectedConversation)
@@ -106,16 +100,12 @@ final class ConversationManagementTests: XCTestCase {
         ))
         secondConversation.store.draft = "第二段对话"
         secondConversation.store.send()
-        for _ in 0..<100 where secondConversation.store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(secondConversation.store)
         XCTAssertEqual(appState.conversations.first?.id, secondID)
 
         firstConversation.store.draft = "继续第一段对话"
         firstConversation.store.send()
-        for _ in 0..<100 where firstConversation.store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(firstConversation.store)
         XCTAssertEqual(appState.conversations.first?.id, firstConversation.id)
     }
 }

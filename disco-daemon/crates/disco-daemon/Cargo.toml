@@ -1,0 +1,21 @@
+[package]
+name = "disco-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+disco-protocol = { path = "../disco-protocol" }
+disco-core = { path = "../disco-core" }
+disco-providers = { path = "../disco-providers" }
+disco-tools = { path = "../disco-tools" }
+disco-persist = { path = "../disco-persist" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures-core = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

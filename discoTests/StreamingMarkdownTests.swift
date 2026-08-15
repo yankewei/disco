@@ -25,9 +25,7 @@ final class StreamingMarkdownTests: XCTestCase {
         store.draft = "请使用 Markdown 回复"
         store.send()
 
-        for _ in 0..<100 where store.isStreaming {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        try await waitUntilStreamingFinishes(store)
 
         XCTAssertEqual(store.messages.last?.text, expected)
     }
