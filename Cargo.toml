@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/disco-app",
+    "crates/disco-acp-engine",
     "crates/disco-codex-engine",
     "crates/disco-domain",
     "crates/disco-kernel",
@@ -23,6 +24,7 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 agent-client-protocol = "2.0.0"
+disco-acp-engine = { path = "crates/disco-acp-engine" }
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

@@ -2887,6 +2887,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "disco-acp-engine"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "futures",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "disco-app"
 version = "0.1.0"
 dependencies = [
@@ -2930,10 +2939,8 @@ dependencies = [
 name = "disco-opencode-engine"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
- "futures",
- "tempfile",
- "thiserror 2.0.20",
+ "disco-acp-engine",
+ "serde_json",
 ]
 
 [[package]]
@@ -2982,6 +2989,7 @@ dependencies = [
  "disco-codex-engine",
  "disco-domain",
  "disco-kernel",
+ "disco-opencode-engine",
  "disco-rig-engine",
  "gpui",
  "serde",
