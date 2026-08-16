@@ -1,11 +1,11 @@
 //! Codex app-server provider adapter.
 //!
-//! Manages a `codex app-server` subprocess and communicates via JSON-RPC
-//! over stdio (JSONL). Maps Codex turn events to the unified ProviderEvent stream.
+//! 管理 `codex app-server` 子进程及 JSON-RPC stdio 连接。Codex 原始运行语义仅暴露给
+//! CodexAdapter；ModelProvider 实现是迁移期的 compaction bridge。
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
+use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use disco_protocol::types::TokenUsage;
@@ -28,11 +29,19 @@ use crate::openai_responses::{ChatMessage, ProviderEvent};
 /// A JSON-RPC envelope for messages from the codex app-server.
 #[derive(Debug, Deserialize)]
 pub struct RpcEnvelope {
-    pub id: Option<i64>,
+    pub id: Option<CodexRequestId>,
     pub method: Option<String>,
     pub params: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub error: Option<RpcErrorPayload>,
+}
+
+/// Codex app-server 允许 server request 使用数字或字符串 ID。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(untagged)]
+pub enum CodexRequestId {
+    Number(i64),
+    String(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,7 +68,7 @@ struct RpcNotification {
 /// A JSON-RPC error response (for server requests we don't support).
 #[derive(Debug, Serialize)]
 struct RpcErrorResponse {
-    id: i64,
+    id: CodexRequestId,
     error: RpcErrorPayloadOut,
 }
 
@@ -72,19 +81,68 @@ struct RpcErrorPayloadOut {
 // MARK: - Codex turn events (internal)
 
 #[derive(Debug, Clone)]
-enum CodexTurnEvent {
-    Started { _turn_id: String },
-    AgentMessageDelta(String),
-    ReasoningSummaryDelta(String),
-    TokenUsageUpdated(TokenUsage),
-    Completed { status: CodexTurnStatus },
+pub enum CodexProviderEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    Usage(TokenUsage),
+    ToolStarted(CodexToolCall),
+    ToolCompleted(CodexToolResult),
+    ApprovalRequested(CodexApprovalRequest),
+    Completed,
+    Cancelled,
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
-enum CodexTurnStatus {
-    Completed,
-    Interrupted,
-    Failed(String),
+pub struct CodexToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexToolResult {
+    pub id: String,
+    pub name: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexApprovalKind {
+    CommandExecution,
+    FileChange,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexApprovalRequest {
+    pub request_id: CodexRequestId,
+    pub kind: CodexApprovalKind,
+    pub item_id: String,
+    pub title: String,
+    pub reason: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub grant_root: Option<String>,
+    pub allows_session_approval: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexApprovalDecision {
+    Accept,
+    AcceptForSession,
+    Decline,
+    Cancel,
+}
+
+impl CodexApprovalDecision {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::AcceptForSession => "acceptForSession",
+            Self::Decline => "decline",
+            Self::Cancel => "cancel",
+        }
+    }
 }
 
 // MARK: - Pending request tracking
@@ -96,8 +154,17 @@ struct PendingRequest {
 // MARK: - Active turn tracking
 
 struct ActiveTurn {
-    sender: mpsc::Sender<CodexTurnEvent>,
+    sender: mpsc::Sender<CodexProviderEvent>,
     turn_id: Option<String>,
+}
+
+/// 事件流被取消时同步终止尚未完成的 turn/start 任务，避免留下 detached turn。
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 // MARK: - Write request for the writer task
@@ -111,9 +178,11 @@ enum WriteRequest {
 
 struct CodexState {
     /// Whether we've completed the initialize handshake.
-    initialized: bool,
+    is_initialized: bool,
     /// The thread ID for this session.
     thread_id: Option<String>,
+    /// 当前 app-server 进程是否已 start/resume 该 thread。
+    is_thread_attached: bool,
     /// Next request ID for JSON-RPC.
     next_request_id: i64,
     /// Pending RPC requests waiting for responses.
@@ -127,8 +196,9 @@ struct CodexState {
 impl CodexState {
     fn new() -> Self {
         Self {
-            initialized: false,
+            is_initialized: false,
             thread_id: None,
+            is_thread_attached: false,
             next_request_id: 0,
             pending: HashMap::new(),
             active_turn: None,
@@ -156,11 +226,15 @@ pub struct CodexProvider {
     model: String,
     /// Optional reasoning effort.
     reasoning_effort: Option<String>,
+    /// Thread 的项目工作目录。
+    cwd: Option<String>,
     /// Optional thread ID to resume.
     resume_thread_id: Option<String>,
 
     /// Internal state protected by mutex.
     state: Arc<Mutex<CodexState>>,
+    /// Drop 时同步通知 writer，使其释放并终止子进程。
+    shutdown_tx: Arc<StdMutex<Option<mpsc::Sender<WriteRequest>>>>,
 }
 
 impl CodexProvider {
@@ -170,23 +244,22 @@ impl CodexProvider {
         model: String,
         reasoning_effort: Option<String>,
         resume_thread_id: Option<String>,
+        cwd: Option<String>,
     ) -> Self {
         Self {
             executable,
             model,
             reasoning_effort,
+            cwd,
             resume_thread_id,
             state: Arc::new(Mutex::new(CodexState::new())),
+            shutdown_tx: Arc::new(StdMutex::new(None)),
         }
     }
 
     /// Find the codex executable in PATH or well-known locations.
     pub fn find_codex() -> String {
-        let candidates = [
-            "codex",
-            "/usr/local/bin/codex",
-            "/opt/homebrew/bin/codex",
-        ];
+        let candidates = ["codex", "/usr/local/bin/codex", "/opt/homebrew/bin/codex"];
 
         // Check PATH
         if let Ok(path) = std::env::var("PATH") {
@@ -215,173 +288,74 @@ impl CodexProvider {
         candidates[0].to_string()
     }
 
-    /// 流式执行一个 turn：把最后一条用户消息发给 codex app-server，
-    /// 转发事件（文本/推理/token 用量/完成状态）为统一 ProviderEvent。
-    /// 多轮对话历史由 app-server 的 thread 状态管理，无需重复发送。
+    /// 流式执行一个 turn，并保留 Codex 的审批与 item 生命周期语义。
+    /// 多轮历史由 app-server thread 管理，只发送最后一条用户消息。
     pub async fn stream_turn(
         &self,
         messages: &[ChatMessage],
-    ) -> Result<impl Stream<Item = Result<ProviderEvent>>> {
-        let (event_tx, mut event_rx) = mpsc::channel::<Result<ProviderEvent>>(64);
-        let state = self.state.clone();
-        let executable = self.executable.clone();
-        let model = self.model.clone();
-        let reasoning_effort = self.reasoning_effort.clone();
-        let resume_thread_id = self.resume_thread_id.clone();
-
-        // Extract the user input (last user message)
+    ) -> Result<impl Stream<Item = Result<CodexProviderEvent>>> {
+        let (event_tx, mut event_rx) = mpsc::channel::<CodexProviderEvent>(64);
         let user_input = messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
             .map(|m| m.text.clone())
             .unwrap_or_default();
-
-        let tx = event_tx.clone();
-
-        tokio::spawn(async move {
-            // Ensure transport is initialized
-            if let Err(e) = Self::ensure_ready(
-                &state,
-                &executable,
-                &model,
-                resume_thread_id.as_deref(),
-            )
+        self.ensure_session().await?;
+        let thread_id = self
+            .state
+            .lock()
             .await
-            {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-
-            // Get the thread ID
-            let thread_id = {
-                let s = state.lock().await;
-                s.thread_id.clone()
-            };
-
-            let Some(thread_id) = thread_id else {
-                let _ = tx.send(Err(anyhow::anyhow!("No active thread"))).await;
-                return;
-            };
-
-            // Create a channel for turn events
-            let (turn_tx, mut turn_rx) = mpsc::channel::<CodexTurnEvent>(64);
-
-            // Register the active turn
-            {
-                let mut s = state.lock().await;
-                s.active_turn = Some(ActiveTurn {
-                    sender: turn_tx,
-                    turn_id: None,
-                });
-            }
-
-            // Send turn/start request
-            let request_id = {
-                let mut s = state.lock().await;
-                s.next_id()
-            };
-
-            let turn_start = serde_json::json!({
-                "id": request_id,
-                "method": "turn/start",
-                "params": {
+            .thread_id
+            .clone()
+            .context("Codex thread 尚未初始化")?;
+        self.state.lock().await.active_turn = Some(ActiveTurn {
+            sender: event_tx,
+            turn_id: None,
+        });
+        let state = self.state.clone();
+        let reasoning_effort = self.reasoning_effort.clone();
+        let startup = AbortTaskOnDrop(tokio::spawn(async move {
+            let response = Self::send_request(
+                &state,
+                "turn/start",
+                serde_json::json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": user_input}],
                     "effort": reasoning_effort,
-                }
-            });
-
-            // Send the request via the writer
-            if let Err(e) = Self::send_line(&state, &turn_start.to_string()).await {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-
-            // Set up a pending request for the turn/start response
-            let (resp_tx, resp_rx) = oneshot::channel();
-            {
-                let mut s = state.lock().await;
-                s.pending.insert(request_id, PendingRequest { sender: resp_tx });
-            }
-
-            // Wait for the turn/start response (with timeout)
-            match timeout(Duration::from_secs(30), resp_rx).await {
-                Ok(Ok(Ok(_result))) => {
+                }),
+            )
+            .await;
+            match response {
+                Ok(response) => {
+                    if let Some(turn_id) = response["turn"]["id"].as_str() {
+                        let mut state = state.lock().await;
+                        if let Some(active_turn) = &mut state.active_turn
+                            && active_turn.turn_id.is_none()
+                        {
+                            active_turn.turn_id = Some(turn_id.to_string());
+                        }
+                    }
                     debug!("turn/start response received");
                 }
-                Ok(Ok(Err(e))) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("turn/start failed: {e}"))).await;
-                    return;
-                }
-                Ok(Err(_)) => {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!("turn/start response channel closed")))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("turn/start timed out"))).await;
-                    return;
-                }
-            }
-
-            // Now forward turn events as ProviderEvents
-            let tx2 = tx.clone();
-            while let Some(turn_event) = turn_rx.recv().await {
-                match turn_event {
-                    CodexTurnEvent::Started { .. } => {
-                        debug!("Turn started");
-                    }
-                    CodexTurnEvent::AgentMessageDelta(delta) => {
-                        if tx2.send(Ok(ProviderEvent::TextDelta(delta))).await.is_err() {
-                            break;
-                        }
-                    }
-                    CodexTurnEvent::ReasoningSummaryDelta(delta) => {
-                        if tx2
-                            .send(Ok(ProviderEvent::ReasoningDelta(delta)))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    CodexTurnEvent::TokenUsageUpdated(usage) => {
-                        if tx2.send(Ok(ProviderEvent::Usage(usage))).await.is_err() {
-                            break;
-                        }
-                    }
-                    CodexTurnEvent::Completed { status } => {
-                        match status {
-                            CodexTurnStatus::Completed => {
-                                let _ = tx2.send(Ok(ProviderEvent::Completed)).await;
-                            }
-                            CodexTurnStatus::Interrupted => {
-                                let _ = tx2.send(Ok(ProviderEvent::Completed)).await;
-                            }
-                            CodexTurnStatus::Failed(msg) => {
-                                let _ = tx2.send(Ok(ProviderEvent::Failed(msg))).await;
-                            }
-                        }
-                        // Clean up active turn
-                        let mut s = state.lock().await;
-                        s.active_turn = None;
-                        return;
+                Err(error) => {
+                    let active_turn = state.lock().await.active_turn.take();
+                    if let Some(active_turn) = active_turn {
+                        let _ = active_turn
+                            .sender
+                            .send(CodexProviderEvent::Failed(format!(
+                                "turn/start failed: {error}"
+                            )))
+                            .await;
                     }
                 }
             }
+        }));
 
-            // If we get here, the turn channel closed without a completed event
-            let _ = tx.send(Ok(ProviderEvent::Completed)).await;
-            let mut s = state.lock().await;
-            s.active_turn = None;
-        });
-
-        // Return a stream that reads from the event channel
         let stream = async_stream::try_stream! {
+            let _startup = startup;
             while let Some(event) = event_rx.recv().await {
-                yield event?;
+                yield event;
             }
         };
 
@@ -394,10 +368,12 @@ impl CodexProvider {
         executable: &str,
         model: &str,
         resume_thread_id: Option<&str>,
+        cwd: Option<&str>,
+        shutdown_tx: &StdMutex<Option<mpsc::Sender<WriteRequest>>>,
     ) -> Result<()> {
         let s = state.lock().await;
 
-        if s.initialized && s.thread_id.is_some() {
+        if s.is_initialized && s.is_thread_attached && s.thread_id.is_some() {
             return Ok(());
         }
 
@@ -406,11 +382,14 @@ impl CodexProvider {
             drop(s); // Release lock before spawning process
             info!("Launching codex app-server: {executable}");
 
-            let mut child = Command::new(executable)
+            let mut command = Command::new(executable);
+            command
                 .arg("app-server")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let mut child = command
                 .spawn()
                 .context("Failed to launch codex app-server")?;
 
@@ -419,6 +398,9 @@ impl CodexProvider {
 
             // Create a writer task that owns the stdin
             let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(32);
+            *shutdown_tx
+                .lock()
+                .expect("Codex shutdown sender mutex poisoned") = Some(write_tx.clone());
 
             tokio::spawn(async move {
                 let mut stdin = stdin;
@@ -473,14 +455,16 @@ impl CodexProvider {
                         "name": "disco",
                         "title": "Disco",
                         "version": env!("CARGO_PKG_VERSION")
-                    }
+                    },
+                    "capabilities": null
                 }
             });
 
             let (resp_tx, resp_rx) = oneshot::channel();
             {
                 let mut s = state.lock().await;
-                s.pending.insert(init_id, PendingRequest { sender: resp_tx });
+                s.pending
+                    .insert(init_id, PendingRequest { sender: resp_tx });
             }
 
             Self::send_line(state, &init_request.to_string()).await?;
@@ -509,15 +493,19 @@ impl CodexProvider {
 
             {
                 let mut s = state.lock().await;
-                s.initialized = true;
+                s.is_initialized = true;
             }
         }
 
         // Start or resume thread
         {
             let mut s = state.lock().await;
-            if s.thread_id.is_none() {
-                let thread_id = if let Some(resume_id) = resume_thread_id {
+            if !s.is_thread_attached {
+                let thread_to_resume = s
+                    .thread_id
+                    .clone()
+                    .or_else(|| resume_thread_id.map(ToString::to_string));
+                let thread_id = if let Some(resume_id) = thread_to_resume {
                     // Resume existing thread
                     let req_id = s.next_id();
                     let request = serde_json::json!({
@@ -526,6 +514,8 @@ impl CodexProvider {
                         "params": {
                             "threadId": resume_id,
                             "model": model,
+                            "cwd": cwd,
+                            "approvalsReviewer": "user",
                         }
                     });
 
@@ -538,7 +528,9 @@ impl CodexProvider {
 
                     if let Some(tx) = &write_tx {
                         let (ok_tx, ok_rx) = oneshot::channel();
-                        let _ = tx.send(WriteRequest::Line(request.to_string(), ok_tx)).await;
+                        let _ = tx
+                            .send(WriteRequest::Line(request.to_string(), ok_tx))
+                            .await;
                         let _ = ok_rx.await;
                     }
 
@@ -565,6 +557,8 @@ impl CodexProvider {
                         "method": "thread/start",
                         "params": {
                             "model": model,
+                            "cwd": cwd,
+                            "approvalsReviewer": "user",
                         }
                     });
 
@@ -577,7 +571,9 @@ impl CodexProvider {
 
                     if let Some(tx) = &write_tx {
                         let (ok_tx, ok_rx) = oneshot::channel();
-                        let _ = tx.send(WriteRequest::Line(request.to_string(), ok_tx)).await;
+                        let _ = tx
+                            .send(WriteRequest::Line(request.to_string(), ok_tx))
+                            .await;
                         let _ = ok_rx.await;
                     }
 
@@ -600,6 +596,7 @@ impl CodexProvider {
 
                 let mut s = state.lock().await;
                 s.thread_id = Some(thread_id.clone());
+                s.is_thread_attached = true;
                 info!("Codex thread ready: {thread_id}");
             }
         }
@@ -625,7 +622,10 @@ impl CodexProvider {
                     continue;
                 }
             };
-            debug!("codex <<< {}", trimmed.chars().take(160).collect::<String>());
+            debug!(
+                "codex <<< {}",
+                trimmed.chars().take(160).collect::<String>()
+            );
 
             Self::handle_envelope(&state, envelope).await;
         }
@@ -634,7 +634,8 @@ impl CodexProvider {
 
         // Clean up state
         let mut s = state.lock().await;
-        s.initialized = false;
+        s.is_initialized = false;
+        s.is_thread_attached = false;
         s.write_tx = None;
 
         // Fail any pending requests
@@ -646,58 +647,75 @@ impl CodexProvider {
         if let Some(active) = s.active_turn.take() {
             let _ = active
                 .sender
-                .send(CodexTurnEvent::Completed {
-                    status: CodexTurnStatus::Failed("Process exited".to_string()),
-                })
+                .send(CodexProviderEvent::Failed("Process exited".to_string()))
                 .await;
         }
     }
 
     /// Handle a single RPC envelope from the codex app-server.
     async fn handle_envelope(state: &Arc<Mutex<CodexState>>, envelope: RpcEnvelope) {
-        // Server request (has both method and id, no result/error) - respond with "not supported"
-        if let (Some(method), Some(id)) = (&envelope.method, envelope.id) {
-            if envelope.result.is_none() && envelope.error.is_none() {
-                debug!("Codex server request: {method} (id={id}) - rejecting");
-                let error_response = RpcErrorResponse {
-                    id,
-                    error: RpcErrorPayloadOut {
-                        code: -32601,
-                        message: format!("disco does not support server request: {method}"),
-                    },
-                };
-                let json = serde_json::to_string(&error_response).unwrap();
-                let s = state.lock().await;
-                if let Some(write_tx) = &s.write_tx {
-                    let (ok_tx, _ok_rx) = oneshot::channel();
-                    let _ = write_tx.send(WriteRequest::Line(json, ok_tx)).await;
+        if let (Some(method), Some(id)) = (&envelope.method, envelope.id.clone())
+            && envelope.result.is_none()
+            && envelope.error.is_none()
+        {
+            if let Some(approval) = parse_approval_request(id.clone(), method, &envelope.params) {
+                let sender = state
+                    .lock()
+                    .await
+                    .active_turn
+                    .as_ref()
+                    .map(|active| active.sender.clone());
+                if let Some(sender) = sender {
+                    let _ = sender
+                        .send(CodexProviderEvent::ApprovalRequested(approval))
+                        .await;
+                } else {
+                    let response = serde_json::json!({
+                        "id": id,
+                        "result": { "decision": "cancel" }
+                    });
+                    let _ = Self::send_line(state, &response.to_string()).await;
                 }
                 return;
             }
-        }
 
-        // Response to our request (has id but no method)
-        if let Some(id) = envelope.id {
-            if envelope.method.is_none() {
-                let mut s = state.lock().await;
-                if let Some(pending) = s.pending.remove(&id) {
-                    if let Some(error) = envelope.error {
-                        let _ = pending.sender.send(Err(anyhow::anyhow!(
-                            "RPC error {}: {}",
-                            error.code,
-                            error.message
-                        )));
-                    } else {
-                        let _ = pending
-                            .sender
-                            .send(Ok(envelope.result.unwrap_or(serde_json::Value::Null)));
-                    }
-                }
-                return;
+            debug!("Codex server request not supported: {method}");
+            let error_response = RpcErrorResponse {
+                id,
+                error: RpcErrorPayloadOut {
+                    code: -32601,
+                    message: format!("disco does not support server request: {method}"),
+                },
+            };
+            let json = serde_json::to_string(&error_response).unwrap();
+            let s = state.lock().await;
+            if let Some(write_tx) = &s.write_tx {
+                let (ok_tx, _ok_rx) = oneshot::channel();
+                let _ = write_tx.send(WriteRequest::Line(json, ok_tx)).await;
             }
+            return;
         }
 
-        // Notification (has method but no id)
+        if envelope.method.is_none()
+            && let Some(CodexRequestId::Number(id)) = envelope.id
+        {
+            let mut s = state.lock().await;
+            if let Some(pending) = s.pending.remove(&id) {
+                if let Some(error) = envelope.error {
+                    let _ = pending.sender.send(Err(anyhow::anyhow!(
+                        "RPC error {}: {}",
+                        error.code,
+                        error.message
+                    )));
+                } else {
+                    let _ = pending
+                        .sender
+                        .send(Ok(envelope.result.unwrap_or(serde_json::Value::Null)));
+                }
+            }
+            return;
+        }
+
         if let Some(method) = &envelope.method {
             Self::handle_notification(state, method, &envelope.params).await;
         }
@@ -720,12 +738,6 @@ impl CodexProvider {
                     let mut s = state.lock().await;
                     if let Some(active) = &mut s.active_turn {
                         active.turn_id = Some(turn_id.to_string());
-                        let _ = active
-                            .sender
-                            .send(CodexTurnEvent::Started {
-                                _turn_id: turn_id.to_string(),
-                            })
-                            .await;
                     }
                 }
             }
@@ -735,7 +747,7 @@ impl CodexProvider {
                     if let Some(active) = &s.active_turn {
                         let _ = active
                             .sender
-                            .send(CodexTurnEvent::AgentMessageDelta(delta.to_string()))
+                            .send(CodexProviderEvent::TextDelta(delta.to_string()))
                             .await;
                     }
                 }
@@ -746,7 +758,7 @@ impl CodexProvider {
                     if let Some(active) = &s.active_turn {
                         let _ = active
                             .sender
-                            .send(CodexTurnEvent::ReasoningSummaryDelta(delta.to_string()))
+                            .send(CodexProviderEvent::ReasoningDelta(delta.to_string()))
                             .await;
                     }
                 }
@@ -755,36 +767,53 @@ impl CodexProvider {
                 if let Some(usage) = parse_codex_usage(params) {
                     let s = state.lock().await;
                     if let Some(active) = &s.active_turn {
-                        let _ = active
-                            .sender
-                            .send(CodexTurnEvent::TokenUsageUpdated(usage))
-                            .await;
+                        let _ = active.sender.send(CodexProviderEvent::Usage(usage)).await;
                     }
                 }
             }
             "turn/completed" => {
-                let status = match params["turn"]["status"].as_str() {
-                    Some("interrupted") => CodexTurnStatus::Interrupted,
+                let event = match params["turn"]["status"].as_str() {
+                    Some("interrupted") => CodexProviderEvent::Cancelled,
                     Some("failed") => {
                         let msg = params["turn"]["error"]["message"]
                             .as_str()
                             .unwrap_or("Unknown error")
                             .to_string();
-                        CodexTurnStatus::Failed(msg)
+                        CodexProviderEvent::Failed(msg)
                     }
-                    _ => CodexTurnStatus::Completed,
+                    _ => CodexProviderEvent::Completed,
                 };
 
                 let mut s = state.lock().await;
                 if let Some(active) = s.active_turn.take() {
-                    let _ = active
-                        .sender
-                        .send(CodexTurnEvent::Completed { status })
-                        .await;
+                    let _ = active.sender.send(event).await;
                 }
             }
-            "item/started" | "item/completed" => {
-                debug!("Codex item lifecycle: {method}");
+            "item/started" => {
+                if let Some(event) = tool_started_event(&params["item"]) {
+                    let sender = state
+                        .lock()
+                        .await
+                        .active_turn
+                        .as_ref()
+                        .map(|active| active.sender.clone());
+                    if let Some(sender) = sender {
+                        let _ = sender.send(event).await;
+                    }
+                }
+            }
+            "item/completed" => {
+                if let Some(event) = tool_completed_event(&params["item"]) {
+                    let sender = state
+                        .lock()
+                        .await
+                        .active_turn
+                        .as_ref()
+                        .map(|active| active.sender.clone());
+                    if let Some(sender) = sender {
+                        let _ = sender.send(event).await;
+                    }
+                }
             }
             _ => {
                 debug!("Codex notification: {method}");
@@ -814,6 +843,78 @@ impl CodexProvider {
             .map_err(|_| anyhow::anyhow!("Writer response channel closed"))?
     }
 
+    /// 初始化 app-server 并创建或恢复当前 thread。
+    pub async fn ensure_session(&self) -> Result<String> {
+        Self::ensure_ready(
+            &self.state,
+            &self.executable,
+            &self.model,
+            self.resume_thread_id.as_deref(),
+            self.cwd.as_deref(),
+            &self.shutdown_tx,
+        )
+        .await?;
+
+        self.state
+            .lock()
+            .await
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex thread 初始化后仍缺少 thread ID"))
+    }
+
+    /// 发送需要响应的 JSON-RPC 请求，并集中处理 request ID、超时和 pending 清理。
+    async fn send_request(
+        state: &Arc<Mutex<CodexState>>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (request_id, response_rx) = {
+            let mut state = state.lock().await;
+            let request_id = state.next_id();
+            let (response_tx, response_rx) = oneshot::channel();
+            state.pending.insert(
+                request_id,
+                PendingRequest {
+                    sender: response_tx,
+                },
+            );
+            (request_id, response_rx)
+        };
+
+        let request = serde_json::json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(error) = Self::send_line(state, &request.to_string()).await {
+            state.lock().await.pending.remove(&request_id);
+            return Err(error);
+        }
+
+        match timeout(Duration::from_secs(30), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow::anyhow!("{method} 响应通道已关闭")),
+            Err(_) => {
+                state.lock().await.pending.remove(&request_id);
+                Err(anyhow::anyhow!("{method} 请求超时"))
+            }
+        }
+    }
+
+    /// 回应 app-server 发起的 command/file approval request。
+    pub async fn respond_to_approval(
+        &self,
+        request: &CodexApprovalRequest,
+        decision: CodexApprovalDecision,
+    ) -> Result<()> {
+        let response = serde_json::json!({
+            "id": request.request_id,
+            "result": { "decision": decision.wire_value() }
+        });
+        Self::send_line(&self.state, &response.to_string()).await
+    }
+
     /// Interrupt the current turn.
     pub async fn interrupt(&self) -> Result<()> {
         let s = self.state.lock().await;
@@ -827,38 +928,82 @@ impl CodexProvider {
             .as_ref()
             .and_then(|a| a.turn_id.clone())
             .ok_or_else(|| anyhow::anyhow!("No active turn"))?;
-        let write_tx = s
-            .write_tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Writer not initialized"))?
-            .clone();
-        let req_id = s.next_request_id;
         drop(s);
 
-        let request = serde_json::json!({
-            "id": req_id,
-            "method": "turn/interrupt",
-            "params": {
+        Self::send_request(
+            &self.state,
+            "turn/interrupt",
+            serde_json::json!({
                 "threadId": thread_id,
                 "turnId": turn_id,
+            }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// turn/start 已提交但 turn ID 尚未到达时短暂等待，避免把取消误报为成功。
+    pub async fn interrupt_when_ready(&self) -> Result<()> {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let turn_is_ready = {
+                    let state = self.state.lock().await;
+                    let Some(active_turn) = state.active_turn.as_ref() else {
+                        return Err(anyhow::anyhow!("No active turn"));
+                    };
+                    active_turn.turn_id.is_some()
+                };
+                if turn_is_ready {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(10)).await;
             }
-        });
+        })
+        .await
+        .context("等待 Codex turn ID 超时")??;
+        self.interrupt().await
+    }
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        write_tx
-            .send(WriteRequest::Line(request.to_string(), resp_tx))
+    /// 删除当前 Codex thread。调用方必须在删除本地会话前等待该操作成功。
+    pub async fn delete_thread(&self) -> Result<()> {
+        let thread_id = self
+            .state
+            .lock()
             .await
-            .map_err(|_| anyhow::anyhow!("Writer task closed"))?;
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No active thread"))?;
 
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Writer response channel closed"))??;
+        self.delete_thread_by_id(&thread_id).await?;
+        let mut state = self.state.lock().await;
+        state.thread_id = None;
+        state.is_thread_attached = false;
+        Ok(())
+    }
 
+    /// 按持久化 handle 删除 thread，不要求先成功 resume。
+    pub async fn delete_thread_by_id(&self, thread_id: &str) -> Result<()> {
+        Self::send_request(
+            &self.state,
+            "thread/delete",
+            serde_json::json!({ "threadId": thread_id }),
+        )
+        .await?;
         Ok(())
     }
 
     /// Stop the codex subprocess.
     pub async fn stop(&self) {
+        self.stop_transport(true).await;
+    }
+
+    /// 无法按 turn 中断时终止 transport，但保留 thread ID 供下一次运行恢复。
+    pub async fn abort_active_transport(&self) {
+        self.stop_transport(false).await;
+    }
+
+    async fn stop_transport(&self, clear_thread: bool) {
         let mut s = self.state.lock().await;
 
         // Fail pending requests
@@ -870,9 +1015,7 @@ impl CodexProvider {
         if let Some(active) = s.active_turn.take() {
             let _ = active
                 .sender
-                .send(CodexTurnEvent::Completed {
-                    status: CodexTurnStatus::Failed("Shutting down".to_string()),
-                })
+                .send(CodexProviderEvent::Failed("Shutting down".to_string()))
                 .await;
         }
 
@@ -880,9 +1023,190 @@ impl CodexProvider {
         if let Some(write_tx) = s.write_tx.take() {
             let _ = write_tx.send(WriteRequest::Shutdown).await;
         }
+        self.shutdown_tx
+            .lock()
+            .expect("Codex shutdown sender mutex poisoned")
+            .take();
 
-        s.initialized = false;
-        s.thread_id = None;
+        s.is_initialized = false;
+        s.is_thread_attached = false;
+        if clear_thread {
+            s.thread_id = None;
+        }
+    }
+}
+
+impl Drop for CodexProvider {
+    fn drop(&mut self) {
+        if let Some(shutdown_tx) = self
+            .shutdown_tx
+            .lock()
+            .expect("Codex shutdown sender mutex poisoned")
+            .take()
+        {
+            let _ = shutdown_tx.try_send(WriteRequest::Shutdown);
+        }
+    }
+}
+
+fn parse_approval_request(
+    request_id: CodexRequestId,
+    method: &str,
+    params: &Option<serde_json::Value>,
+) -> Option<CodexApprovalRequest> {
+    let params = params.as_ref()?;
+    let item_id = params.get("itemId")?.as_str()?.to_string();
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let command = params
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            let allows_session_approval = params
+                .get("availableDecisions")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|decisions| {
+                    decisions
+                        .iter()
+                        .any(|decision| decision.as_str() == Some("acceptForSession"))
+                });
+            Some(CodexApprovalRequest {
+                request_id,
+                kind: CodexApprovalKind::CommandExecution,
+                item_id,
+                title: "执行 Codex 命令".to_string(),
+                reason: params
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                command,
+                cwd: params
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                grant_root: None,
+                allows_session_approval,
+            })
+        }
+        "item/fileChange/requestApproval" => Some(CodexApprovalRequest {
+            request_id,
+            kind: CodexApprovalKind::FileChange,
+            item_id,
+            title: "应用 Codex 文件修改".to_string(),
+            reason: params
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            command: None,
+            cwd: None,
+            grant_root: params
+                .get("grantRoot")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            allows_session_approval: true,
+        }),
+        _ => None,
+    }
+}
+
+fn tool_started_event(item: &serde_json::Value) -> Option<CodexProviderEvent> {
+    let (id, name, arguments) = tool_call_fields(item)?;
+    Some(CodexProviderEvent::ToolStarted(CodexToolCall {
+        id,
+        name,
+        arguments,
+    }))
+}
+
+fn tool_completed_event(item: &serde_json::Value) -> Option<CodexProviderEvent> {
+    let (id, name, _) = tool_call_fields(item)?;
+    let output = match item.get("type").and_then(serde_json::Value::as_str)? {
+        "commandExecution" => item
+            .get("aggregatedOutput")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| json_text(item)),
+        "mcpToolCall" => item
+            .get("result")
+            .filter(|result| !result.is_null())
+            .or_else(|| item.get("error").filter(|error| !error.is_null()))
+            .map(json_text)
+            .unwrap_or_else(|| json_text(item)),
+        _ => json_text(item),
+    };
+    Some(CodexProviderEvent::ToolCompleted(CodexToolResult {
+        id,
+        name,
+        output,
+    }))
+}
+
+fn tool_call_fields(item: &serde_json::Value) -> Option<(String, String, String)> {
+    let item_type = item.get("type")?.as_str()?;
+    let id = item.get("id")?.as_str()?.to_string();
+    let (name, arguments) = match item_type {
+        "commandExecution" => (
+            "shell".to_string(),
+            serde_json::json!({
+                "command": item.get("command"),
+                "cwd": item.get("cwd"),
+            }),
+        ),
+        "fileChange" => (
+            "file_change".to_string(),
+            item.get("changes").cloned().unwrap_or_default(),
+        ),
+        "mcpToolCall" => {
+            let server = item
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("mcp");
+            let tool = item
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (
+                format!("{server}/{tool}"),
+                item.get("arguments").cloned().unwrap_or_default(),
+            )
+        }
+        "dynamicToolCall" => {
+            let namespace = item.get("namespace").and_then(serde_json::Value::as_str);
+            let tool = item
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (
+                namespace
+                    .map(|namespace| format!("{namespace}/{tool}"))
+                    .unwrap_or_else(|| tool.to_string()),
+                item.get("arguments").cloned().unwrap_or_default(),
+            )
+        }
+        "collabAgentToolCall" => (
+            item.get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("agent")
+                .to_string(),
+            serde_json::json!({
+                "prompt": item.get("prompt"),
+                "receiverThreadIds": item.get("receiverThreadIds"),
+                "model": item.get("model"),
+            }),
+        ),
+        "webSearch" => ("web_search".to_string(), item.clone()),
+        "imageView" => ("image_view".to_string(), item.clone()),
+        "imageGeneration" => ("image_generation".to_string(), item.clone()),
+        "sleep" => ("sleep".to_string(), item.clone()),
+        _ => return None,
+    };
+    Some((id, name, json_text(&arguments)))
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 
@@ -902,8 +1226,38 @@ impl ModelProvider for CodexProvider {
         messages: &'a [ChatMessage],
         _tools: Option<&'a [ToolDefinition]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + Send + 'a>>> {
-        let stream = self.stream_turn(messages).await?;
-        Ok(Box::pin(stream))
+        let mut stream = Box::pin(self.stream_turn(messages).await?);
+        Ok(Box::pin(async_stream::try_stream! {
+            while let Some(event) = stream.next().await {
+                match event? {
+                    CodexProviderEvent::TextDelta(delta) => {
+                        yield ProviderEvent::TextDelta(delta);
+                    }
+                    CodexProviderEvent::ReasoningDelta(delta) => {
+                        yield ProviderEvent::ReasoningDelta(delta);
+                    }
+                    CodexProviderEvent::Usage(usage) => {
+                        yield ProviderEvent::Usage(usage);
+                    }
+                    CodexProviderEvent::ApprovalRequested(request) => {
+                        self.respond_to_approval(&request, CodexApprovalDecision::Decline).await?;
+                    }
+                    CodexProviderEvent::Completed => {
+                        yield ProviderEvent::Completed;
+                        return;
+                    }
+                    CodexProviderEvent::Cancelled => {
+                        yield ProviderEvent::Cancelled;
+                        return;
+                    }
+                    CodexProviderEvent::Failed(error) => {
+                        yield ProviderEvent::Failed(error);
+                        return;
+                    }
+                    CodexProviderEvent::ToolStarted(_) | CodexProviderEvent::ToolCompleted(_) => {}
+                }
+            }
+        }))
     }
 }
 
@@ -982,11 +1336,7 @@ mod tests {
 
     #[test]
     fn encode_thread_start_request() {
-        let json = encode_rpc_request(
-            1,
-            "thread/start",
-            serde_json::json!({"model": "o4-mini"}),
-        );
+        let json = encode_rpc_request(1, "thread/start", serde_json::json!({"model": "o4-mini"}));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 1);
         assert_eq!(parsed["method"], "thread/start");
@@ -1022,7 +1372,7 @@ mod tests {
     fn decode_response_envelope() {
         let line = r#"{"id":0,"result":{"userAgent":"codex-cli/0.147.0"}}"#;
         let envelope = decode_rpc_envelope(line).unwrap();
-        assert_eq!(envelope.id, Some(0));
+        assert_eq!(envelope.id, Some(CodexRequestId::Number(0)));
         assert!(envelope.method.is_none());
         assert!(envelope.result.is_some());
     }
@@ -1031,7 +1381,7 @@ mod tests {
     fn decode_error_envelope() {
         let line = r#"{"id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
         let envelope = decode_rpc_envelope(line).unwrap();
-        assert_eq!(envelope.id, Some(1));
+        assert_eq!(envelope.id, Some(CodexRequestId::Number(1)));
         assert!(envelope.error.is_some());
         let error = envelope.error.unwrap();
         assert_eq!(error.code, -32601);
@@ -1048,10 +1398,80 @@ mod tests {
 
     #[test]
     fn decode_server_request_envelope() {
-        let line = r#"{"id":99,"method":"approval/request","params":{"tool":"shell"}}"#;
+        let line = r#"{"id":"approval-99","method":"item/commandExecution/requestApproval","params":{"itemId":"tool-1"}}"#;
         let envelope = decode_rpc_envelope(line).unwrap();
-        assert_eq!(envelope.id, Some(99));
-        assert_eq!(envelope.method.as_deref(), Some("approval/request"));
+        assert_eq!(
+            envelope.id,
+            Some(CodexRequestId::String("approval-99".to_string()))
+        );
+        assert_eq!(
+            envelope.method.as_deref(),
+            Some("item/commandExecution/requestApproval")
+        );
+    }
+
+    #[test]
+    fn parses_current_command_and_file_approval_requests() {
+        let command = parse_approval_request(
+            CodexRequestId::String("approval-1".to_string()),
+            "item/commandExecution/requestApproval",
+            &Some(serde_json::json!({
+                "itemId": "command-1",
+                "command": "git status",
+                "cwd": "/workspace",
+                "reason": "需要检查状态",
+                "availableDecisions": ["accept", "acceptForSession", "decline"]
+            })),
+        )
+        .unwrap();
+        assert_eq!(command.kind, CodexApprovalKind::CommandExecution);
+        assert_eq!(command.command.as_deref(), Some("git status"));
+        assert!(command.allows_session_approval);
+
+        let file = parse_approval_request(
+            CodexRequestId::Number(7),
+            "item/fileChange/requestApproval",
+            &Some(serde_json::json!({
+                "itemId": "file-1",
+                "grantRoot": "/workspace/src"
+            })),
+        )
+        .unwrap();
+        assert_eq!(file.kind, CodexApprovalKind::FileChange);
+        assert_eq!(file.grant_root.as_deref(), Some("/workspace/src"));
+    }
+
+    #[test]
+    fn maps_current_command_item_lifecycle() {
+        let started = tool_started_event(&serde_json::json!({
+            "type": "commandExecution",
+            "id": "command-1",
+            "command": "cargo test",
+            "cwd": "/workspace",
+            "status": "inProgress"
+        }))
+        .unwrap();
+        assert!(matches!(
+            started,
+            CodexProviderEvent::ToolStarted(CodexToolCall { id, name, arguments })
+                if id == "command-1" && name == "shell" && arguments.contains("cargo test")
+        ));
+
+        let completed = tool_completed_event(&serde_json::json!({
+            "type": "commandExecution",
+            "id": "command-1",
+            "command": "cargo test",
+            "cwd": "/workspace",
+            "status": "completed",
+            "aggregatedOutput": "ok\n",
+            "exitCode": 0
+        }))
+        .unwrap();
+        assert!(matches!(
+            completed,
+            CodexProviderEvent::ToolCompleted(CodexToolResult { id, output, .. })
+                if id == "command-1" && output == "ok\n"
+        ));
     }
 
     #[test]
@@ -1140,7 +1560,7 @@ mod tests {
     #[test]
     fn error_response_encoding() {
         let response = RpcErrorResponse {
-            id: 42,
+            id: CodexRequestId::Number(42),
             error: RpcErrorPayloadOut {
                 code: -32601,
                 message: "disco does not support server request: approval/request".to_string(),
@@ -1150,9 +1570,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 42);
         assert_eq!(parsed["error"]["code"], -32601);
-        assert!(parsed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("approval/request"));
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("approval/request")
+        );
     }
 }

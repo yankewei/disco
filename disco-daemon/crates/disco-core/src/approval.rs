@@ -44,6 +44,37 @@ pub struct ApprovalManager {
     session_approved: Arc<Mutex<Vec<String>>>,
 }
 
+/// 已完成预注册的审批等待句柄。
+///
+/// 调用方必须先取得该句柄，再向客户端发布审批事件，避免响应早于 pending 登记。
+pub struct PendingApproval {
+    receiver: oneshot::Receiver<ApprovalDecision>,
+    fingerprint: String,
+    session_approved: Arc<Mutex<Vec<String>>>,
+}
+
+/// 审批预注册结果。已存在会话授权时无需再打扰用户。
+pub enum PreparedApproval {
+    SessionApproved,
+    Pending(PendingApproval),
+}
+
+impl PendingApproval {
+    /// 等待用户决定，并在选择本会话允许时记录 fingerprint。
+    pub async fn wait(self) -> ApprovalDecision {
+        let Ok(decision) = self.receiver.await else {
+            return ApprovalDecision::Decline;
+        };
+        if decision == ApprovalDecision::ApproveForSession {
+            let mut approved = self.session_approved.lock().await;
+            if !approved.contains(&self.fingerprint) {
+                approved.push(self.fingerprint);
+            }
+        }
+        decision
+    }
+}
+
 impl ApprovalManager {
     /// Create a new ApprovalManager.
     ///
@@ -57,44 +88,31 @@ impl ApprovalManager {
         }
     }
 
-    /// Request approval for a tool execution.
+    /// 请求一次工具调用审批。
     ///
-    /// If the fingerprint has already been approved for the session,
-    /// returns `ApproveOnce` immediately. Otherwise, blocks until the
-    /// router calls `respond` with a decision.
+    /// fingerprint 已获得本会话授权时直接返回 `ApproveOnce`，否则等待客户端响应。
     pub async fn request_approval(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        // Check session approval
-        {
-            let approved = self.session_approved.lock().await;
-            if approved.contains(&request.fingerprint) {
-                return ApprovalDecision::ApproveOnce;
-            }
+        match self.prepare_approval(request).await {
+            PreparedApproval::SessionApproved => ApprovalDecision::ApproveOnce,
+            PreparedApproval::Pending(pending) => pending.wait().await,
         }
+    }
 
-        // Create a oneshot channel for this request
-        let (tx, rx) = oneshot::channel();
-
-        // Register the pending request
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(request.id, tx);
+    /// 在发布审批事件前登记 pending，关闭“事件已发出但响应尚不可消费”的竞态窗口。
+    pub async fn prepare_approval(&self, request: &ApprovalRequest) -> PreparedApproval {
+        let approved = self.session_approved.lock().await;
+        if approved.contains(&request.fingerprint) {
+            return PreparedApproval::SessionApproved;
         }
+        drop(approved);
 
-        // Wait for a decision from the router
-        match rx.await {
-            Ok(decision) => {
-                // If approved for session, record the fingerprint
-                if decision == ApprovalDecision::ApproveForSession {
-                    let mut approved = self.session_approved.lock().await;
-                    approved.push(request.fingerprint.clone());
-                }
-                decision
-            }
-            Err(_) => {
-                // Sender dropped (e.g., run cancelled)
-                ApprovalDecision::Decline
-            }
-        }
+        let (sender, receiver) = oneshot::channel();
+        self.pending.lock().await.insert(request.id, sender);
+        PreparedApproval::Pending(PendingApproval {
+            receiver,
+            fingerprint: request.fingerprint.clone(),
+            session_approved: self.session_approved.clone(),
+        })
     }
 
     /// Respond to a pending approval request.
@@ -126,6 +144,28 @@ pub fn make_fingerprint(tool_name: &str, arguments: &str) -> String {
     format!("{tool_name}:{arguments}")
 }
 
+/// 为一次工具调用构造稳定的审批请求。
+pub fn tool_approval_request(run_id: Uuid, tool_name: &str, arguments: &str) -> ApprovalRequest {
+    let impact = impact_from_tool_call(tool_name, arguments);
+    let kind = match &impact {
+        ApprovalImpact::Command { .. } => "command",
+        ApprovalImpact::FileChange { .. } => "file_change",
+        ApprovalImpact::Network { .. } => "network",
+        ApprovalImpact::Permission { .. } => "permission",
+    };
+
+    ApprovalRequest {
+        id: Uuid::new_v4(),
+        run_id,
+        kind: kind.to_string(),
+        title: format!("执行工具：{tool_name}"),
+        reason: None,
+        impact,
+        fingerprint: make_fingerprint(tool_name, arguments),
+        allows_session_approval: true,
+    }
+}
+
 /// Build an `ApprovalImpact` from a tool call. Currently produces a
 /// generic Command impact; in the future each executor can provide its
 /// own impact details.
@@ -135,11 +175,7 @@ pub fn impact_from_tool_call(tool_name: &str, arguments: &str) -> ApprovalImpact
         if let Some(cmd) = json.get("command").and_then(|v| v.as_str()) {
             return ApprovalImpact::Command {
                 executable: cmd.split_whitespace().next().unwrap_or(cmd).to_string(),
-                arguments: cmd
-                    .split_whitespace()
-                    .skip(1)
-                    .map(String::from)
-                    .collect(),
+                arguments: cmd.split_whitespace().skip(1).map(String::from).collect(),
                 cwd: json
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -150,7 +186,7 @@ pub fn impact_from_tool_call(tool_name: &str, arguments: &str) -> ApprovalImpact
         if let Some(path) = json.get("path").and_then(|v| v.as_str()) {
             return ApprovalImpact::FileChange {
                 paths: vec![path.to_string()],
-                summary: format!("{tool_name} on {path}"),
+                summary: format!("使用 {tool_name} 修改 {path}"),
                 diff: None,
             };
         }
@@ -159,7 +195,7 @@ pub fn impact_from_tool_call(tool_name: &str, arguments: &str) -> ApprovalImpact
     // Fallback: generic permission impact
     ApprovalImpact::Permission {
         scope: tool_name.to_string(),
-        description: format!("Execute tool: {tool_name}"),
+        description: format!("执行工具：{tool_name}"),
     }
 }
 
@@ -201,20 +237,37 @@ mod tests {
         // Spawn a task that requests approval
         let manager = Arc::new(manager);
         let mgr_clone = manager.clone();
-        let handle = tokio::spawn(async move {
-            mgr_clone.request_approval(&request).await
-        });
+        let handle = tokio::spawn(async move { mgr_clone.request_approval(&request).await });
 
         // Give the request time to register
         tokio::task::yield_now().await;
 
         // Respond with approval
-        let responded = manager.respond(approval_id, ApprovalDecision::ApproveOnce).await;
+        let responded = manager
+            .respond(approval_id, ApprovalDecision::ApproveOnce)
+            .await;
         assert!(responded);
 
         // The requesting task should complete
         let decision = handle.await.unwrap();
         assert_eq!(decision, ApprovalDecision::ApproveOnce);
+    }
+
+    #[tokio::test]
+    async fn prepare_registers_before_the_event_can_be_published() {
+        let manager = ApprovalManager::new(make_session_approved());
+        let approval_id = Uuid::new_v4();
+        let request = make_request(approval_id, "registered-first");
+        let PreparedApproval::Pending(pending) = manager.prepare_approval(&request).await else {
+            panic!("首次审批应创建 pending");
+        };
+
+        assert!(
+            manager
+                .respond(approval_id, ApprovalDecision::ApproveOnce)
+                .await
+        );
+        assert_eq!(pending.wait().await, ApprovalDecision::ApproveOnce);
     }
 
     #[tokio::test]
@@ -226,13 +279,13 @@ mod tests {
 
         let manager = Arc::new(manager);
         let mgr_clone = manager.clone();
-        let handle = tokio::spawn(async move {
-            mgr_clone.request_approval(&request).await
-        });
+        let handle = tokio::spawn(async move { mgr_clone.request_approval(&request).await });
 
         tokio::task::yield_now().await;
 
-        let responded = manager.respond(approval_id, ApprovalDecision::Decline).await;
+        let responded = manager
+            .respond(approval_id, ApprovalDecision::Decline)
+            .await;
         assert!(responded);
 
         let decision = handle.await.unwrap();
@@ -250,12 +303,12 @@ mod tests {
         let req1 = make_request(id1, "fp_session");
 
         let mgr1 = manager.clone();
-        let h1 = tokio::spawn(async move {
-            mgr1.request_approval(&req1).await
-        });
+        let h1 = tokio::spawn(async move { mgr1.request_approval(&req1).await });
 
         tokio::task::yield_now().await;
-        manager.respond(id1, ApprovalDecision::ApproveForSession).await;
+        manager
+            .respond(id1, ApprovalDecision::ApproveForSession)
+            .await;
         let d1 = h1.await.unwrap();
         assert_eq!(d1, ApprovalDecision::ApproveForSession);
 
@@ -289,9 +342,7 @@ mod tests {
         let req = make_request(id, "fp_cancel");
 
         let mgr = manager.clone();
-        let handle = tokio::spawn(async move {
-            mgr.request_approval(&req).await
-        });
+        let handle = tokio::spawn(async move { mgr.request_approval(&req).await });
 
         tokio::task::yield_now().await;
 
@@ -313,7 +364,11 @@ mod tests {
     fn impact_from_shell_command() {
         let impact = impact_from_tool_call("shell", r#"{"command":"ls -la /tmp","cwd":"/home"}"#);
         match impact {
-            ApprovalImpact::Command { executable, arguments, cwd } => {
+            ApprovalImpact::Command {
+                executable,
+                arguments,
+                cwd,
+            } => {
                 assert_eq!(executable, "ls");
                 assert_eq!(arguments, vec!["-la", "/tmp"]);
                 assert_eq!(cwd, "/home");
@@ -342,5 +397,29 @@ mod tests {
             }
             _ => panic!("Expected Permission impact"),
         }
+    }
+
+    #[test]
+    fn tool_approval_request_preserves_policy_metadata() {
+        let run_id = Uuid::new_v4();
+        let request = tool_approval_request(
+            run_id,
+            "shell",
+            r#"{"command":"git status","cwd":"/workspace"}"#,
+        );
+
+        assert_eq!(request.run_id, run_id);
+        assert_eq!(request.kind, "command");
+        assert_eq!(request.title, "执行工具：shell");
+        assert_eq!(
+            request.fingerprint,
+            r#"shell:{"command":"git status","cwd":"/workspace"}"#
+        );
+        assert!(request.allows_session_approval);
+        assert!(matches!(
+            request.impact,
+            ApprovalImpact::Command { ref executable, ref cwd, .. }
+                if executable == "git" && cwd == "/workspace"
+        ));
     }
 }

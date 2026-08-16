@@ -69,8 +69,9 @@ final class AppState: ObservableObject {
     private var discoveredModelCatalogs: [ProviderVendor: [ModelCatalogEntry]] = [:]
     /// 用户按模型填写的上下文窗口覆盖值，不随模型目录刷新删除。
     private var contextWindowOverrides: [ProviderVendor: [String: Int]] = [:]
+    private var daemonEventTask: Task<Void, Never>?
 
-    // MARK: - 守护进程（Phase 1：并行通信路径）
+    // MARK: - 守护进程（迁移期运行路径）
 
     /// 守护进程客户端（通过 Unix 域套接字与 Rust daemon 通信）。
     let daemonClient = DaemonClient()
@@ -324,7 +325,8 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 let resolvedKey = (try? self.resolvedAPIKey(vendor: vendor, apiKey: apiKey)) ?? ""
                 _ = try? await self.daemonClient.configureProvider(
-                    vendor: vendor.rawValue,
+                    providerID: vendor.daemonProviderID,
+                    vendor: vendor.daemonVendor,
                     baseURL: providerBaseURL,
                     apiKey: resolvedKey,
                     model: trimmedModel,
@@ -767,17 +769,10 @@ final class AppState: ObservableObject {
         selectedConversationID = conversation.id
         persistEmptyProjectConversation(conversation)
 
-        // Phase 2：守护进程可用时，在守护进程中创建会话
-        if useDaemon, let projectID {
-            let vendor = activeVendor
-            let model = providerConfigs[vendor]?.model ?? ""
+        if useDaemon, projectID != nil {
             Task { [weak self] in
                 guard let self else { return }
-                _ = try? await self.daemonClient.createSession(
-                    projectID: projectID,
-                    vendor: vendor.rawValue,
-                    model: model
-                )
+                await self.registerDaemonConversation(conversation)
             }
         }
 
@@ -793,6 +788,28 @@ final class AppState: ObservableObject {
     }
 
     func deleteConversation(id: ConversationSession.ID) {
+        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        if conversation.store.hasDaemonSession {
+            guard useDaemon else {
+                storageError = "daemon 当前不可用，无法同时删除原始 Agent 会话；本地会话已保留。"
+                return
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await daemonClient.deleteSession(sessionID: id)
+                    removeConversationLocally(id: id)
+                } catch {
+                    storageError = "无法删除原始 Agent 会话，本地会话已保留：\(error.localizedDescription)"
+                }
+            }
+            return
+        }
+        removeConversationLocally(id: id)
+    }
+
+    /// 完成已确认不再有原始 Agent 状态的本地会话删除。
+    private func removeConversationLocally(id: ConversationSession.ID) {
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].store.stop()
         let oldRuntime = conversations[index].store.configure(runtime: nil)
@@ -805,14 +822,6 @@ final class AppState: ObservableObject {
             storageError = nil
         } catch {
             storageError = "无法删除本地会话：\(error.localizedDescription)"
-        }
-
-        // Phase 2：守护进程可用时，同步删除守护进程中的会话
-        if useDaemon {
-            Task { [weak self] in
-                guard let self else { return }
-                _ = try? await self.daemonClient.deleteSession(sessionID: id)
-            }
         }
 
         if conversations.isEmpty {
@@ -1116,6 +1125,8 @@ final class AppState: ObservableObject {
             // 执行初始化握手
             _ = try await daemonClient.initialize()
             isDaemonAvailable = true
+            startDaemonEventRouting()
+            await synchronizeDaemonConversations()
         } catch {
             daemonConnectionState = daemonClient.state
             isDaemonAvailable = false
@@ -1126,10 +1137,104 @@ final class AppState: ObservableObject {
     ///
     /// 未接线：当前应用退出时未调用，daemon 进程由系统回收（Phase 1 预留）。
     func stopDaemon() {
+        daemonEventTask?.cancel()
+        daemonEventTask = nil
+        for conversation in conversations {
+            conversation.store.handleDaemonDisconnection("daemon 已停止。")
+        }
         daemonClient.disconnect()
         daemonProcessManager.stopDaemon()
         daemonConnectionState = .disconnected
         isDaemonAvailable = false
+    }
+
+    private func startDaemonEventRouting() {
+        daemonEventTask?.cancel()
+        let events = daemonClient.events()
+        daemonEventTask = Task { [weak self] in
+            do {
+                for try await event in events {
+                    guard !Task.isCancelled, let self, let sessionID = event.sessionID else {
+                        continue
+                    }
+                    conversations.first { $0.id == sessionID }?
+                        .store.handleDaemonNotification(event)
+                }
+                guard !Task.isCancelled, let self else { return }
+                daemonConnectionState = .disconnected
+                isDaemonAvailable = false
+                for conversation in conversations {
+                    conversation.store.handleDaemonDisconnection("daemon 连接已中断。")
+                }
+            } catch {
+                guard !Task.isCancelled, let self else { return }
+                daemonConnectionState = .failed(error.localizedDescription)
+                isDaemonAvailable = false
+                for conversation in conversations {
+                    conversation.store.handleDaemonDisconnection(
+                        "daemon 连接已中断：\(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
+    private func synchronizeDaemonConversations() async {
+        for conversation in conversations
+        where conversation.store.hasDaemonSession
+            || (conversation.projectID != nil && conversation.store.messages.isEmpty) {
+            await registerDaemonConversation(conversation)
+        }
+    }
+
+    /// 注册尚未开始的 Project 会话，或在断线后恢复本次进程已知的 daemon 会话。
+    private func registerDaemonConversation(_ conversation: ConversationSession) async {
+        guard useDaemon,
+              conversation.store.hasDaemonSession || conversation.store.messages.isEmpty,
+              let projectID = conversation.projectID,
+              let project = projects.first(where: { $0.id == projectID }),
+              case let .available(workspace) = projectAvailability[projectID],
+              let config = providerConfigs[activeVendor] else { return }
+
+        let vendor = activeVendor
+        let apiKey = vendor.requiresAPIKey
+            ? ((try? keyStores[vendor]?.load()) ?? "")
+            : ""
+        do {
+            try await daemonClient.configureProvider(
+                providerID: vendor.daemonProviderID,
+                vendor: vendor.daemonVendor,
+                baseURL: config.baseURL,
+                apiKey: apiKey,
+                model: config.model,
+                thinkingEnabled: config.thinkingEnabled
+            )
+            let daemonProject = try await daemonClient.createProject(
+                projectID: project.id,
+                name: project.name,
+                path: workspace.rootURL.path
+            )
+            guard let daemonProjectID = UUID(uuidString: daemonProject.id) else {
+                throw DaemonError.invalidResponse("session/project/create 返回了无效的项目 ID。")
+            }
+            let session = try await daemonClient.createSession(
+                sessionID: conversation.id,
+                projectID: daemonProjectID,
+                providerID: vendor.daemonProviderID,
+                vendor: vendor.daemonVendor,
+                model: config.model
+            )
+            guard UUID(uuidString: session.id) == conversation.id else {
+                throw DaemonError.invalidResponse("session/create 未保留客户端会话 ID。")
+            }
+            guard conversations.contains(where: { $0.id == conversation.id }) else {
+                try? await daemonClient.deleteSession(sessionID: conversation.id)
+                return
+            }
+            conversation.store.enableDaemonRuns(sessionID: conversation.id)
+        } catch {
+            conversation.store.disableDaemonRuns()
+        }
     }
 }
 

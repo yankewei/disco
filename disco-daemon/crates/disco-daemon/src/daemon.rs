@@ -4,32 +4,57 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::router;
 use anyhow::{Context, Result};
-use disco_core::ApprovalManager;
+use disco_backends::{deepseek_runtime, openai_chat_runtime, openai_responses_runtime};
+use disco_core::{AgentBackend, RunCoordinator};
 use disco_persist::Database;
+use disco_protocol::types::{ProviderId, Vendor};
 use disco_providers::ModelProvider;
-use disco_protocol::types::Vendor;
 use disco_tools::CompositeExecutor;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
-use crate::router;
+/// 一个 Provider profile 对应的运行时依赖。
+pub struct ProviderRuntime {
+    pub backend: Arc<dyn AgentBackend>,
+    /// 迁移期仅供上下文压缩使用；后续由 Backend 自己实现 compact capability。
+    pub compaction_provider: Arc<dyn ModelProvider>,
+}
+
+/// 根据产品层的 Vendor 选择 Rig provider 协议，并组装 API Key 后端。
+pub fn api_key_provider_runtime(
+    vendor: Vendor,
+    base_url: String,
+    api_key: String,
+    model: String,
+    executor: Arc<CompositeExecutor>,
+) -> Result<ProviderRuntime> {
+    let runtime = match vendor {
+        Vendor::Openai | Vendor::Codex => {
+            openai_responses_runtime(base_url, api_key, model, executor)?
+        }
+        Vendor::Deepseek => deepseek_runtime(base_url, api_key, model, executor)?,
+        Vendor::MoonshotKimi | Vendor::KimiCode | Vendor::Glm => {
+            openai_chat_runtime(base_url, api_key, model, executor)?
+        }
+    };
+    Ok(ProviderRuntime {
+        backend: runtime.backend,
+        compaction_provider: runtime.compaction_provider,
+    })
+}
 
 /// Shared application state accessible from all connection handlers.
 pub struct AppState {
     pub db: Database,
-    /// 默认/主服务商（来自环境变量；可为 None，表示尚未配置任何服务商）。
-    pub provider: Option<Arc<dyn ModelProvider>>,
-    /// Map of configured providers by vendor.
-    pub providers: Mutex<HashMap<Vendor, Arc<dyn ModelProvider>>>,
-    /// Active runs keyed by run ID.
-    pub active_runs: Mutex<HashMap<Uuid, CancellationToken>>,
-    /// Active approval managers keyed by run ID.
-    pub active_approval: Mutex<HashMap<Uuid, Arc<ApprovalManager>>>,
+    /// Provider 配置对应的运行时依赖，配置更新时原子替换。
+    pub runtime_by_provider_id: Mutex<HashMap<ProviderId, ProviderRuntime>>,
+    /// 活动运行、会话互斥、取消和审批路由。
+    pub run_coordinator: RunCoordinator,
     /// Tool executor composite.
     pub executor: Arc<CompositeExecutor>,
     /// Shutdown signal.
@@ -37,28 +62,30 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Get the provider for a given vendor. Falls back to the default provider.
-    pub async fn get_provider(&self, vendor: Option<Vendor>) -> Option<Arc<dyn ModelProvider>> {
-        if let Some(vendor) = vendor {
-            let providers = self.providers.lock().await;
-            if let Some(provider) = providers.get(&vendor) {
-                return Some(provider.clone());
-            }
-        }
-        self.provider.clone()
+    pub async fn get_backend(&self, provider_id: &ProviderId) -> Option<Arc<dyn AgentBackend>> {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .get(provider_id)
+            .map(|runtime| runtime.backend.clone())
     }
 
-    /// Register a provider for a vendor.
-    pub async fn set_provider(&self, vendor: Vendor, provider: Arc<dyn ModelProvider>) {
-        let mut providers = self.providers.lock().await;
-        providers.insert(vendor, provider);
+    pub async fn get_compaction_provider(
+        &self,
+        provider_id: &ProviderId,
+    ) -> Option<Arc<dyn ModelProvider>> {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .get(provider_id)
+            .map(|runtime| runtime.compaction_provider.clone())
     }
 
-    /// Remove a provider for a vendor.
-    #[allow(dead_code)]
-    pub async fn remove_provider(&self, vendor: &Vendor) {
-        let mut providers = self.providers.lock().await;
-        providers.remove(vendor);
+    pub async fn set_provider_runtime(&self, provider_id: ProviderId, runtime: ProviderRuntime) {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .insert(provider_id, runtime);
     }
 }
 

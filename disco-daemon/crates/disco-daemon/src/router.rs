@@ -1,38 +1,34 @@
 use std::sync::Arc;
 
-use disco_core::{AgentLoop, AgentOutput, ApprovalManager};
+use disco_backends::CodexAdapter;
+use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError};
 use disco_protocol::*;
+use disco_providers::CodexProvider;
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
-use disco_providers::{CodexProvider, ModelProvider, OpenAIResponsesProvider};
 use tokio::sync::mpsc::Sender;
-use tokio_util::sync::CancellationToken;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::daemon::AppState;
+use crate::daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
 
 /// Handle a single request and send the response (and any events) via the output channel.
-pub async fn handle_request(
-    req: &Request,
-    app: &Arc<AppState>,
-    out_tx: &Sender<String>,
-) {
+pub async fn handle_request(req: &Request, app: &Arc<AppState>, out_tx: &Sender<String>) {
     let response = match req.method.as_str() {
         "initialize" => handle_initialize(req),
         "shutdown" => handle_shutdown(req, app),
         "run/start" => handle_run_start(req, app, out_tx).await,
-        "run/cancel" => handle_run_cancel(req, app),
+        "run/cancel" => handle_run_cancel(req, app).await,
         "run/approve" => handle_run_approve(req, app).await,
         "run/compact" => handle_run_compact(req, app, out_tx).await,
         "session/create" => handle_session_create(req, app),
         "session/list" => handle_session_list(req, app),
-        "session/delete" => handle_session_delete(req, app),
+        "session/delete" => handle_session_delete(req, app).await,
         "session/projects" => handle_session_projects(req, app),
         "session/project/create" => handle_session_project_create(req, app),
         "provider/configure" => handle_provider_configure(req, app).await,
         "provider/list" => handle_provider_list(req, app),
-        "provider/models" => handle_provider_models(req, app).await,
+        "provider/models" => handle_provider_models(req),
         other => {
             warn!("Unknown method: {other}");
             error_response(req.id, RpcError::method_not_found(other))
@@ -62,6 +58,25 @@ fn error_response(id: i64, error: RpcError) -> Response {
     }
 }
 
+fn resolve_provider_id(
+    provider_id: Option<ProviderId>,
+    vendor: Vendor,
+) -> Result<ProviderId, RpcError> {
+    let provider_id = provider_id.unwrap_or_else(|| ProviderId::legacy_default_for_vendor(vendor));
+    let vendor_matches_reserved_id = match provider_id.as_str() {
+        ProviderId::CODEX_APP_SERVER => vendor == Vendor::Codex,
+        ProviderId::CODEX_API => vendor == Vendor::Openai,
+        _ => true,
+    };
+    if !vendor_matches_reserved_id {
+        return Err(RpcError::invalid_params(&format!(
+            "Provider {} 与 vendor {:?} 不匹配",
+            provider_id, vendor
+        )));
+    }
+    Ok(provider_id)
+}
+
 // MARK: - Handlers
 
 fn handle_initialize(req: &Request) -> Response {
@@ -75,10 +90,7 @@ fn handle_initialize(req: &Request) -> Response {
         protocol_version: "v1".to_string(),
     };
 
-    info!(
-        "Client initialized (protocol {})",
-        result.protocol_version
-    );
+    info!("Client initialized (protocol {})", result.protocol_version);
     success_response(req.id, result)
 }
 
@@ -88,58 +100,72 @@ fn handle_shutdown(req: &Request, app: &Arc<AppState>) -> Response {
     success_response(req.id, ShutdownResult {})
 }
 
-async fn handle_run_start(
-    req: &Request,
-    app: &Arc<AppState>,
-    out_tx: &Sender<String>,
-) -> Response {
+async fn handle_run_start(req: &Request, app: &Arc<AppState>, out_tx: &Sender<String>) -> Response {
     let params: RunStartParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    let run_id = Uuid::new_v4();
     let session_id = params.session_id;
-    let cancel = CancellationToken::new();
 
-    // Register the run
-    app.active_runs.lock().await.insert(run_id, cancel.clone());
-
-    // Look up the session to get the vendor and project_id
-    let session = app
-        .db
-        .get_session(session_id)
-        .ok()
-        .flatten();
-    let vendor = session.as_ref().map(|s| s.vendor);
-    let workspace_path = session
-        .as_ref()
-        .and_then(|s| app.db.get_project(s.project_id).ok().flatten())
-        .map(|p| p.path);
-
-    // Get the appropriate provider
-    let provider = match app.get_provider(vendor).await {
-        Some(p) => p,
-        None => {
-            app.active_runs.lock().await.remove(&run_id);
+    let session = match app.db.get_session(session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
             return error_response(
                 req.id,
-                RpcError::internal("未配置模型服务商：请在设置中配置（或设置 OPENAI_API_KEY 环境变量）"),
+                RpcError::invalid_params(&format!("会话 {session_id} 不存在")),
+            );
+        }
+        Err(e) => return error_response(req.id, RpcError::internal(&e.to_string())),
+    };
+
+    let started_run = match app.run_coordinator.begin_run(session_id).await {
+        Ok(started_run) => started_run,
+        Err(BeginRunError::SessionBusy { active_run_id }) => {
+            return error_response(
+                req.id,
+                RpcError::invalid_params(&format!(
+                    "会话 {session_id} 已有活动任务 {active_run_id}"
+                )),
+            );
+        }
+    };
+    let run_id = started_run.run_id;
+    let cancel = started_run.cancellation;
+    let approval_manager = started_run.approval_manager;
+
+    let workspace_path = app
+        .db
+        .get_project(session.project_id)
+        .ok()
+        .flatten()
+        .map(|p| p.path);
+
+    let backend = match app.get_backend(&session.provider_id).await {
+        Some(backend) => backend,
+        None => {
+            app.run_coordinator.finish_run(run_id).await;
+            return error_response(
+                req.id,
+                RpcError::internal("未配置 Agent Backend：请先在设置中配置该 Provider"),
             );
         }
     };
 
     // Save the user message to the database
     if let Err(e) = app.db.add_message(session_id, "user", &params.text) {
-        app.active_runs.lock().await.remove(&run_id);
-        return error_response(req.id, RpcError::internal(&format!("Failed to save message: {e}")));
+        app.run_coordinator.finish_run(run_id).await;
+        return error_response(
+            req.id,
+            RpcError::internal(&format!("Failed to save message: {e}")),
+        );
     }
 
     // Load message history from the database
     let stored_messages = match app.db.list_messages(session_id) {
         Ok(msgs) => msgs,
         Err(e) => {
-            app.active_runs.lock().await.remove(&run_id);
+            app.run_coordinator.finish_run(run_id).await;
             return error_response(
                 req.id,
                 RpcError::internal(&format!("Failed to load messages: {e}")),
@@ -189,7 +215,13 @@ async fn handle_run_start(
         chat_messages.len()
     );
 
-    // Send run state event: connecting
+    let backend_handle = match app.db.get_session_backend_handle(session_id) {
+        Ok(handle) => handle,
+        Err(error) => {
+            app.run_coordinator.finish_run(run_id).await;
+            return error_response(req.id, RpcError::internal(&error.to_string()));
+        }
+    };
     send_event(
         out_tx,
         &Event::run_state(RunStateData {
@@ -199,24 +231,68 @@ async fn handle_run_start(
         }),
     );
 
-    // Create approval manager for this run
-    let session_approved = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-    let approval_manager = Arc::new(ApprovalManager::new(session_approved));
-
-    // Register the approval manager
-    app.active_approval
-        .lock()
-        .await
-        .insert(run_id, approval_manager.clone());
-
-    // Create agent loop
-    let agent = AgentLoop::new(provider, app.executor.clone(), approval_manager);
-
     // Spawn the agent task
     let out_tx_clone = out_tx.clone();
     let app_clone = Arc::clone(app);
+    let cancellation = cancel.clone();
+    let backend_request = BackendRunRequest {
+        run_id,
+        session: BackendSession {
+            id: session_id,
+            model: session.model,
+            backend_handle,
+        },
+        messages: chat_messages,
+        workspace_path,
+        cancellation: cancel,
+        approval_manager,
+    };
 
     tokio::spawn(async move {
+        let backend_run = match backend.start_run(backend_request).await {
+            Ok(run) => run,
+            Err(error) => {
+                let event = if cancellation.is_cancelled() {
+                    Event::run_cancelled(RunCancelledData { run_id, session_id })
+                } else {
+                    Event::run_failed(RunFailedData {
+                        run_id,
+                        session_id,
+                        error: RunError {
+                            code: ErrorCode::Generic,
+                            message: error.to_string(),
+                            recovery_suggestion: None,
+                            retryable: false,
+                        },
+                    })
+                };
+                send_event(&out_tx_clone, &event);
+                app_clone.run_coordinator.finish_run(run_id).await;
+                return;
+            }
+        };
+        if let Some(handle) = backend_run.backend_handle.as_deref()
+            && let Err(error) = app_clone.db.set_session_backend_handle(session_id, handle)
+        {
+            app_clone.run_coordinator.cancel_run(run_id).await;
+            send_event(
+                &out_tx_clone,
+                &Event::run_failed(RunFailedData {
+                    run_id,
+                    session_id,
+                    error: RunError {
+                        code: ErrorCode::Generic,
+                        message: error.to_string(),
+                        recovery_suggestion: None,
+                        retryable: false,
+                    },
+                }),
+            );
+            app_clone.run_coordinator.finish_run(run_id).await;
+            return;
+        }
+        let mut stream = backend_run.events;
+
         // Send run state: running
         send_event(
             &out_tx_clone,
@@ -227,9 +303,6 @@ async fn handle_run_start(
             }),
         );
 
-        let mut stream = agent
-            .run(chat_messages, cancel.clone(), run_id, session_id, workspace_path)
-            .await;
         let mut full_response = String::new();
         let mut accumulated_usage: Option<TokenUsage> = None;
 
@@ -366,6 +439,7 @@ async fn handle_run_start(
                         &out_tx_clone,
                         &Event::approval_resolved(ApprovalResolvedData {
                             run_id,
+                            session_id,
                             approval_id,
                             decision,
                         }),
@@ -373,21 +447,15 @@ async fn handle_run_start(
                 }
                 AgentOutput::Completed => {
                     save_assistant_message(&app_clone, session_id, &full_response).await;
-                    // Clean up approval manager
-                    app_clone.active_approval.lock().await.remove(&run_id);
                     send_event(
                         &out_tx_clone,
-                        &Event::run_completed(RunCompletedData {
-                            run_id,
-                            session_id,
-                        }),
+                        &Event::run_completed(RunCompletedData { run_id, session_id }),
                     );
-                    app_clone.active_runs.lock().await.remove(&run_id);
+                    app_clone.run_coordinator.finish_run(run_id).await;
                     return;
                 }
                 AgentOutput::Failed(error) => {
                     save_assistant_message(&app_clone, session_id, &full_response).await;
-                    app_clone.active_approval.lock().await.remove(&run_id);
                     send_event(
                         &out_tx_clone,
                         &Event::run_failed(RunFailedData {
@@ -401,20 +469,16 @@ async fn handle_run_start(
                             },
                         }),
                     );
-                    app_clone.active_runs.lock().await.remove(&run_id);
+                    app_clone.run_coordinator.finish_run(run_id).await;
                     return;
                 }
                 AgentOutput::Cancelled => {
                     save_assistant_message(&app_clone, session_id, &full_response).await;
-                    app_clone.active_approval.lock().await.remove(&run_id);
                     send_event(
                         &out_tx_clone,
-                        &Event::run_cancelled(RunCancelledData {
-                            run_id,
-                            session_id,
-                        }),
+                        &Event::run_cancelled(RunCancelledData { run_id, session_id }),
                     );
-                    app_clone.active_runs.lock().await.remove(&run_id);
+                    app_clone.run_coordinator.finish_run(run_id).await;
                     return;
                 }
             }
@@ -422,45 +486,25 @@ async fn handle_run_start(
 
         // Stream ended without explicit terminal event
         save_assistant_message(&app_clone, session_id, &full_response).await;
-        app_clone.active_approval.lock().await.remove(&run_id);
         send_event(
             &out_tx_clone,
-            &Event::run_completed(RunCompletedData {
-                run_id,
-                session_id,
-            }),
+            &Event::run_completed(RunCompletedData { run_id, session_id }),
         );
-        app_clone.active_runs.lock().await.remove(&run_id);
+        app_clone.run_coordinator.finish_run(run_id).await;
     });
 
     success_response(req.id, RunStartResult { run_id })
 }
 
-fn handle_run_cancel(req: &Request, app: &Arc<AppState>) -> Response {
+async fn handle_run_cancel(req: &Request, app: &Arc<AppState>) -> Response {
     let params: RunCancelParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    let active_runs = app.active_runs.try_lock();
-    match active_runs {
-        Ok(runs) => {
-            if let Some(cancel) = runs.get(&params.run_id) {
-                info!("Cancelling run {}", params.run_id);
-                cancel.cancel();
-                success_response(req.id, RunCancelResult {})
-            } else {
-                error_response(
-                    req.id,
-                    RpcError::invalid_params(&format!("Run {} not found", params.run_id)),
-                )
-            }
-        }
-        Err(_) => {
-            warn!("Could not acquire active_runs lock for cancel");
-            error_response(req.id, RpcError::internal("Could not cancel run"))
-        }
-    }
+    info!("Cancelling run {}", params.run_id);
+    app.run_coordinator.cancel_run(params.run_id).await;
+    success_response(req.id, RunCancelResult {})
 }
 
 async fn handle_run_approve(req: &Request, app: &Arc<AppState>) -> Response {
@@ -469,21 +513,21 @@ async fn handle_run_approve(req: &Request, app: &Arc<AppState>) -> Response {
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    // Find the approval manager for this approval by searching all active runs
-    let managers = app.active_approval.lock().await;
-    for (_run_id, manager) in managers.iter() {
-        if manager.respond(params.approval_id, params.decision).await {
-            info!("Approval {} resolved: {:?}", params.approval_id, params.decision);
-            return success_response(req.id, RunApproveResult {});
-        }
+    if app
+        .run_coordinator
+        .respond_approval(params.approval_id, params.decision)
+        .await
+    {
+        info!(
+            "Approval {} resolved: {:?}",
+            params.approval_id, params.decision
+        );
+        return success_response(req.id, RunApproveResult {});
     }
 
     error_response(
         req.id,
-        RpcError::invalid_params(&format!(
-            "Approval {} not found",
-            params.approval_id
-        )),
+        RpcError::invalid_params(&format!("Approval {} not found", params.approval_id)),
     )
 }
 
@@ -510,10 +554,7 @@ async fn handle_run_compact(
     };
 
     if stored_messages.is_empty() {
-        return error_response(
-            req.id,
-            RpcError::invalid_params("No messages to compact"),
-        );
+        return error_response(req.id, RpcError::invalid_params("No messages to compact"));
     }
 
     let chat_messages: Vec<ChatMessage> = stored_messages
@@ -525,12 +566,24 @@ async fn handle_run_compact(
         })
         .collect();
 
-    let provider = match app.get_provider(None).await {
+    let session = match app.db.get_session(session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return error_response(
+                req.id,
+                RpcError::invalid_params(&format!("会话 {session_id} 不存在")),
+            );
+        }
+        Err(e) => return error_response(req.id, RpcError::internal(&e.to_string())),
+    };
+    let provider = match app.get_compaction_provider(&session.provider_id).await {
         Some(p) => p,
         None => {
             return error_response(
                 req.id,
-                RpcError::internal("未配置模型服务商：请在设置中配置（或设置 OPENAI_API_KEY 环境变量）"),
+                RpcError::internal(
+                    "未配置模型服务商：请在设置中配置（或设置 OPENAI_API_KEY 环境变量）",
+                ),
             );
         }
     };
@@ -597,7 +650,40 @@ fn handle_session_create(req: &Request, app: &Arc<AppState>) -> Response {
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    match app.db.create_session(params.project_id, params.vendor, &params.model, None) {
+    let provider_id = match resolve_provider_id(params.provider_id, params.vendor) {
+        Ok(provider_id) => provider_id,
+        Err(error) => return error_response(req.id, error),
+    };
+    if let Some(session_id) = params.session_id {
+        match app.db.get_session(session_id) {
+            Ok(Some(session))
+                if session.project_id == params.project_id
+                    && session.provider_id == provider_id
+                    && session.vendor == params.vendor
+                    && session.model == params.model =>
+            {
+                return success_response(req.id, SessionCreateResult { session });
+            }
+            Ok(Some(_)) => {
+                return error_response(
+                    req.id,
+                    RpcError::invalid_params("会话 ID 已绑定到不同的项目或 Provider"),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return error_response(req.id, RpcError::internal(&error.to_string()));
+            }
+        }
+    }
+    match app.db.create_session_with_id(
+        params.session_id.unwrap_or_else(Uuid::new_v4),
+        params.project_id,
+        provider_id,
+        params.vendor,
+        &params.model,
+        None,
+    ) {
         Ok(session) => success_response(req.id, SessionCreateResult { session }),
         Err(e) => error_response(req.id, RpcError::internal(&e.to_string())),
     }
@@ -615,11 +701,57 @@ fn handle_session_list(req: &Request, app: &Arc<AppState>) -> Response {
     }
 }
 
-fn handle_session_delete(req: &Request, app: &Arc<AppState>) -> Response {
+async fn handle_session_delete(req: &Request, app: &Arc<AppState>) -> Response {
     let params: SessionDeleteParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
+
+    let session = match app.db.get_session(params.session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return success_response(req.id, SessionDeleteResult {}),
+        Err(error) => return error_response(req.id, RpcError::internal(&error.to_string())),
+    };
+    if let Some(active_run_id) = app.run_coordinator.active_run_id(session.id).await {
+        return error_response(
+            req.id,
+            RpcError::invalid_params(&format!(
+                "会话 {} 仍有活动任务 {active_run_id}，请先取消任务",
+                session.id
+            )),
+        );
+    }
+
+    let backend = match app.get_backend(&session.provider_id).await {
+        Some(backend) => backend,
+        None => {
+            return error_response(
+                req.id,
+                RpcError::internal("无法连接原始 Agent Backend，本地会话未删除"),
+            );
+        }
+    };
+    if !backend.capabilities().can_delete_session {
+        return error_response(
+            req.id,
+            RpcError::invalid_params("该 Agent Backend 不支持删除原始会话，本地会话未删除"),
+        );
+    }
+    let backend_handle = match app.db.get_session_backend_handle(session.id) {
+        Ok(handle) => handle,
+        Err(error) => return error_response(req.id, RpcError::internal(&error.to_string())),
+    };
+    let backend_session = BackendSession {
+        id: session.id,
+        model: session.model,
+        backend_handle,
+    };
+    if let Err(error) = backend.delete_session(&backend_session).await {
+        return error_response(
+            req.id,
+            RpcError::internal(&format!("删除原始 Agent 会话失败，本地会话已保留：{error}")),
+        );
+    }
 
     match app.db.delete_session(params.session_id) {
         Ok(()) => success_response(req.id, SessionDeleteResult {}),
@@ -640,7 +772,18 @@ fn handle_session_project_create(req: &Request, app: &Arc<AppState>) -> Response
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    match app.db.create_project(&params.name, &params.path) {
+    match app.db.get_project_by_path(&params.path) {
+        Ok(Some(project)) => {
+            return success_response(req.id, SessionProjectCreateResult { project });
+        }
+        Ok(None) => {}
+        Err(error) => return error_response(req.id, RpcError::internal(&error.to_string())),
+    }
+    match app.db.create_project_with_id(
+        params.project_id.unwrap_or_else(Uuid::new_v4),
+        &params.name,
+        &params.path,
+    ) {
         Ok(project) => success_response(req.id, SessionProjectCreateResult { project }),
         Err(e) => error_response(req.id, RpcError::internal(&e.to_string())),
     }
@@ -654,7 +797,12 @@ async fn handle_provider_configure(req: &Request, app: &Arc<AppState>) -> Respon
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
+    let provider_id = match resolve_provider_id(params.provider_id.clone(), params.vendor) {
+        Ok(provider_id) => provider_id,
+        Err(error) => return error_response(req.id, error),
+    };
     let config = disco_persist::provider_configs::ProviderConfig {
+        provider_id,
         vendor: params.vendor,
         base_url: params.base_url.clone(),
         api_key: params.api_key.clone(),
@@ -663,33 +811,49 @@ async fn handle_provider_configure(req: &Request, app: &Arc<AppState>) -> Respon
         updated_at: String::new(),
     };
 
-    if let Err(e) = app.db.save_provider_config(&config) {
-        return error_response(req.id, RpcError::internal(&format!("Failed to save config: {e}")));
-    }
-
-    // Codex 走本地 codex app-server（ChatGPT 订阅，无需 API Key）；
-    // 其余服务商走 OpenAI 兼容 API。
-    let provider: Arc<dyn ModelProvider> = match params.vendor {
-        Vendor::Codex => Arc::new(CodexProvider::new(
-            CodexProvider::find_codex(),
-            params.model,
-            None,
-            None,
-        )),
-        _ => Arc::new(OpenAIResponsesProvider::new(
-            params.base_url,
-            params.api_key,
-            params.model,
-        )),
+    let runtime = if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
+        let executable = CodexProvider::find_codex();
+        ProviderRuntime {
+            compaction_provider: Arc::new(CodexProvider::new(
+                executable.clone(),
+                params.model.clone(),
+                None,
+                None,
+                None,
+            )),
+            backend: Arc::new(CodexAdapter::new(executable, None)),
+        }
+    } else {
+        match api_key_provider_runtime(
+            params.vendor,
+            params.base_url.clone(),
+            params.api_key.clone(),
+            params.model.clone(),
+            app.executor.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return error_response(req.id, RpcError::invalid_params(&error.to_string()));
+            }
+        }
     };
 
-    app.set_provider(params.vendor, provider).await;
+    if let Err(e) = app.db.save_provider_config(&config) {
+        return error_response(
+            req.id,
+            RpcError::internal(&format!("Failed to save config: {e}")),
+        );
+    }
 
-    info!("Provider configured: {:?}", params.vendor);
+    app.set_provider_runtime(config.provider_id.clone(), runtime)
+        .await;
+
+    info!("Provider configured: {}", config.provider_id);
 
     success_response(
         req.id,
         ProviderConfigureResult {
+            provider_id: config.provider_id,
             vendor: params.vendor,
         },
     )
@@ -701,6 +865,7 @@ fn handle_provider_list(req: &Request, app: &Arc<AppState>) -> Response {
             let providers: Vec<ProviderEntry> = configs
                 .into_iter()
                 .map(|c| ProviderEntry {
+                    provider_id: c.provider_id,
                     vendor: c.vendor,
                     base_url: c.base_url,
                     model: c.model,
@@ -713,13 +878,15 @@ fn handle_provider_list(req: &Request, app: &Arc<AppState>) -> Response {
     }
 }
 
-async fn handle_provider_models(req: &Request, app: &Arc<AppState>) -> Response {
+fn handle_provider_models(req: &Request) -> Response {
     let params: ProviderModelsParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    let _provider = app.get_provider(Some(params.vendor)).await;
+    if let Err(error) = resolve_provider_id(params.provider_id, params.vendor) {
+        return error_response(req.id, error);
+    }
     let models = get_default_models(params.vendor);
 
     success_response(req.id, ProviderModelsResult { models })
@@ -854,30 +1021,97 @@ fn accumulate_usage(prev: &Option<TokenUsage>, current: &TokenUsage) -> TokenUsa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disco_core::{AgentBackend, RunCoordinator};
     use disco_protocol::types::Vendor;
-    use disco_providers::OpenAIResponsesProvider;
     use disco_tools::CompositeExecutor;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
+    use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
+
+    struct FailingDeleteBackend;
+
+    struct BlockingStartBackend {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FailingDeleteBackend {
+        fn capabilities(&self) -> disco_core::BackendCapabilities {
+            disco_core::BackendCapabilities {
+                has_persistent_sessions: true,
+                can_delete_session: true,
+            }
+        }
+
+        async fn start_run(
+            &self,
+            _request: BackendRunRequest,
+        ) -> anyhow::Result<disco_core::BackendRun> {
+            Err(anyhow::anyhow!("测试后端不运行任务"))
+        }
+
+        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("上游不可用"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for BlockingStartBackend {
+        fn capabilities(&self) -> disco_core::BackendCapabilities {
+            disco_core::BackendCapabilities {
+                has_persistent_sessions: true,
+                can_delete_session: true,
+            }
+        }
+
+        async fn start_run(
+            &self,
+            request: BackendRunRequest,
+        ) -> anyhow::Result<disco_core::BackendRun> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+            let terminal = if request.cancellation.is_cancelled() {
+                AgentOutput::Cancelled
+            } else {
+                AgentOutput::Completed
+            };
+            event_tx.send(terminal).await.unwrap();
+            Ok(disco_core::BackendRun {
+                events: Box::pin(tokio_stream::wrappers::ReceiverStream::new(event_rx)),
+                backend_handle: Some("blocking-session".to_string()),
+            })
+        }
+
+        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     fn make_test_app() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("disco-router-test-{}", Uuid::new_v4()));
         let db = disco_persist::Database::open(&dir.join("test.db")).unwrap();
-        let provider: Arc<dyn ModelProvider> = Arc::new(OpenAIResponsesProvider::new(
+        let executor = Arc::new(CompositeExecutor::new());
+        let runtime = api_key_provider_runtime(
+            Vendor::Openai,
             "https://api.openai.com/v1".to_string(),
             "test-key".to_string(),
             "gpt-4".to_string(),
-        ));
+            executor.clone(),
+        )
+        .unwrap();
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        let mut runtime_by_provider_id = HashMap::new();
+        runtime_by_provider_id.insert(provider_id, runtime);
 
         Arc::new(AppState {
             db,
-            provider: Some(provider),
-            providers: Mutex::new(HashMap::new()),
-            active_runs: Mutex::new(HashMap::new()),
-            active_approval: Mutex::new(HashMap::new()),
-            executor: Arc::new(CompositeExecutor::new()),
+            runtime_by_provider_id: Mutex::new(runtime_by_provider_id),
+            run_coordinator: RunCoordinator::new(),
+            executor,
             shutdown: CancellationToken::new(),
         })
     }
@@ -921,11 +1155,13 @@ mod tests {
     #[test]
     fn test_session_project_create_and_list() {
         let app = make_test_app();
+        let project_id = Uuid::new_v4();
 
         let req = Request {
             id: 1,
             method: "session/project/create".to_string(),
             params: serde_json::to_value(SessionProjectCreateParams {
+                project_id: Some(project_id),
                 name: "Test Project".to_string(),
                 path: "/tmp/test-project".to_string(),
             })
@@ -936,7 +1172,12 @@ mod tests {
         assert!(resp.error.is_none());
         let result: SessionProjectCreateResult =
             serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.project.id, project_id);
         assert_eq!(result.project.name, "Test Project");
+        let repeated = handle_session_project_create(&req, &app);
+        let repeated: SessionProjectCreateResult =
+            serde_json::from_value(repeated.result.unwrap()).unwrap();
+        assert_eq!(repeated.project.id, project_id);
 
         let req = Request {
             id: 2,
@@ -946,8 +1187,7 @@ mod tests {
 
         let resp = handle_session_projects(&req, &app);
         assert!(resp.error.is_none());
-        let result: SessionProjectsResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: SessionProjectsResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.projects.len(), 1);
     }
 
@@ -955,12 +1195,15 @@ mod tests {
     fn test_session_create_and_list() {
         let app = make_test_app();
         let project = app.db.create_project("Test", "/tmp/test").unwrap();
+        let session_id = Uuid::new_v4();
 
         let req = Request {
             id: 1,
             method: "session/create".to_string(),
             params: serde_json::to_value(SessionCreateParams {
+                session_id: Some(session_id),
                 project_id: project.id,
+                provider_id: None,
                 vendor: Vendor::Openai,
                 model: "gpt-4".to_string(),
             })
@@ -969,9 +1212,14 @@ mod tests {
 
         let resp = handle_session_create(&req, &app);
         assert!(resp.error.is_none());
-        let result: SessionCreateResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: SessionCreateResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.session.id, session_id);
         assert_eq!(result.session.model, "gpt-4");
+        assert_eq!(result.session.provider_id.as_str(), "openai_api");
+        let repeated = handle_session_create(&req, &app);
+        let repeated: SessionCreateResult =
+            serde_json::from_value(repeated.result.unwrap()).unwrap();
+        assert_eq!(repeated.session.id, session_id);
 
         let req = Request {
             id: 2,
@@ -984,18 +1232,23 @@ mod tests {
 
         let resp = handle_session_list(&req, &app);
         assert!(resp.error.is_none());
-        let result: SessionListResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: SessionListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.sessions.len(), 1);
     }
 
-    #[test]
-    fn test_session_delete() {
+    #[tokio::test]
+    async fn test_session_delete() {
         let app = make_test_app();
         let project = app.db.create_project("Test", "/tmp/test-del").unwrap();
         let session = app
             .db
-            .create_session(project.id, Vendor::Openai, "gpt-4", None)
+            .create_session(
+                project.id,
+                ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
             .unwrap();
 
         let req = Request {
@@ -1007,15 +1260,53 @@ mod tests {
             .unwrap(),
         };
 
-        let resp = handle_session_delete(&req, &app);
+        let resp = handle_session_delete(&req, &app).await;
         assert!(resp.error.is_none());
 
         let sessions = app.db.list_sessions(project.id).unwrap();
         assert!(sessions.is_empty());
     }
 
-    #[test]
-    fn test_run_cancel_nonexistent() {
+    #[tokio::test]
+    async fn upstream_delete_failure_preserves_local_session() {
+        let app = make_test_app();
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        let compaction_provider = app.get_compaction_provider(&provider_id).await.unwrap();
+        app.set_provider_runtime(
+            provider_id.clone(),
+            ProviderRuntime {
+                backend: Arc::new(FailingDeleteBackend),
+                compaction_provider,
+            },
+        )
+        .await;
+        let project = app
+            .db
+            .create_project("Test", "/tmp/test-delete-failure")
+            .unwrap();
+        let session = app
+            .db
+            .create_session(project.id, provider_id, Vendor::Openai, "gpt-4", None)
+            .unwrap();
+        app.db.add_message(session.id, "user", "保留我").unwrap();
+        let request = Request {
+            id: 1,
+            method: "session/delete".to_string(),
+            params: serde_json::to_value(SessionDeleteParams {
+                session_id: session.id,
+            })
+            .unwrap(),
+        };
+
+        let response = handle_session_delete(&request, &app).await;
+
+        assert!(response.error.is_some());
+        assert!(app.db.get_session(session.id).unwrap().is_some());
+        assert_eq!(app.db.list_messages(session.id).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_cancel_nonexistent_is_idempotent() {
         let app = make_test_app();
 
         let req = Request {
@@ -1027,8 +1318,81 @@ mod tests {
             .unwrap(),
         };
 
-        let resp = handle_run_cancel(&req, &app);
-        assert!(resp.error.is_some());
+        let resp = handle_run_cancel(&req, &app).await;
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_start_returns_before_backend_connects_and_can_be_cancelled() {
+        let app = make_test_app();
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        let compaction_provider = app.get_compaction_provider(&provider_id).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        app.set_provider_runtime(
+            provider_id.clone(),
+            ProviderRuntime {
+                backend: Arc::new(BlockingStartBackend {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+                compaction_provider,
+            },
+        )
+        .await;
+        let project = app
+            .db
+            .create_project("连接阶段取消", "/tmp/disco-connect-cancel")
+            .unwrap();
+        let session = app
+            .db
+            .create_session(project.id, provider_id, Vendor::Openai, "gpt-4", None)
+            .unwrap();
+        let request = Request {
+            id: 1,
+            method: "run/start".to_string(),
+            params: serde_json::to_value(RunStartParams {
+                session_id: session.id,
+                text: "开始".to_string(),
+            })
+            .unwrap(),
+        };
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(16);
+
+        let response = timeout(
+            Duration::from_millis(100),
+            handle_run_start(&request, &app, &out_tx),
+        )
+        .await
+        .expect("run/start 不应等待 backend 连接完成");
+        let result: RunStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+
+        let cancel = Request {
+            id: 2,
+            method: "run/cancel".to_string(),
+            params: serde_json::to_value(RunCancelParams {
+                run_id: result.run_id,
+            })
+            .unwrap(),
+        };
+        assert!(handle_run_cancel(&cancel, &app).await.error.is_none());
+        release.notify_one();
+
+        let terminal = timeout(Duration::from_secs(1), async {
+            while let Some(line) = out_rx.recv().await {
+                let event = disco_protocol::decode_event(&line).unwrap();
+                if event.event.starts_with("run.") && event.event != "run.state" {
+                    return event.event;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal, "run.cancelled");
     }
 
     #[test]
@@ -1054,6 +1418,7 @@ mod tests {
             id: 1,
             method: "provider/configure".to_string(),
             params: serde_json::to_value(ProviderConfigureParams {
+                provider_id: None,
                 vendor: Vendor::Deepseek,
                 base_url: "https://api.deepseek.com/v1".to_string(),
                 api_key: "sk-test".to_string(),
@@ -1065,9 +1430,9 @@ mod tests {
 
         let resp = handle_provider_configure(&req, &app).await;
         assert!(resp.error.is_none());
-        let result: ProviderConfigureResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ProviderConfigureResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.vendor, Vendor::Deepseek);
+        assert_eq!(result.provider_id.as_str(), "deepseek_api");
 
         let req = Request {
             id: 2,
@@ -1077,30 +1442,27 @@ mod tests {
 
         let resp = handle_provider_list(&req, &app);
         assert!(resp.error.is_none());
-        let result: ProviderListResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ProviderListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].vendor, Vendor::Deepseek);
         assert_eq!(result.providers[0].model, "deepseek-chat");
     }
 
-    #[tokio::test]
-    async fn test_provider_models() {
-        let app = make_test_app();
-
+    #[test]
+    fn test_provider_models() {
         let req = Request {
             id: 1,
             method: "provider/models".to_string(),
             params: serde_json::to_value(ProviderModelsParams {
+                provider_id: None,
                 vendor: Vendor::Openai,
             })
             .unwrap(),
         };
 
-        let resp = handle_provider_models(&req, &app).await;
+        let resp = handle_provider_models(&req);
         assert!(resp.error.is_none());
-        let result: ProviderModelsResult =
-            serde_json::from_value(resp.result.unwrap()).unwrap();
+        let result: ProviderModelsResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert!(!result.models.is_empty());
         assert!(result.models.iter().any(|m| m.id == "gpt-4o"));
     }
@@ -1117,6 +1479,15 @@ mod tests {
 
         let models = get_default_models(Vendor::Codex);
         assert!(!models.is_empty());
+    }
+
+    #[test]
+    fn test_reserved_provider_id_rejects_mismatched_vendor() {
+        let result = resolve_provider_id(
+            Some(ProviderId::new(ProviderId::CODEX_APP_SERVER)),
+            Vendor::Openai,
+        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]

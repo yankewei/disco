@@ -186,6 +186,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 3,
   "method": "provider/configure",
   "params": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek",
     "baseURL": "https://api.deepseek.com/v1",
     "apiKey": "sk-xxx",
@@ -201,6 +202,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
 {
   "id": 3,
   "result": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek"
   }
 }
@@ -228,12 +230,14 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "result": {
     "providers": [
       {
+        "providerID": "deepseek_api",
         "vendor": "deepseek",
         "baseURL": "https://api.deepseek.com/v1",
         "model": "deepseek-chat",
         "thinkingEnabled": true
       },
       {
+        "providerID": "openai_api",
         "vendor": "openai",
         "baseURL": "https://api.openai.com/v1",
         "model": "gpt-4",
@@ -255,10 +259,15 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 5,
   "method": "provider/models",
   "params": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek"
   }
 }
 ```
+
+`providerID` 是稳定的 Provider profile 标识。迁移期客户端可以省略，daemon 会根据
+`vendor` 选择旧版默认 profile。`codex_app_server` 和 `codex_api` 是两个不同
+Provider，不共享会话或配置。
 
 **响应**：
 
@@ -399,11 +408,15 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 9,
   "method": "session/project/create",
   "params": {
+    "projectID": "proj_456",
     "name": "my-project",
     "path": "/Users/dev/projects/my-project"
   }
 }
 ```
+
+`projectID` 可选。客户端可提供稳定 ID；相同路径已存在时，daemon 返回已有项目，
+因此该请求可安全重试。
 
 **响应**：
 
@@ -447,6 +460,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
       {
         "id": "sess_789",
         "projectID": "proj_123",
+        "providerID": "deepseek_api",
         "vendor": "deepseek",
         "model": "deepseek-chat",
         "createdAt": "2026-01-15T10:30:00Z",
@@ -469,7 +483,9 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 11,
   "method": "session/create",
   "params": {
+    "sessionID": "sess_abc",
     "projectID": "proj_123",
+    "providerID": "deepseek_api",
     "vendor": "deepseek",
     "model": "deepseek-chat"
   }
@@ -485,6 +501,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
     "session": {
       "id": "sess_abc",
       "projectID": "proj_123",
+      "providerID": "deepseek_api",
       "vendor": "deepseek",
       "model": "deepseek-chat",
       "createdAt": "2026-01-20T15:00:00Z"
@@ -492,6 +509,11 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   }
 }
 ```
+
+会话创建后 `providerID` 不可变。切换 Provider 需要创建新会话。旧客户端可以在
+`session/create` 中省略 `providerID`，daemon 会从 `vendor` 映射到默认 Provider。
+`sessionID` 也可省略；客户端提供稳定 ID 时，相同会话参数的重复请求返回已有会话，
+参数不一致则返回 `invalid_params`。
 
 #### `session/delete`
 
@@ -839,6 +861,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "event": "approval.resolved",
   "data": {
     "runID": "run_def",
+    "sessionID": "sess_abc",
     "approvalID": "appr_xyz",
     "decision": "approve_once"
   }

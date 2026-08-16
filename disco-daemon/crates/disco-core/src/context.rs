@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use disco_protocol::types::CompactionStatus;
-use disco_providers::openai_responses::{ChatMessage, ProviderEvent};
 use disco_providers::ModelProvider;
+use disco_providers::openai_responses::{ChatMessage, ProviderEvent};
 use tokio_stream::StreamExt;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -136,6 +136,11 @@ impl ContextCompactor {
                 Ok(ProviderEvent::Failed(msg)) => {
                     failed = true;
                     error_msg = Some(msg);
+                    break;
+                }
+                Ok(ProviderEvent::Cancelled) => {
+                    failed = true;
+                    error_msg = Some("上下文压缩已取消".to_string());
                     break;
                 }
                 Err(e) => {

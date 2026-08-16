@@ -101,7 +101,13 @@ mod tests {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/test-msg").unwrap();
         let session = db
-            .create_session(project.id, Vendor::Openai, "gpt-4", None)
+            .create_session(
+                project.id,
+                disco_protocol::types::ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
             .unwrap();
 
         db.add_message(session.id, "user", "hello").unwrap();
@@ -123,7 +129,13 @@ mod tests {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/test-role").unwrap();
         let session = db
-            .create_session(project.id, Vendor::Openai, "gpt-4", None)
+            .create_session(
+                project.id,
+                disco_protocol::types::ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
             .unwrap();
 
         let result = db.add_message(session.id, "system", "not allowed");
@@ -135,7 +147,13 @@ mod tests {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/test-order").unwrap();
         let session = db
-            .create_session(project.id, Vendor::Openai, "gpt-4", None)
+            .create_session(
+                project.id,
+                disco_protocol::types::ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
             .unwrap();
 
         for i in 0..5 {

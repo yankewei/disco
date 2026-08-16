@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 // MARK: - 服务商
@@ -12,6 +13,44 @@ pub enum Vendor {
     KimiCode,
     Glm,
     Codex,
+}
+
+/// 用户选择的 Provider profile 稳定标识。
+///
+/// `Vendor` 仅作为迁移期的模型厂商信息；会话和运行路由以 Provider ID 为准。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    pub const CODEX_APP_SERVER: &'static str = "codex_app_server";
+    pub const CODEX_API: &'static str = "codex_api";
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn legacy_default_for_vendor(vendor: Vendor) -> Self {
+        let value = match vendor {
+            Vendor::Openai => "openai_api",
+            Vendor::Deepseek => "deepseek_api",
+            Vendor::MoonshotKimi => "moonshot_kimi_api",
+            Vendor::KimiCode => "kimi_code_api",
+            Vendor::Glm => "glm_api",
+            Vendor::Codex => Self::CODEX_APP_SERVER,
+        };
+        Self::new(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 // MARK: - 运行状态
@@ -183,6 +222,7 @@ pub struct Project {
 pub struct Session {
     pub id: Uuid,
     pub project_id: Uuid,
+    pub provider_id: ProviderId,
     pub vendor: Vendor,
     pub model: String,
     pub created_at: String,

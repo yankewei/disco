@@ -3,6 +3,16 @@ import Foundation
 import Darwin
 #endif
 
+/// ConversationStore 依赖的稳定 daemon 边界；隐藏迁移期 DAP 传输细节。
+@MainActor
+protocol DiscoDaemonClient: AnyObject {
+    func events() -> AsyncThrowingStream<DaemonEvent, Error>
+    func startRun(sessionID: UUID, text: String) async throws -> UUID
+    func cancelRun(runID: UUID) async throws
+    func approve(approvalID: UUID, decision: String) async throws
+    func deleteSession(sessionID: UUID) async throws
+}
+
 // MARK: - 守护进程客户端
 
 /// 通过 Unix 域套接字与 Rust 守护进程通信的客户端。
@@ -248,11 +258,8 @@ final class DaemonClient {
     /// 获取守护进程推送的事件流。
     ///
     /// 每次成功连接都会重建事件流；未连接或已断开时返回一个立即结束的空流。
-    /// 注意：当前没有调用方，daemon 事件链路尚未接线（Phase 2 预留）。
-    nonisolated func events() -> AsyncThrowingStream<DaemonEvent, Error> {
-        unsafeAssumeIsolated {
-            eventStream ?? AsyncThrowingStream { $0.finish() }
-        }
+    func events() -> AsyncThrowingStream<DaemonEvent, Error> {
+        eventStream ?? AsyncThrowingStream { $0.finish() }
     }
 
     // MARK: - 便捷方法
@@ -270,8 +277,6 @@ final class DaemonClient {
     }
 
     /// 启动一次运行。
-    ///
-    /// 未接线：客户端目前仍走本地 runtime，尚未把运行路由到 daemon（Phase 2 预留）。
     func startRun(sessionID: UUID, text: String) async throws -> UUID {
         let result = try await request(
             "run/start",
@@ -288,8 +293,6 @@ final class DaemonClient {
     }
 
     /// 取消一次运行。
-    ///
-    /// 未接线：与 startRun 配套，运行路由到 daemon 后启用（Phase 2 预留）。
     func cancelRun(runID: UUID) async throws {
         _ = try await request(
             "run/cancel",
@@ -309,10 +312,11 @@ final class DaemonClient {
         )
     }
 
-    // MARK: - 服务商管理（Phase 2）
+    // MARK: - 服务商管理
 
     /// 配置一个服务商（API Key、Base URL、模型等）。
     func configureProvider(
+        providerID: String,
         vendor: String,
         baseURL: String,
         apiKey: String,
@@ -322,6 +326,7 @@ final class DaemonClient {
         _ = try await request(
             "provider/configure",
             params: DaemonProviderConfigureParams(
+                providerId: providerID,
                 vendor: vendor,
                 baseUrl: baseURL,
                 apiKey: apiKey,
@@ -344,23 +349,28 @@ final class DaemonClient {
         return result.providers
     }
 
-    // MARK: - 会话管理（Phase 2）
+    // MARK: - 会话管理
 
     /// 在守护进程中创建一个会话。
     func createSession(
+        sessionID: UUID,
         projectID: UUID,
+        providerID: String,
         vendor: String,
         model: String
     ) async throws -> DaemonSession {
-        try await request(
+        let result = try await request(
             "session/create",
             params: DaemonSessionCreateParams(
+                sessionId: sessionID.uuidString,
                 projectId: projectID.uuidString,
+                providerId: providerID,
                 vendor: vendor,
                 model: model
             ),
-            as: DaemonSession.self
+            as: DaemonSessionCreateResult.self
         )
+        return result.session
     }
 
     /// 获取指定项目下的会话列表。
@@ -384,17 +394,20 @@ final class DaemonClient {
         )
     }
 
-    // MARK: - 项目管理（Phase 2）
+    // MARK: - 项目管理
 
     /// 在守护进程中创建一个项目。
-    ///
-    /// 未接线：项目仍由客户端本地管理（Phase 2 预留）。
-    func createProject(name: String, path: String) async throws -> DaemonProject {
-        try await request(
+    func createProject(projectID: UUID, name: String, path: String) async throws -> DaemonProject {
+        let result = try await request(
             "session/project/create",
-            params: DaemonProjectCreateParams(name: name, path: path),
-            as: DaemonProject.self
+            params: DaemonProjectCreateParams(
+                projectId: projectID.uuidString,
+                name: name,
+                path: path
+            ),
+            as: DaemonProjectCreateResult.self
         )
+        return result.project
     }
 
     /// 获取守护进程中所有项目。
@@ -422,12 +435,9 @@ final class DaemonClient {
         )
     }
 
-    // MARK: - 审批响应（Phase 3）
+    // MARK: - 审批响应
 
     /// 响应用户审批请求。
-    ///
-    /// 未接线：pendingApproval 目前只能由 handleDaemonNotification 设置，
-    /// 而事件流尚未被消费，整条审批链路暂不可达（Phase 3 预留）。
     func approve(approvalID: UUID, decision: String) async throws {
         _ = try await request(
             "run/approve",
@@ -624,6 +634,8 @@ final class DaemonClient {
     }
 }
 
+extension DaemonClient: DiscoDaemonClient {}
+
 // MARK: - Data 扩展
 
 private extension Data {
@@ -637,18 +649,4 @@ private extension Data {
 // MARK: - Sendable 安全
 
 // DaemonClient 标记为 @MainActor，所有状态访问都在 MainActor 上。
-// events() 只读取 connect 时创建的流引用，非主线程不做状态变更。
 extension DaemonClient: @unchecked Sendable {}
-
-/// 辅助：在 nonisolated 上下文中安全访问 MainActor 隔离的属性。
-/// 仅用于读取 connect 时创建的事件流引用。
-@inline(__always)
-private func unsafeAssumeIsolated<T>(
-    file: StaticString = #file,
-    line: UInt = #line,
-    _ body: @MainActor () -> T
-) -> T {
-    // 在 Swift 6 中，nonisolated 方法访问 MainActor 隔离的属性需要显式隔离。
-    // eventStream 在 init 时创建后不再变更，是安全的。
-    MainActor.assumeIsolated(body, file: file, line: line)
-}

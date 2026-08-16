@@ -51,8 +51,16 @@ final class ConversationStore: ObservableObject {
     /// 当前运行中活跃/已完成的工具执行记录（守护进程路径）。
     @Published private(set) var toolExecutions: [ToolExecutionDisplay] = []
 
-    /// 守护进程客户端引用（Phase 3：审批响应需要直接调用 daemonClient）。
-    private var daemonClient: DaemonClient?
+    /// daemon 运行边界；只有成功注册了 daemon session 的会话才启用。
+    private var daemonClient: (any DiscoDaemonClient)?
+    private var daemonSessionID: UUID?
+    private var daemonRunsEnabled = false
+    private var daemonRunID: UUID?
+    private var daemonAssistantID: UUID?
+    private var daemonCancellationRequested = false
+    private var daemonCancelSent = false
+    private var clearAfterDaemonRun = false
+    private var isClearingDaemonSession = false
 
     private var runtime: (any AgentRuntime)?
     private var requestTask: Task<Void, Never>?
@@ -69,7 +77,13 @@ final class ConversationStore: ObservableObject {
     /// Generic 压缩 checkpoint 与最近一次成功压缩；随每次持久化回调落盘。
     private(set) var contextState: ConversationContextState
 
-    var hasRuntime: Bool { runtime != nil }
+    var hasRuntime: Bool {
+        if daemonSessionID != nil {
+            return daemonRunsEnabled && daemonClient != nil
+        }
+        return runtime != nil
+    }
+    var hasDaemonSession: Bool { daemonSessionID != nil }
     var isStreaming: Bool { runState.isActive }
 
     var firstPendingInteraction: PendingUserInteraction? {
@@ -122,8 +136,9 @@ final class ConversationStore: ObservableObject {
     }
 
     var canSend: Bool {
-        runtime != nil
+        hasRuntime
             && !isStreaming
+            && !isClearingDaemonSession
             && compactionTask == nil
             && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -183,9 +198,29 @@ final class ConversationStore: ObservableObject {
         return oldRuntime
     }
 
-    /// 设置守护进程客户端引用（Phase 3：用于审批响应）。
-    func configure(daemonClient: DaemonClient?) {
+    /// 设置守护进程客户端引用；注册 session 后再单独启用 daemon 运行。
+    func configure(daemonClient: (any DiscoDaemonClient)?) {
         self.daemonClient = daemonClient
+    }
+
+    func enableDaemonRuns(sessionID: UUID) {
+        daemonSessionID = sessionID
+        daemonRunsEnabled = true
+    }
+
+    func disableDaemonRuns() {
+        daemonRunsEnabled = false
+    }
+
+    /// daemon 连接中断后结束当前远端运行；已注册会话等待重连，不切换运行来源。
+    func handleDaemonDisconnection(_ message: String) {
+        disableDaemonRuns()
+        guard let assistantID = daemonAssistantID else { return }
+        errorMessage = message
+        runState = .failed
+        cancelPendingInteractions()
+        removeEmptyPlaceholder(assistantID)
+        finishDaemonRun()
     }
 
     /// 更新订阅会话的线程 id（CodexRuntime 首次运行时回调）。
@@ -203,13 +238,65 @@ final class ConversationStore: ObservableObject {
     /// "Publishing changes from within view updates"）。
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let runtime, !text.isEmpty, !isStreaming, !isSendStarting else { return }
+        guard !text.isEmpty, canSend, !isSendStarting else { return }
         isSendStarting = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isSendStarting = false }
             guard !self.isStreaming else { return }
-            self.startRun(text: text, runtime: runtime)
+            if let sessionID = self.daemonSessionID {
+                guard self.daemonRunsEnabled, let client = self.daemonClient else { return }
+                self.startDaemonRun(text: text, sessionID: sessionID, client: client)
+            } else if let runtime = self.runtime {
+                self.startRun(text: text, runtime: runtime)
+            }
+        }
+    }
+
+    private func startDaemonRun(
+        text: String,
+        sessionID: UUID,
+        client: any DiscoDaemonClient
+    ) {
+        interactionRecords.removeAll { record in
+            switch record.status {
+            case .resolved, .cancelled: true
+            case .pending, .submitting, .failed: false
+            }
+        }
+        draft = ""
+        errorMessage = nil
+        messages.append(ChatMessage(role: .user, text: text))
+
+        let assistantID = UUID()
+        messages.append(ChatMessage(id: assistantID, role: .assistant))
+        schedulePersistence()
+
+        activeRunID = UUID()
+        daemonRunID = nil
+        daemonAssistantID = assistantID
+        daemonCancellationRequested = false
+        daemonCancelSent = false
+        runState = .connecting
+
+        requestTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let runID = try await client.startRun(sessionID: sessionID, text: text)
+                guard daemonAssistantID == assistantID else {
+                    try? await client.cancelRun(runID: runID)
+                    return
+                }
+                daemonRunID = runID
+                activeRunID = runID
+                sendDaemonCancellationIfPossible()
+            } catch {
+                guard daemonAssistantID == assistantID else { return }
+                errorMessage = "无法启动 daemon 运行：\(error.localizedDescription)"
+                runState = .failed
+                removeEmptyPlaceholder(assistantID)
+                finishDaemonRun()
+            }
         }
     }
 
@@ -311,16 +398,20 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    // MARK: - 守护进程事件处理（Phase 2）
+    // MARK: - 守护进程事件处理
 
     /// 处理守护进程推送的事件，映射到与 AgentEvent 相同的内部状态变更。
     ///
     /// 当运行通过守护进程路由时（`useDaemon == true`），事件流来自守护进程通知
     /// 而非本地 AgentRuntime。此方法将守护进程事件翻译为与 `handle(_:assistantID:)`
     /// 等价的状态更新，确保 UI 层无需区分数据来源。
-    /// 注意：当前没有调用方（daemon 事件流尚未接线），审批/工具执行等
-    /// 守护进程事件暂不可达（Phase 2/3 预留）。
-    func handleDaemonNotification(_ event: DaemonEvent, assistantID: UUID) {
+    func handleDaemonNotification(_ event: DaemonEvent) {
+        guard let assistantID = daemonAssistantID else { return }
+        if let runID = event.runID {
+            daemonRunID = runID
+            activeRunID = runID
+            sendDaemonCancellationIfPossible()
+        }
         switch event.eventName {
         case "message.delta":
             guard let data = try? event.decoded(as: DaemonMessageDeltaData.self) else { return }
@@ -410,9 +501,7 @@ final class ConversationStore: ObservableObject {
 
         case "run.completed":
             runState = .completed
-            if let runID = activeRunID {
-                finishRun(runID)
-            }
+            finishDaemonRun()
 
         case "run.failed":
             if let data = try? event.decoded(as: DaemonRunFailedData.self) {
@@ -423,18 +512,14 @@ final class ConversationStore: ObservableObject {
             runState = .failed
             cancelPendingInteractions()
             removeEmptyPlaceholder(assistantID)
-            if let runID = activeRunID {
-                finishRun(runID)
-            }
+            finishDaemonRun()
 
         case "run.cancelled":
             runState = .cancelled
             cancelPendingInteractions()
-            if let runID = activeRunID {
-                finishRun(runID)
-            }
+            finishDaemonRun()
 
-        // MARK: - 工具执行事件（Phase 3）
+        // MARK: - 工具执行事件
 
         case "tool.started":
             guard let data = try? event.decoded(as: DaemonToolStartedData.self) else { return }
@@ -462,7 +547,7 @@ final class ConversationStore: ObservableObject {
                 toolExecutions.append(execution)
             }
 
-        // MARK: - 审批事件（Phase 3）
+        // MARK: - 审批事件
 
         case "approval.requested":
             guard let data = try? event.decoded(as: DaemonApprovalRequestedData.self) else { return }
@@ -537,6 +622,23 @@ final class ConversationStore: ObservableObject {
         toolExecutions.removeAll()
     }
 
+    private func finishDaemonRun() {
+        let shouldClear = clearAfterDaemonRun
+        let sessionIDToClear = daemonSessionID
+        persistImmediately()
+        activeRunID = nil
+        daemonRunID = nil
+        daemonAssistantID = nil
+        daemonCancellationRequested = false
+        daemonCancelSent = false
+        clearAfterDaemonRun = false
+        requestTask = nil
+        toolExecutions.removeAll()
+        if shouldClear, let sessionIDToClear {
+            clearDaemonSessionAndLocalHistory(sessionIDToClear)
+        }
+    }
+
     func stop() {
         let hadActiveRequest = requestTask != nil || isStreaming
         cancelRequest()
@@ -553,6 +655,19 @@ final class ConversationStore: ObservableObject {
     }
 
     func clear() {
+        if let daemonSessionID {
+            if daemonAssistantID != nil {
+                clearAfterDaemonRun = true
+                cancelRequest()
+            } else {
+                clearDaemonSessionAndLocalHistory(daemonSessionID)
+            }
+            return
+        }
+        clearLocalHistory()
+    }
+
+    private func clearLocalHistory() {
         cancelRequest()
         cancelCompaction()
         messages.removeAll()
@@ -571,6 +686,25 @@ final class ConversationStore: ObservableObject {
         toolExecutions.removeAll()
         runState = .idle
         persistImmediately()
+    }
+
+    private func clearDaemonSessionAndLocalHistory(_ sessionID: UUID) {
+        guard !isClearingDaemonSession, let daemonClient else { return }
+        isClearingDaemonSession = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await daemonClient.deleteSession(sessionID: sessionID)
+                isClearingDaemonSession = false
+                guard daemonSessionID == sessionID else { return }
+                daemonRunsEnabled = false
+                daemonSessionID = nil
+                clearLocalHistory()
+            } catch {
+                isClearingDaemonSession = false
+                errorMessage = "无法清理 daemon 会话，本地历史已保留：\(error.localizedDescription)"
+            }
+        }
     }
 
     func dismissError() {
@@ -662,17 +796,23 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    /// 响应守护进程路径的审批请求（Phase 3）。
+    /// 响应守护进程路径的审批请求。
     ///
-    /// 未接线：pendingApproval 只能由 handleDaemonNotification 设置，
-    /// 在事件流消费前此方法不会被触发。
     func respondToApproval(decision: String) {
         guard let approval = pendingApproval else { return }
         pendingApproval = nil
         guard let client = daemonClient,
               let approvalUUID = UUID(uuidString: approval.approvalId) else { return }
-        Task {
-            try? await client.approve(approvalID: approvalUUID, decision: decision)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await client.approve(approvalID: approvalUUID, decision: decision)
+            } catch {
+                guard daemonAssistantID != nil else { return }
+                pendingApproval = approval
+                runState = .waitingForApproval
+                errorMessage = "无法提交审批结果：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -747,6 +887,14 @@ final class ConversationStore: ObservableObject {
     }
 
     private func cancelRequest() {
+        if daemonAssistantID != nil {
+            guard isStreaming else { return }
+            runState = .cancelling
+            daemonCancellationRequested = true
+            sendDaemonCancellationIfPossible()
+            cancelPendingInteractions()
+            return
+        }
         if isStreaming {
             runState = .cancelling
         }
@@ -759,6 +907,17 @@ final class ConversationStore: ObservableObject {
         }
         cancelPendingInteractions()
         runState = .cancelled
+    }
+
+    private func sendDaemonCancellationIfPossible() {
+        guard daemonCancellationRequested,
+              !daemonCancelSent,
+              let client = daemonClient,
+              let runID = daemonRunID else { return }
+        daemonCancelSent = true
+        Task {
+            try? await client.cancelRun(runID: runID)
+        }
     }
 
     private func cancelPendingInteractions() {

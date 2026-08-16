@@ -1,7 +1,7 @@
 //! SQLite persistence for provider configurations.
 
 use anyhow::{Context, Result};
-use disco_protocol::types::Vendor;
+use disco_protocol::types::{ProviderId, Vendor};
 use serde::{Deserialize, Serialize};
 
 use crate::Database;
@@ -9,6 +9,7 @@ use crate::Database;
 /// A persisted provider configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    pub provider_id: ProviderId,
     pub vendor: Vendor,
     pub base_url: String,
     pub api_key: String,
@@ -28,10 +29,11 @@ impl Database {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO provider_configs
-             (vendor, base_url, api_key, model, thinking_enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO provider_profiles
+             (id, vendor, base_url, api_key, model, thinking_enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
+                config.provider_id.as_str(),
                 vendor_str,
                 config.base_url,
                 config.api_key,
@@ -40,39 +42,35 @@ impl Database {
                 &now,
             ],
         )
-        .with_context(|| format!("Failed to save provider config for {:?}", config.vendor))?;
+        .with_context(|| format!("Failed to save provider config {}", config.provider_id))?;
 
         Ok(())
     }
 
-    /// Get a provider configuration by vendor.
-    pub fn get_provider_config(&self, vendor: Vendor) -> Result<Option<ProviderConfig>> {
-        let vendor_str = serde_json::to_string(&vendor)
-            .context("Failed to serialize vendor")?
-            .trim_matches('"')
-            .to_string();
-
+    /// Get a provider configuration by its stable profile ID.
+    pub fn get_provider_config(&self, provider_id: &ProviderId) -> Result<Option<ProviderConfig>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT vendor, base_url, api_key, model, thinking_enabled, updated_at
-                 FROM provider_configs
-                 WHERE vendor = ?1",
+                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, updated_at
+                 FROM provider_profiles
+                 WHERE id = ?1",
             )
             .context("Failed to prepare get_provider_config query")?;
 
         let result = stmt
-            .query_row(rusqlite::params![vendor_str], |row| {
-                let vendor_str: String = row.get(0)?;
-                let vendor: Vendor = serde_json::from_str(&format!("\"{vendor_str}\""))
-                    .unwrap_or(Vendor::Openai);
+            .query_row(rusqlite::params![provider_id.as_str()], |row| {
+                let vendor_str: String = row.get(1)?;
+                let vendor: Vendor =
+                    serde_json::from_str(&format!("\"{vendor_str}\"")).unwrap_or(Vendor::Openai);
                 Ok(ProviderConfig {
+                    provider_id: ProviderId::new(row.get::<_, String>(0)?),
                     vendor,
-                    base_url: row.get(1)?,
-                    api_key: row.get(2)?,
-                    model: row.get(3)?,
-                    thinking_enabled: row.get::<_, i32>(4)? != 0,
-                    updated_at: row.get(5)?,
+                    base_url: row.get(2)?,
+                    api_key: row.get(3)?,
+                    model: row.get(4)?,
+                    thinking_enabled: row.get::<_, i32>(5)? != 0,
+                    updated_at: row.get(6)?,
                 })
             })
             .optional()
@@ -86,23 +84,24 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT vendor, base_url, api_key, model, thinking_enabled, updated_at
-                 FROM provider_configs
-                 ORDER BY vendor",
+                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, updated_at
+                 FROM provider_profiles
+                 ORDER BY id",
             )
             .context("Failed to prepare list_provider_configs query")?;
 
         let rows = stmt.query_map([], |row| {
-            let vendor_str: String = row.get(0)?;
-            let vendor: Vendor = serde_json::from_str(&format!("\"{vendor_str}\""))
-                .unwrap_or(Vendor::Openai);
+            let vendor_str: String = row.get(1)?;
+            let vendor: Vendor =
+                serde_json::from_str(&format!("\"{vendor_str}\"")).unwrap_or(Vendor::Openai);
             Ok(ProviderConfig {
+                provider_id: ProviderId::new(row.get::<_, String>(0)?),
                 vendor,
-                base_url: row.get(1)?,
-                api_key: row.get(2)?,
-                model: row.get(3)?,
-                thinking_enabled: row.get::<_, i32>(4)? != 0,
-                updated_at: row.get(5)?,
+                base_url: row.get(2)?,
+                api_key: row.get(3)?,
+                model: row.get(4)?,
+                thinking_enabled: row.get::<_, i32>(5)? != 0,
+                updated_at: row.get(6)?,
             })
         })?;
 
@@ -113,19 +112,14 @@ impl Database {
         Ok(configs)
     }
 
-    /// Delete a provider configuration by vendor.
-    pub fn delete_provider_config(&self, vendor: Vendor) -> Result<()> {
-        let vendor_str = serde_json::to_string(&vendor)
-            .context("Failed to serialize vendor")?
-            .trim_matches('"')
-            .to_string();
-
+    /// Delete a provider configuration by its stable profile ID.
+    pub fn delete_provider_config(&self, provider_id: &ProviderId) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM provider_configs WHERE vendor = ?1",
-            rusqlite::params![vendor_str],
+            "DELETE FROM provider_profiles WHERE id = ?1",
+            rusqlite::params![provider_id.as_str()],
         )
-        .with_context(|| format!("Failed to delete provider config for {:?}", vendor))?;
+        .with_context(|| format!("Failed to delete provider config {provider_id}"))?;
 
         Ok(())
     }
@@ -160,6 +154,7 @@ mod tests {
     fn save_and_get_provider_config() {
         let db = temp_db();
         let config = ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::Openai),
             vendor: Vendor::Openai,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "sk-test".to_string(),
@@ -170,7 +165,10 @@ mod tests {
 
         db.save_provider_config(&config).unwrap();
 
-        let loaded = db.get_provider_config(Vendor::Openai).unwrap().unwrap();
+        let loaded = db
+            .get_provider_config(&ProviderId::legacy_default_for_vendor(Vendor::Openai))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.vendor, Vendor::Openai);
         assert_eq!(loaded.base_url, "https://api.openai.com/v1");
         assert_eq!(loaded.api_key, "sk-test");
@@ -182,6 +180,7 @@ mod tests {
     fn update_provider_config() {
         let db = temp_db();
         let config = ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::Deepseek),
             vendor: Vendor::Deepseek,
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: "sk-old".to_string(),
@@ -201,7 +200,10 @@ mod tests {
         };
         db.save_provider_config(&updated).unwrap();
 
-        let loaded = db.get_provider_config(Vendor::Deepseek).unwrap().unwrap();
+        let loaded = db
+            .get_provider_config(&ProviderId::legacy_default_for_vendor(Vendor::Deepseek))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.api_key, "sk-new");
         assert_eq!(loaded.model, "deepseek-reasoner");
         assert!(loaded.thinking_enabled);
@@ -212,6 +214,7 @@ mod tests {
         let db = temp_db();
 
         db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::Openai),
             vendor: Vendor::Openai,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "sk-1".to_string(),
@@ -222,6 +225,7 @@ mod tests {
         .unwrap();
 
         db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::Deepseek),
             vendor: Vendor::Deepseek,
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: "sk-2".to_string(),
@@ -240,6 +244,7 @@ mod tests {
         let db = temp_db();
 
         db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::Openai),
             vendor: Vendor::Openai,
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "sk-test".to_string(),
@@ -249,16 +254,19 @@ mod tests {
         })
         .unwrap();
 
-        db.delete_provider_config(Vendor::Openai).unwrap();
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        db.delete_provider_config(&provider_id).unwrap();
 
-        let loaded = db.get_provider_config(Vendor::Openai).unwrap();
+        let loaded = db.get_provider_config(&provider_id).unwrap();
         assert!(loaded.is_none());
     }
 
     #[test]
     fn get_nonexistent_provider_config() {
         let db = temp_db();
-        let loaded = db.get_provider_config(Vendor::Glm).unwrap();
+        let loaded = db
+            .get_provider_config(&ProviderId::legacy_default_for_vendor(Vendor::Glm))
+            .unwrap();
         assert!(loaded.is_none());
     }
 
@@ -267,6 +275,7 @@ mod tests {
         let db = temp_db();
 
         db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::legacy_default_for_vendor(Vendor::MoonshotKimi),
             vendor: Vendor::MoonshotKimi,
             base_url: "https://api.moonshot.cn/v1".to_string(),
             api_key: "sk-kimi".to_string(),
@@ -276,8 +285,50 @@ mod tests {
         })
         .unwrap();
 
-        let loaded = db.get_provider_config(Vendor::MoonshotKimi).unwrap().unwrap();
+        let loaded = db
+            .get_provider_config(&ProviderId::legacy_default_for_vendor(Vendor::MoonshotKimi))
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.vendor, Vendor::MoonshotKimi);
         assert!(loaded.thinking_enabled);
+    }
+
+    #[test]
+    fn codex_app_server_and_codex_api_are_distinct_profiles() {
+        let db = temp_db();
+
+        db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::new(ProviderId::CODEX_APP_SERVER),
+            vendor: Vendor::Codex,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: "o4-mini".to_string(),
+            thinking_enabled: false,
+            updated_at: String::new(),
+        })
+        .unwrap();
+        db.save_provider_config(&ProviderConfig {
+            provider_id: ProviderId::new(ProviderId::CODEX_API),
+            vendor: Vendor::Openai,
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-5-codex".to_string(),
+            thinking_enabled: false,
+            updated_at: String::new(),
+        })
+        .unwrap();
+
+        let configs = db.list_provider_configs().unwrap();
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs
+                .iter()
+                .any(|config| config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER)
+        );
+        assert!(
+            configs
+                .iter()
+                .any(|config| config.provider_id.as_str() == ProviderId::CODEX_API)
+        );
     }
 }

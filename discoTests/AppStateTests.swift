@@ -3,6 +3,15 @@ import XCTest
 
 @MainActor
 final class AppStateTests: XCTestCase {
+    func testProviderVendorsMapToDaemonProfiles() {
+        XCTAssertEqual(ProviderVendor.openai.daemonProviderID, "codex_api")
+        XCTAssertEqual(ProviderVendor.openai.daemonVendor, "openai")
+        XCTAssertEqual(ProviderVendor.chatgpt.daemonProviderID, "codex_app_server")
+        XCTAssertEqual(ProviderVendor.chatgpt.daemonVendor, "codex")
+        XCTAssertEqual(ProviderVendor.moonshot.daemonVendor, "moonshot_kimi")
+        XCTAssertEqual(ProviderVendor.zhipu.daemonVendor, "glm")
+    }
+
     func testHostedWebSearchCapabilitiesAreVendorAndModelSpecific() {
         XCTAssertEqual(ProviderVendor.openai.hostedTools(for: "gpt-5.6"), [.webSearch])
         XCTAssertEqual(ProviderVendor.deepseek.hostedTools(for: "deepseek-v4-flash"), [.webSearch])
