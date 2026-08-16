@@ -596,16 +596,19 @@ private struct VendorDetailPanel: View {
             Divider()
                 .opacity(0.65)
 
-            VStack(alignment: .leading, spacing: 18) {
-                credentialsCard
-                verifyRow
-                modelSection
-                if vendor.requiresAPIKey {
-                    thinkingRow
+            // 页面级滚动：模型列表保底高度可能超出固定窗口（940×600），超出时整页滚动而非压缩列表
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    credentialsCard
+                    verifyRow
+                    modelSection
+                    if vendor.requiresAPIKey {
+                        thinkingRow
+                    }
                 }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
-            .padding(20)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
             Divider()
                 .opacity(0.65)
@@ -1036,7 +1039,7 @@ private struct VendorDetailPanel: View {
                             .foregroundStyle(.orange)
                     }
                     Spacer()
-                    if draft.models.count > 7 {
+                    if draft.models.count > Self.maxVisibleModelRows {
                         HStack(spacing: 7) {
                             Image(systemName: "magnifyingglass")
                                 .foregroundStyle(.secondary)
@@ -1082,16 +1085,25 @@ private struct VendorDetailPanel: View {
                             }
                         }
                     }
-                    .frame(maxHeight: .infinity)
+                    // 固定可视高度：避免被凭据等区块挤压成 1~2 行；超过上限的模型在列表内滚动 + 筛选
+                    .frame(height: Self.visibleModelListHeight(for: filteredModels.count))
                 }
             }
             .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
-            .frame(maxHeight: .infinity)
 
             contextWindowEditor
                 .onAppear(perform: syncContextWindowText)
                 .onChange(of: draft.selectedModel) { _, _ in syncContextWindowText() }
         }
+    }
+
+    /// 模型列表可视行数上限：超过后列表内部滚动，并出现筛选框
+    private static let maxVisibleModelRows = 8
+
+    /// 列表可视高度：按模型数量自适应（每行最小高 40 + 分隔线 1），模型多时封顶
+    private static func visibleModelListHeight(for modelCount: Int) -> CGFloat {
+        let rowUnitHeight: CGFloat = 41
+        return CGFloat(min(modelCount, maxVisibleModelRows)) * rowUnitHeight
     }
 
     private var contextWindowEditor: some View {
