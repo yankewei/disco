@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use disco_backends::{CodexAdapter, ModelApiBackend};
-use disco_core::{AgentBackend, AgentOutput, BackendRunRequest, BackendSession, BeginRunError};
+use disco_backends::CodexAdapter;
+use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError};
 use disco_protocol::*;
+use disco_providers::CodexProvider;
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
-use disco_providers::{CodexProvider, ModelProvider, OpenAIResponsesProvider};
 use tokio::sync::mpsc::Sender;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::daemon::{AppState, ProviderRuntime};
+use crate::daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
 
 /// Handle a single request and send the response (and any events) via the output channel.
 pub async fn handle_request(req: &Request, app: &Arc<AppState>, out_tx: &Sender<String>) {
@@ -749,6 +749,32 @@ async fn handle_provider_configure(req: &Request, app: &Arc<AppState>) -> Respon
         updated_at: String::new(),
     };
 
+    let runtime = if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
+        let executable = CodexProvider::find_codex();
+        ProviderRuntime {
+            compaction_provider: Arc::new(CodexProvider::new(
+                executable.clone(),
+                params.model.clone(),
+                None,
+                None,
+            )),
+            backend: Arc::new(CodexAdapter::new(executable, None)),
+        }
+    } else {
+        match api_key_provider_runtime(
+            params.vendor,
+            params.base_url.clone(),
+            params.api_key.clone(),
+            params.model.clone(),
+            app.executor.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return error_response(req.id, RpcError::invalid_params(&error.to_string()));
+            }
+        }
+    };
+
     if let Err(e) = app.db.save_provider_config(&config) {
         return error_response(
             req.id,
@@ -756,36 +782,8 @@ async fn handle_provider_configure(req: &Request, app: &Arc<AppState>) -> Respon
         );
     }
 
-    let (compaction_provider, backend): (Arc<dyn ModelProvider>, Arc<dyn AgentBackend>) =
-        if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
-            let executable = CodexProvider::find_codex();
-            (
-                Arc::new(CodexProvider::new(
-                    executable.clone(),
-                    params.model,
-                    None,
-                    None,
-                )),
-                Arc::new(CodexAdapter::new(executable, None)),
-            )
-        } else {
-            let provider: Arc<dyn ModelProvider> = Arc::new(OpenAIResponsesProvider::new(
-                params.base_url,
-                params.api_key,
-                params.model,
-            ));
-            let backend = Arc::new(ModelApiBackend::new(provider.clone(), app.executor.clone()));
-            (provider, backend)
-        };
-
-    app.set_provider_runtime(
-        config.provider_id.clone(),
-        ProviderRuntime {
-            backend,
-            compaction_provider,
-        },
-    )
-    .await;
+    app.set_provider_runtime(config.provider_id.clone(), runtime)
+        .await;
 
     info!("Provider configured: {}", config.provider_id);
 
@@ -962,7 +960,6 @@ mod tests {
     use super::*;
     use disco_core::{AgentBackend, RunCoordinator};
     use disco_protocol::types::Vendor;
-    use disco_providers::OpenAIResponsesProvider;
     use disco_tools::CompositeExecutor;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -995,23 +992,18 @@ mod tests {
     fn make_test_app() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("disco-router-test-{}", Uuid::new_v4()));
         let db = disco_persist::Database::open(&dir.join("test.db")).unwrap();
-        let provider: Arc<dyn ModelProvider> = Arc::new(OpenAIResponsesProvider::new(
+        let executor = Arc::new(CompositeExecutor::new());
+        let runtime = api_key_provider_runtime(
+            Vendor::Openai,
             "https://api.openai.com/v1".to_string(),
             "test-key".to_string(),
             "gpt-4".to_string(),
-        ));
-        let executor = Arc::new(CompositeExecutor::new());
-        let backend: Arc<dyn AgentBackend> =
-            Arc::new(ModelApiBackend::new(provider.clone(), executor.clone()));
+            executor.clone(),
+        )
+        .unwrap();
         let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
         let mut runtime_by_provider_id = HashMap::new();
-        runtime_by_provider_id.insert(
-            provider_id,
-            ProviderRuntime {
-                backend,
-                compaction_provider: provider,
-            },
-        );
+        runtime_by_provider_id.insert(provider_id, runtime);
 
         Arc::new(AppState {
             db,

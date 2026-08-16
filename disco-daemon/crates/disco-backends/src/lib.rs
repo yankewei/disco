@@ -1,5 +1,5 @@
 mod codex;
-mod model_api;
+mod rig;
 
 pub use codex::CodexAdapter;
-pub use model_api::ModelApiBackend;
+pub use rig::{RigBackend, deepseek_provider, openai_chat_provider, openai_responses_provider};

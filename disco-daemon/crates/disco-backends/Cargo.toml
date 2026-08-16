@@ -5,14 +5,19 @@ edition.workspace = true
 
 [dependencies]
 disco-core = { path = "../disco-core" }
+disco-protocol = { path = "../disco-protocol" }
 disco-providers = { path = "../disco-providers" }
 disco-tools = { path = "../disco-tools" }
 async-trait = { workspace = true }
+async-stream = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 uuid = { workspace = true }
+rig-core = { workspace = true }
+serde_json = { workspace = true }
+futures-core = { workspace = true }
 
 [dev-dependencies]
 tokio-util = { workspace = true }
-futures-core = { workspace = true }
+rig-core = { workspace = true, features = ["test-utils"] }
