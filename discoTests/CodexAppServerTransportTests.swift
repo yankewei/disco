@@ -56,11 +56,12 @@ final class CodexAppServerTransportTests: XCTestCase {
         XCTAssertEqual(lineMethod(of: handshake[1]), "initialized")
         XCTAssertNil(requestID(of: handshake[1]))
 
-        let thread = try await transport.startThread(model: "gpt-5.6")
+        let thread = try await transport.startThread(model: "gpt-5.6", cwd: "/tmp/disco-workspace")
         XCTAssertEqual(thread, threadID)
         let threadStart = process.sentLines[2]
         XCTAssertEqual(requestID(of: threadStart), 1)
         XCTAssertEqual(requestParams(of: threadStart)["model"] as? String, "gpt-5.6")
+        XCTAssertEqual(requestParams(of: threadStart)["cwd"] as? String, "/tmp/disco-workspace")
 
         var events: [CodexTurnEvent] = []
         for try await event in transport.startTurn(threadID: thread, input: "你好", effort: "high") {
@@ -484,11 +485,16 @@ final class CodexAppServerTransportTests: XCTestCase {
         defer { transport.stop() }
         try await transport.start()
 
-        let threadID = try await transport.startThread(model: "gpt-5.6", resumeThreadID: "thr_999")
+        let threadID = try await transport.startThread(
+            model: "gpt-5.6",
+            resumeThreadID: "thr_999",
+            cwd: "/tmp/disco-workspace"
+        )
         XCTAssertEqual(threadID, "thr_999")
         // sentLines: [0]=initialize, [1]=initialized 通知, [2]=thread/resume
         XCTAssertEqual(lineMethod(of: process.sentLines[2]), "thread/resume")
         XCTAssertEqual(requestParams(of: process.sentLines[2])["threadId"] as? String, "thr_999")
+        XCTAssertEqual(requestParams(of: process.sentLines[2])["cwd"] as? String, "/tmp/disco-workspace")
     }
 
     /// 一条连接可承载多个 thread；事件按 threadId 路由，互不覆盖。

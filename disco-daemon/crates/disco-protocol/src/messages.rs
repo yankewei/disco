@@ -181,6 +181,26 @@ pub struct SessionDeleteParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionDeleteResult {}
 
+// --- session/messages ---
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessagesParams {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessagesResult {
+    pub messages: Vec<SessionMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub id: Uuid,
+    pub role: String,
+    pub text: String,
+    pub created_at: String,
+}
+
 // --- run/start ---
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -26,6 +26,7 @@ pub async fn handle_request(req: &Request, app: &Arc<AppState>, out_tx: &Sender<
         "session/delete" => handle_session_delete(req, app).await,
         "session/projects" => handle_session_projects(req, app),
         "session/project/create" => handle_session_project_create(req, app),
+        "session/messages" => handle_session_messages(req, app),
         "provider/configure" => handle_provider_configure(req, app).await,
         "provider/list" => handle_provider_list(req, app),
         "provider/models" => handle_provider_models(req),
@@ -701,6 +702,31 @@ fn handle_session_list(req: &Request, app: &Arc<AppState>) -> Response {
     }
 }
 
+fn handle_session_messages(req: &Request, app: &Arc<AppState>) -> Response {
+    let params: SessionMessagesParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
+    };
+
+    match app.db.list_messages(params.session_id) {
+        Ok(messages) => success_response(
+            req.id,
+            SessionMessagesResult {
+                messages: messages
+                    .into_iter()
+                    .map(|message| SessionMessage {
+                        id: message.id,
+                        role: message.role,
+                        text: message.text,
+                        created_at: message.created_at,
+                    })
+                    .collect(),
+            },
+        ),
+        Err(e) => error_response(req.id, RpcError::internal(&e.to_string())),
+    }
+}
+
 async fn handle_session_delete(req: &Request, app: &Arc<AppState>) -> Response {
     let params: SessionDeleteParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
@@ -1234,6 +1260,42 @@ mod tests {
         assert!(resp.error.is_none());
         let result: SessionListResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(result.sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_session_messages() {
+        let app = make_test_app();
+        let project = app.db.create_project("Test", "/tmp/test-messages").unwrap();
+        let session = app
+            .db
+            .create_session(
+                project.id,
+                ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
+            .unwrap();
+        app.db.add_message(session.id, "user", "你好").unwrap();
+        app.db.add_message(session.id, "assistant", "世界").unwrap();
+
+        let req = Request {
+            id: 1,
+            method: "session/messages".to_string(),
+            params: serde_json::to_value(SessionMessagesParams {
+                session_id: session.id,
+            })
+            .unwrap(),
+        };
+
+        let resp = handle_session_messages(&req, &app);
+        assert!(resp.error.is_none());
+        let result: SessionMessagesResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].role, "user");
+        assert_eq!(result.messages[0].text, "你好");
+        assert_eq!(result.messages[1].role, "assistant");
+        assert_eq!(result.messages[1].text, "世界");
     }
 
     #[tokio::test]

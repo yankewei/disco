@@ -163,11 +163,15 @@ struct CodexEmptyParams: Encodable {}
 
 struct CodexThreadStartParams: Encodable {
     let model: String
+    /// 线程的项目工作目录；nil 表示使用 app-server 默认目录（临时对话）。
+    let cwd: String?
 }
 
 struct CodexThreadResumeParams: Encodable {
     let threadId: String
     let model: String?
+    /// 续接时仍可携带工作目录；nil 表示沿用线程已有目录。
+    let cwd: String?
 }
 
 struct CodexTurnInput: Encodable {

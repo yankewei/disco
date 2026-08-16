@@ -14,9 +14,10 @@ use disco_tools::{CompositeExecutor, ToolCall, ToolContext, ToolDefinition, Tool
 use futures_core::Stream;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
-    AgentHook, MultiTurnStreamItem, StepEventKind, ToolCall as ToolCallEvent, ToolCallAction,
-    ToolResultAction, ToolResultEvent,
+    AgentHook, MultiTurnStreamItem, StepEventKind, StreamingError, ToolCall as ToolCallEvent,
+    ToolCallAction, ToolResultAction, ToolResultEvent,
 };
+use rig_agent::completion::PromptError;
 use rig_agent::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
@@ -32,8 +33,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const MAX_MODEL_ROUNDS: usize = 8;
-const MAX_TOOL_CALLS: usize = 16;
+/// 单次运行的模型轮次预算（含首轮）。大项目分析可能持续很多轮，
+/// 10000 实际上近似不设限；达到上限仍按预算约束收尾而不是报错。
+const MAX_MODEL_ROUNDS: usize = 10_000;
+const MAX_TOOL_CALLS: usize = 10_000;
 
 /// 一份 API Key Provider 配置对应的两个运行时接口。
 ///
@@ -49,11 +52,20 @@ pub struct RigRuntime {
 struct RigBackend<M> {
     model: M,
     executor: Arc<CompositeExecutor>,
+    max_model_rounds: usize,
 }
 
 impl<M> RigBackend<M> {
     fn new(model: M, executor: Arc<CompositeExecutor>) -> Self {
-        Self { model, executor }
+        Self::with_budget(model, executor, MAX_MODEL_ROUNDS)
+    }
+
+    fn with_budget(model: M, executor: Arc<CompositeExecutor>, max_model_rounds: usize) -> Self {
+        Self {
+            model,
+            executor,
+            max_model_rounds,
+        }
     }
 }
 
@@ -97,15 +109,17 @@ where
             .add_hook(hook)
             .build();
         let executor = self.executor.clone();
+        let max_model_rounds = self.max_model_rounds;
 
         tokio::spawn(async move {
             let mut stream = agent
                 .runner(prompt)
                 .history(messages)
-                .max_turns(MAX_MODEL_ROUNDS)
+                .max_turns(max_model_rounds)
                 .tool_concurrency(1)
                 .stream()
                 .await;
+            let mut has_text = false;
             loop {
                 tokio::select! {
                     biased;
@@ -119,7 +133,10 @@ where
                         let output = match item {
                             Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
                                 StreamedAssistantContent::Text(text),
-                            ))) => Some(AgentOutput::TextDelta(text.text)),
+                            ))) => {
+                                has_text = true;
+                                Some(AgentOutput::TextDelta(text.text))
+                            }
                             Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
                                 StreamedAssistantContent::Reasoning(reasoning),
                             ))) => {
@@ -139,6 +156,26 @@ where
                             Some(Ok(_)) => None,
                             Some(Err(_)) if request.cancellation.is_cancelled() => {
                                 Some(AgentOutput::Cancelled)
+                            }
+                            Some(Err(error))
+                                if matches!(
+                                    &error,
+                                    StreamingError::Prompt(prompt)
+                                        if matches!(
+                                            prompt.as_ref(),
+                                            PromptError::MaxTurnsError { .. }
+                                        )
+                                ) =>
+                            {
+                                // 达到轮次上限是预算约束而不是故障：正常收尾，
+                                // 避免把 MaxTurnsError 原文当作运行失败抛给用户。
+                                if has_text {
+                                    Some(AgentOutput::Completed)
+                                } else {
+                                    Some(AgentOutput::Failed(
+                                        "已达到最大模型轮次上限，未产生有效回复。".to_string(),
+                                    ))
+                                }
                             }
                             Some(Err(error)) => Some(AgentOutput::Failed(error.to_string())),
                             None => Some(AgentOutput::Failed(
@@ -835,6 +872,88 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "echo");
         assert_eq!(calls[0].arguments, r#"{"value":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn max_turns_exhaustion_completes_gracefully_with_partial_text() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = CompositeExecutor::new();
+        executor.register(Box::new(RecordingToolExecutor {
+            calls: calls.clone(),
+        }));
+        // 注入一个很小的轮次预算，每轮都返回工具调用把预算耗尽；
+        // 首轮先输出一段文本，验证有文本时按完成收尾。
+        let budget = 5;
+        let mut turns: Vec<Vec<MockStreamEvent>> = Vec::new();
+        for index in 0..budget {
+            let mut events = Vec::new();
+            if index == 0 {
+                events.push(MockStreamEvent::text("开始分析"));
+            }
+            events.push(MockStreamEvent::tool_call(
+                &format!("call-{index}"),
+                "echo",
+                serde_json::json!({"value": index.to_string()}),
+            ));
+            events.push(MockStreamEvent::final_response_with_default_usage());
+            turns.push(events);
+        }
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let approval_manager = Arc::new(ApprovalManager::new(Arc::new(Mutex::new(Vec::new()))));
+        let backend = RigBackend::with_budget(model.clone(), Arc::new(executor), budget);
+        let request = BackendRunRequest {
+            run_id: Uuid::new_v4(),
+            session: BackendSession {
+                id: Uuid::new_v4(),
+                model: "test-model".to_string(),
+                backend_handle: None,
+            },
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                text: "持续分析".to_string(),
+                ..Default::default()
+            }],
+            workspace_path: Some("/workspace".to_string()),
+            cancellation: CancellationToken::new(),
+            approval_manager: approval_manager.clone(),
+        };
+
+        let mut events = backend.start_run(request).await.unwrap().events;
+        let mut saw_text = false;
+        let mut terminal: Option<AgentOutput> = None;
+        while let Some(event) = events.next().await {
+            if let AgentOutput::TextDelta(_) = &event {
+                saw_text = true;
+            }
+            if let AgentOutput::ApprovalWaiting { approval_id, .. } = &event {
+                let mut responded = approval_manager
+                    .respond(*approval_id, ApprovalDecision::ApproveOnce)
+                    .await;
+                for _ in 0..100 {
+                    if responded {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    responded = approval_manager
+                        .respond(*approval_id, ApprovalDecision::ApproveOnce)
+                        .await;
+                }
+                assert!(responded, "审批请求应在事件发出后完成注册");
+            }
+            if matches!(
+                event,
+                AgentOutput::Completed | AgentOutput::Failed(_) | AgentOutput::Cancelled
+            ) {
+                terminal = Some(event);
+                break;
+            }
+        }
+
+        assert!(saw_text, "首轮文本应被流式输出");
+        // 轮次预算耗尽后按完成收尾，而不是把 MaxTurnsError 原文抛给用户。
+        assert!(matches!(terminal, Some(AgentOutput::Completed)));
+        assert_eq!(model.request_count(), budget);
+        assert_eq!(calls.lock().await.len(), budget);
     }
 
     #[tokio::test]

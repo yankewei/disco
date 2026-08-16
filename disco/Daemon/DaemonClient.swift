@@ -374,8 +374,6 @@ final class DaemonClient {
     }
 
     /// 获取指定项目下的会话列表。
-    ///
-    /// 未接线：尚无 UI 调用（Phase 2 预留）。
     func listSessions(projectID: UUID) async throws -> [DaemonSession] {
         let result = try await request(
             "session/list",
@@ -383,6 +381,16 @@ final class DaemonClient {
             as: DaemonSessionListResult.self
         )
         return result.sessions
+    }
+
+    /// 读取 daemon 中会话的权威消息历史（恢复用）。
+    func listMessages(sessionID: UUID) async throws -> [DaemonSessionMessage] {
+        let result = try await request(
+            "session/messages",
+            params: DaemonSessionMessagesParams(sessionId: sessionID.uuidString),
+            as: DaemonSessionMessagesResult.self
+        )
+        return result.messages
     }
 
     /// 删除一个会话。

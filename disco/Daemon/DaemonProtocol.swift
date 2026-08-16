@@ -233,6 +233,23 @@ struct DaemonSessionListResult: Codable, Sendable {
     let sessions: [DaemonSession]
 }
 
+/// `session/messages` 返回的会话消息（daemon 权威历史）。
+struct DaemonSessionMessage: Codable, Sendable {
+    let id: String
+    let role: String
+    let text: String
+    let createdAt: String
+}
+
+/// `session/messages` 参数与结果。
+struct DaemonSessionMessagesParams: Codable, Sendable {
+    let sessionId: String
+}
+
+struct DaemonSessionMessagesResult: Codable, Sendable {
+    let messages: [DaemonSessionMessage]
+}
+
 /// `session/delete` 参数。
 struct DaemonSessionDeleteParams: Codable, Sendable {
     let sessionId: String

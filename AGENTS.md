@@ -118,7 +118,7 @@ disco/
 
 ### Daemon 侧
 
-- **Agent loop**：多轮模型循环（最多 8 轮，每轮最多 16 个工具调用），支持审批流
+- **Agent loop**：多轮模型循环（最多 24 轮，单次运行最多 64 个工具调用），支持审批流
 - **工具执行**：`CompositeExecutor` 按工具名路由到 `ShellExecutor`、`FileEditExecutor`、`SearchExecutor`
 - **审批流**：`ApprovalManager` 使用 oneshot channel 阻塞等待用户响应，支持 session 级别指纹缓存
 - **Provider trait**：统一的 `ModelProvider` 接口，支持 Responses API 和 Chat Completions API

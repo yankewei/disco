@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, ApprovalRequest, PreparedApproval, tool_approval_request};
 
-const MAX_MODEL_ROUNDS: usize = 8;
-const MAX_TOOL_CALLS: usize = 16;
+const MAX_MODEL_ROUNDS: usize = 24;
+const MAX_TOOL_CALLS: usize = 64;
 
 /// Output events from the agent loop, forwarded to the client via the daemon.
 #[derive(Debug, Clone)]
@@ -486,8 +486,8 @@ mod tests {
 
     #[test]
     fn max_constants() {
-        assert_eq!(MAX_MODEL_ROUNDS, 8);
-        assert_eq!(MAX_TOOL_CALLS, 16);
+        assert_eq!(MAX_MODEL_ROUNDS, 24);
+        assert_eq!(MAX_TOOL_CALLS, 64);
     }
 
     #[tokio::test]

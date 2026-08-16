@@ -212,6 +212,22 @@ final class ConversationStore: ObservableObject {
         daemonRunsEnabled = false
     }
 
+    /// 撤销 daemon 会话注册：会话不再由 daemon 托管，退回直连路径并恢复本地落盘。
+    func revertDaemonRegistration() {
+        daemonSessionID = nil
+        daemonRunsEnabled = false
+        daemonRunID = nil
+        daemonAssistantID = nil
+        notifyMessagesChanged()
+    }
+
+    /// 从 daemon 恢复权威消息（daemon 路径）。
+    /// 调用前需已 enableDaemonRuns，这样本地只保留会话元数据，不重复落盘消息。
+    func restoreMessages(_ restored: [ChatMessage]) {
+        messages = restored
+        notifyMessagesChanged()
+    }
+
     /// daemon 连接中断后结束当前远端运行；已注册会话等待重连，不切换运行来源。
     func handleDaemonDisconnection(_ message: String) {
         disableDaemonRuns()
@@ -939,13 +955,23 @@ final class ConversationStore: ObservableObject {
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled, let self else { return }
             persistenceTask = nil
-            onMessagesChanged(messages, threadID, contextState)
+            notifyMessagesChanged()
         }
     }
 
     private func persistImmediately() {
         persistenceTask?.cancel()
         persistenceTask = nil
-        onMessagesChanged(messages, threadID, contextState)
+        notifyMessagesChanged()
+    }
+
+    /// 持久化回调：daemon 托管会话由 daemon 保存权威历史，本地不再写消息副本，
+    /// 只保留 threadID 与上下文状态等 daemon 没有的元数据。
+    private func notifyMessagesChanged() {
+        onMessagesChanged(
+            daemonSessionID == nil ? messages : [],
+            threadID,
+            contextState
+        )
     }
 }

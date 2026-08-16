@@ -485,19 +485,20 @@ final class CodexAppServerTransport {
     }
 
     /// 加载一个 thread。一个连接可多次调用；同一连接不会重复加载同一个 id。
-    func startThread(model: String, resumeThreadID: String? = nil) async throws -> String {
+    /// - Parameter cwd: 项目工作目录；nil 表示使用 app-server 默认目录（临时对话）。
+    func startThread(model: String, resumeThreadID: String? = nil, cwd: String? = nil) async throws -> String {
         guard isInitialized else { throw CodexAppServerError.notInitialized }
         let response: CodexThreadResponse
         if let resumeThreadID {
             response = try await request(
                 method: "thread/resume",
-                params: CodexThreadResumeParams(threadId: resumeThreadID, model: model),
+                params: CodexThreadResumeParams(threadId: resumeThreadID, model: model, cwd: cwd),
                 result: CodexThreadResponse.self
             )
         } else {
             response = try await request(
                 method: "thread/start",
-                params: CodexThreadStartParams(model: model),
+                params: CodexThreadStartParams(model: model, cwd: cwd),
                 result: CodexThreadResponse.self
             )
         }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - 守护进程进程管理
@@ -48,46 +49,54 @@ final class DaemonProcessManager {
 
     /// 确保守护进程正在运行。
     ///
-    /// 如果守护进程已经在运行（套接字存在且可连接），直接返回。
-    /// 否则查找并启动守护进程二进制文件。
+    /// 优先复用仍在运行且二进制未过期的 daemon（同一路径且未被重新编译替换）；
+    /// 否则停掉旧进程，用当前包里的二进制重新启动。
     func ensureDaemonRunning() async throws {
-        // 检查套接字是否已经存在且可连接
         let socketPath = daemonSocketPath()
         if canConnectToSocket(at: socketPath) {
-            // 守护进程已在运行（可能由其他实例启动）
-            launchedByUs = false
-            return
+            let holders = Self.socketHolderPIDs(
+                lsofOutput: runCommand("/usr/sbin/lsof", ["-U", "-Fn"]),
+                socketPath: socketPath
+            )
+            if holders.isEmpty || holders.contains(where: isCurrentDaemon) {
+                // 找不到占用者（lsof 不可用）或仍是当前 daemon：直接复用
+                launchedByUs = false
+                return
+            }
+            stopProcesses(holders)
         }
 
-        // 查找守护进程二进制
         guard let binaryPath = daemonBinaryPath() else {
             throw DaemonError.daemonNotFound
         }
 
-        // 启动守护进程
         try launchDaemon(binaryPath: binaryPath, socketPath: socketPath)
         launchedByUs = true
 
-        // 等待套接字就绪
         try await waitForSocket(at: socketPath, timeout: .seconds(10))
     }
 
     /// 停止守护进程。
+    ///
+    /// 停掉占用本应用套接字的 daemon（无论是否由本实例启动），
+    /// 确保 App 退出后不留孤儿进程。
     func stopDaemon() {
-        guard launchedByUs, let process, process.isRunning else {
-            // 不是我们启动的，或者已经停止
-            return
-        }
+        let socketPath = daemonSocketPath()
+        let holders = Self.socketHolderPIDs(
+            lsofOutput: runCommand("/usr/sbin/lsof", ["-U", "-Fn"]),
+            socketPath: socketPath
+        )
+        stopProcesses(holders)
 
-        // 尝试优雅关闭（通过套接字发送 shutdown 请求）
-        // Phase 1 简化：直接终止进程
-        process.terminate()
-        process.waitUntilExit()
+        // 兼容：本实例启动的已知子进程
+        if let process, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
         self.process = nil
         launchedByUs = false
 
         // 清理套接字文件
-        let socketPath = daemonSocketPath()
         try? FileManager.default.removeItem(atPath: socketPath)
     }
 
@@ -134,6 +143,120 @@ final class DaemonProcessManager {
         }
 
         return candidates
+    }
+
+    /// 占用给定套接字的进程是否还是当前二进制。
+    ///
+    /// 满足两个条件才算“当前”：可执行文件路径等于本包路径，且二进制没有被替换
+    /// （进程启动时间不早于二进制修改时间）。
+    private func isCurrentDaemon(pid: pid_t) -> Bool {
+        guard let binaryPath = daemonBinaryPath(),
+              let executablePath = Self.daemonExecutablePath(
+                  lsofOutput: runCommand(
+                      "/usr/sbin/lsof",
+                      ["-p", String(pid), "-a", "-d", "txt", "-Fn"]
+                  )
+              ),
+              executablePath == binaryPath,
+              let startTime = Self.processStartTime(
+                  psOutput: runCommand(
+                      "/bin/ps",
+                      ["-p", String(pid), "-o", "lstart="],
+                      environment: ["LC_ALL": "C"]
+                  )
+              ),
+              let binaryMtime = fileModificationTime(at: binaryPath) else {
+            return false
+        }
+        return binaryMtime <= startTime
+    }
+
+    private func fileModificationTime(at path: String) -> Date? {
+        try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date
+    }
+
+    /// 发送 SIGTERM 停止指定进程，2 秒内未退出则升级为 SIGKILL。
+    private func stopProcesses(_ pids: [pid_t]) {
+        for pid in pids {
+            Darwin.kill(pid, SIGTERM)
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if pids.allSatisfy({ Darwin.kill($0, 0) != 0 }) {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        for pid in pids where Darwin.kill(pid, 0) == 0 {
+            Darwin.kill(pid, SIGKILL)
+        }
+    }
+
+    /// 同步执行一条外部命令并返回标准输出；失败返回 nil。
+    private func runCommand(
+        _ executablePath: String,
+        _ arguments: [String],
+        environment: [String: String] = [:]
+    ) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        var env = ProcessInfo.processInfo.environment
+        for (key, value) in environment {
+            env[key] = value
+        }
+        process.environment = env
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// 从 `lsof -U -Fn` 输出解析占用指定套接字的进程 PID。
+    static func socketHolderPIDs(lsofOutput: String?, socketPath: String) -> [pid_t] {
+        guard let lsofOutput else { return [] }
+        var pids: [pid_t] = []
+        var currentPID: pid_t?
+        for line in lsofOutput.split(separator: "\n") {
+            if line.hasPrefix("p"), let pid = pid_t(line.dropFirst()) {
+                currentPID = pid
+            } else if line.hasPrefix("n"), let pid = currentPID,
+                      String(line.dropFirst()) == socketPath {
+                if !pids.contains(pid) {
+                    pids.append(pid)
+                }
+            }
+        }
+        return pids
+    }
+
+    /// 从 `lsof -p <pid> -a -d txt -Fn` 输出解析 daemon 可执行文件路径。
+    static func daemonExecutablePath(lsofOutput: String?) -> String? {
+        guard let lsofOutput else { return nil }
+        for line in lsofOutput.split(separator: "\n") where line.hasPrefix("n") {
+            let path = String(line.dropFirst())
+            if path.contains("disco-daemon") {
+                return path
+            }
+        }
+        return nil
+    }
+
+    /// 从 `ps -p <pid> -o lstart=` 输出解析进程启动时间（LC_ALL=C 格式）。
+    static func processStartTime(psOutput: String?) -> Date? {
+        guard let psOutput else { return nil }
+        let text = psOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return formatter.date(from: text)
     }
 
     /// 启动守护进程子进程。

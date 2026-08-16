@@ -547,6 +547,47 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(store.runState, .idle)
     }
 
+    /// daemon 托管会话：消息由 daemon 保存，本地持久化回调不再收到消息副本。
+    func testDaemonOwnedConversationSkipsLocalMessageCopies() {
+        let probe = PersistenceProbe()
+        let store = ConversationStore(
+            messages: [ChatMessage(role: .user, text: "旧消息")],
+            onMessagesChanged: { messages, _, _ in
+                probe.messages = messages
+            }
+        )
+
+        store.enableDaemonRuns(sessionID: UUID())
+        store.restoreMessages([ChatMessage(role: .user, text: "daemon 历史")])
+
+        XCTAssertEqual(store.messages.map(\.text), ["daemon 历史"])
+        XCTAssertTrue(probe.messages.isEmpty, "daemon 托管会话不应落盘消息副本")
+    }
+
+    /// 撤销 daemon 注册后，会话退回直连路径并恢复本地落盘。
+    func testRevertDaemonRegistrationRestoresLocalPersistence() {
+        let probe = PersistenceProbe()
+        let store = ConversationStore(
+            messages: [],
+            onMessagesChanged: { messages, threadID, _ in
+                probe.messages = messages
+                probe.threadID = threadID
+            }
+        )
+
+        store.enableDaemonRuns(sessionID: UUID())
+        store.restoreMessages([ChatMessage(role: .user, text: "daemon 历史")])
+        XCTAssertTrue(probe.messages.isEmpty)
+
+        store.revertDaemonRegistration()
+        XCTAssertFalse(store.hasDaemonSession)
+        XCTAssertEqual(probe.messages.map(\.text), ["daemon 历史"])
+
+        store.updateThreadID("thr_1")
+        XCTAssertEqual(probe.messages.map(\.text), ["daemon 历史"])
+        XCTAssertEqual(probe.threadID, "thr_1")
+    }
+
     private func waitUntil(
         _ store: ConversationStore,
         condition: (ConversationStore) -> Bool
@@ -633,6 +674,12 @@ private actor StreamRecorder {
     func record(_ messages: [ChatMessage]) {
         self.messages = messages
     }
+}
+
+/// 捕获持久化回调的轻量探针（@MainActor 测试内同步使用）。
+private final class PersistenceProbe {
+    var messages: [ChatMessage] = []
+    var threadID: String?
 }
 
 private struct RecordingProvider: ModelProvider {

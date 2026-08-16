@@ -19,15 +19,19 @@ final class CodexRuntime: AgentRuntime {
         let reasoningEffort: String?
         /// 续接的 codex 会话线程 id（nil 表示新建线程）；来自会话持久化
         let resumeThreadID: String?
+        /// 会话创建时锁定的项目工作目录；临时对话为 nil，线程以 app-server 默认目录运行。
+        let cwd: String?
 
         init(
             model: String,
             reasoningEffort: String? = nil,
-            resumeThreadID: String?
+            resumeThreadID: String?,
+            cwd: String? = nil
         ) {
             self.model = model
             self.reasoningEffort = reasoningEffort
             self.resumeThreadID = resumeThreadID
+            self.cwd = cwd
         }
     }
 
@@ -248,7 +252,8 @@ final class CodexRuntime: AgentRuntime {
         if threadConnectionGeneration != transport.connectionGeneration {
             let resolved = try await transport.startThread(
                 model: configuration.model,
-                resumeThreadID: threadID ?? configuration.resumeThreadID
+                resumeThreadID: threadID ?? configuration.resumeThreadID,
+                cwd: configuration.cwd
             )
             threadID = resolved
             threadConnectionGeneration = transport.connectionGeneration

@@ -28,8 +28,8 @@ final class GenericAgentRuntime: AgentRuntime {
             hostedTools: Set<HostedToolKind> = [],
             userInputEnabled: Bool = false,
             workspace: WorkspaceContext? = nil,
-            maximumModelRounds: Int = 8,
-            maximumToolCalls: Int = 16,
+            maximumModelRounds: Int = 24,
+            maximumToolCalls: Int = 64,
             contextWindow: Int? = nil
         ) {
             self.model = model
@@ -299,6 +299,11 @@ final class GenericAgentRuntime: AgentRuntime {
             var toolCallCount = 0
             var committedToolCallIDs = Set<String>()
             var hasAnyText = false
+            var instructions = ContextCompactor.runtimeInstructions
+            if let workspace = configuration.workspace {
+                instructions +=
+                    "\n工作目录：\(workspace.rootURL.path)。本地文件与 shell 工具的默认根目录。"
+            }
             while true {
                 try Task.checkCancellation()
                 guard modelRoundCount < configuration.maximumModelRounds else {
@@ -330,7 +335,7 @@ final class GenericAgentRuntime: AgentRuntime {
                 var modelCompletion: ModelCompletion?
                 do {
                     let stream = provider.stream(request: ModelRequest(
-                        instructions: ContextCompactor.runtimeInstructions,
+                        instructions: instructions,
                         messages: input,
                         model: configuration.model,
                         reasoningEnabled: configuration.reasoningEnabled,

@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -77,6 +78,8 @@ final class AppState: ObservableObject {
     let daemonClient = DaemonClient()
     /// 守护进程进程管理器（启动/停止 daemon 二进制）。
     let daemonProcessManager = DaemonProcessManager()
+    /// App 退出时停止 daemon 的观察者，避免留下孤儿进程。
+    private var daemonTerminationObserver: NSObjectProtocol?
     /// 守护进程连接状态（供 UI 观察）。
     @Published private(set) var daemonConnectionState: DaemonClient.State = .disconnected
     /// 守护进程是否可用（已连接并完成初始化握手）。
@@ -243,8 +246,28 @@ final class AppState: ObservableObject {
             refreshRuntimes(stopActiveStreams: true)
         }
 
-        // Phase 1：启动守护进程连接（异步，不阻塞 UI）
-        Task { await startDaemonIfNeeded() }
+        // 测试环境不触碰真实 daemon：跳过启动与退出清理
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            // App 退出时停止 daemon，避免留下孤儿进程
+            daemonTerminationObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.stopDaemon()
+                }
+            }
+
+            // Phase 1：启动守护进程连接（异步，不阻塞 UI）
+            Task { await startDaemonIfNeeded() }
+        }
+    }
+
+    deinit {
+        if let daemonTerminationObserver {
+            NotificationCenter.default.removeObserver(daemonTerminationObserver)
+        }
     }
 
     // MARK: - 多服务商配置
@@ -963,7 +986,8 @@ final class AppState: ObservableObject {
                 configuration: CodexRuntime.Configuration(
                     model: config.model,
                     reasoningEffort: selectedReasoningEffort(for: vendor),
-                    resumeThreadID: store.threadID
+                    resumeThreadID: store.threadID,
+                    cwd: workspace?.rootURL.path
                 ),
                 onThreadReady: { threadID in
                     // 线程就绪（新建或续接）：写回会话并触发持久化
@@ -1180,17 +1204,19 @@ final class AppState: ObservableObject {
     }
 
     private func synchronizeDaemonConversations() async {
-        for conversation in conversations
-        where conversation.store.hasDaemonSession
-            || (conversation.projectID != nil && conversation.store.messages.isEmpty) {
+        // 所有项目会话都尝试与 daemon 对齐：已有 daemon 会话的恢复权威历史，
+        // 没有的新建会话；本地有历史但 daemon 从未注册过的保持直连路径。
+        for conversation in conversations where conversation.projectID != nil {
             await registerDaemonConversation(conversation)
         }
     }
 
-    /// 注册尚未开始的 Project 会话，或在断线后恢复本次进程已知的 daemon 会话。
+    /// 对齐项目会话与 daemon：注册缺失的会话，并把 daemon 的权威历史恢复到本地。
+    ///
+    /// daemon 可用时项目会话由 daemon 保存消息（单写），本地只保留会话元数据；
+    /// 本地有历史但 daemon 从未注册过（如直连期会话）保持直连路径，不丢上下文。
     private func registerDaemonConversation(_ conversation: ConversationSession) async {
         guard useDaemon,
-              conversation.store.hasDaemonSession || conversation.store.messages.isEmpty,
               let projectID = conversation.projectID,
               let project = projects.first(where: { $0.id == projectID }),
               case let .available(workspace) = projectAvailability[projectID],
@@ -1217,21 +1243,44 @@ final class AppState: ObservableObject {
             guard let daemonProjectID = UUID(uuidString: daemonProject.id) else {
                 throw DaemonError.invalidResponse("session/project/create 返回了无效的项目 ID。")
             }
-            let session = try await daemonClient.createSession(
-                sessionID: conversation.id,
-                projectID: daemonProjectID,
-                providerID: vendor.daemonProviderID,
-                vendor: vendor.daemonVendor,
-                model: config.model
-            )
-            guard UUID(uuidString: session.id) == conversation.id else {
-                throw DaemonError.invalidResponse("session/create 未保留客户端会话 ID。")
+            let existingSessions = try await daemonClient.listSessions(projectID: daemonProjectID)
+            let hasDaemonSession = existingSessions.contains {
+                $0.id == conversation.id.uuidString
+            }
+            if !hasDaemonSession {
+                // 本地有历史但 daemon 从未注册过：保持直连路径，避免创建空会话丢上下文。
+                guard conversation.store.messages.isEmpty else {
+                    conversation.store.revertDaemonRegistration()
+                    return
+                }
+                _ = try await daemonClient.createSession(
+                    sessionID: conversation.id,
+                    projectID: daemonProjectID,
+                    providerID: vendor.daemonProviderID,
+                    vendor: vendor.daemonVendor,
+                    model: config.model
+                )
             }
             guard conversations.contains(where: { $0.id == conversation.id }) else {
                 try? await daemonClient.deleteSession(sessionID: conversation.id)
                 return
             }
-            conversation.store.enableDaemonRuns(sessionID: conversation.id)
+
+            let storedMessages = (try? await daemonClient.listMessages(
+                sessionID: conversation.id
+            )) ?? []
+            if !storedMessages.isEmpty || conversation.store.messages.isEmpty {
+                conversation.store.enableDaemonRuns(sessionID: conversation.id)
+                if !storedMessages.isEmpty {
+                    conversation.store.restoreMessages(storedMessages.map { message in
+                        ChatMessage(
+                            id: UUID(uuidString: message.id) ?? UUID(),
+                            role: message.role == "user" ? .user : .assistant,
+                            text: message.text
+                        )
+                    })
+                }
+            }
         } catch {
             conversation.store.disableDaemonRuns()
         }
