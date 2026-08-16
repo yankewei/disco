@@ -177,6 +177,7 @@ struct DaemonRunCancelResult: Decodable, Sendable {}
 
 /// 配置一个服务商（API Key、Base URL、模型等）。
 struct DaemonProviderConfigureParams: Codable, Sendable {
+    let providerId: String
     let vendor: String
     let baseUrl: String
     let apiKey: String
@@ -186,6 +187,7 @@ struct DaemonProviderConfigureParams: Codable, Sendable {
 
 /// 守护进程返回的服务商条目（不含 API Key 明文）。
 struct DaemonProviderEntry: Codable, Sendable {
+    let providerId: String
     let vendor: String
     let baseUrl: String
     let model: String
@@ -197,10 +199,12 @@ struct DaemonProviderListResult: Codable, Sendable {
     let providers: [DaemonProviderEntry]
 }
 
-// MARK: - 会话管理（Phase 2）
+// MARK: - 会话管理
 
 struct DaemonSessionCreateParams: Codable, Sendable {
+    let sessionId: String
     let projectId: String
+    let providerId: String
     let vendor: String
     let model: String
 }
@@ -208,11 +212,16 @@ struct DaemonSessionCreateParams: Codable, Sendable {
 struct DaemonSession: Codable, Sendable {
     let id: String
     let projectId: String
+    let providerId: String
     let vendor: String
     let model: String
     let createdAt: String
     let updatedAt: String
     let title: String?
+}
+
+struct DaemonSessionCreateResult: Codable, Sendable {
+    let session: DaemonSession
 }
 
 /// `session/list` 返回结果。
@@ -229,9 +238,10 @@ struct DaemonSessionDeleteParams: Codable, Sendable {
     let sessionId: String
 }
 
-// MARK: - 项目管理（Phase 2）
+// MARK: - 项目管理
 
 struct DaemonProjectCreateParams: Codable, Sendable {
+    let projectId: String
     let name: String
     let path: String
 }
@@ -243,12 +253,16 @@ struct DaemonProject: Codable, Sendable {
     let createdAt: String
 }
 
+struct DaemonProjectCreateResult: Codable, Sendable {
+    let project: DaemonProject
+}
+
 /// `project/list` 返回结果。
 struct DaemonProjectListResult: Codable, Sendable {
     let projects: [DaemonProject]
 }
 
-// MARK: - 事件数据类型（Phase 2）
+// MARK: - 事件数据类型
 
 /// `message.delta` 事件数据：文本内容增量。
 struct DaemonMessageDeltaData: Codable, Sendable {
@@ -349,7 +363,7 @@ struct DaemonRunCompactParams: Codable, Sendable {
     let sessionId: String
 }
 
-// MARK: - 工具执行事件（Phase 3）
+// MARK: - 工具执行事件
 
 /// `tool.started` 事件数据：工具即将开始执行。
 struct DaemonToolStartedData: Codable, Sendable {
@@ -369,7 +383,7 @@ struct DaemonToolCompletedData: Codable, Sendable {
     let output: String
 }
 
-// MARK: - 审批事件（Phase 3）
+// MARK: - 审批事件
 
 /// `approval.requested` 事件数据：Agent 需要用户确认后才能执行工具。
 struct DaemonApprovalRequestedData: Codable, Sendable {
@@ -407,11 +421,12 @@ struct DaemonApprovalImpact: Codable, Sendable {
 /// `approval.resolved` 事件数据：审批已处理。
 struct DaemonApprovalResolvedData: Codable, Sendable {
     let runId: String
+    let sessionId: String
     let approvalId: String
     let decision: String
 }
 
-// MARK: - 审批请求（Phase 3）
+// MARK: - 审批请求
 
 /// `run/approve` 参数：响应用户审批决定。
 struct DaemonRunApproveParams: Codable, Sendable {
@@ -438,6 +453,22 @@ struct DaemonEvent: Sendable, Equatable {
     /// 解析为具体类型。
     func decoded<T: Decodable>(as type: T.Type = T.self) throws -> T {
         try data.decoded(as: type)
+    }
+
+    var sessionID: UUID? {
+        guard let fields = data.objectValue,
+              let value = (fields["sessionId"] ?? fields["session_id"])?.stringValue else {
+            return nil
+        }
+        return UUID(uuidString: value)
+    }
+
+    var runID: UUID? {
+        guard let fields = data.objectValue,
+              let value = (fields["runId"] ?? fields["run_id"])?.stringValue else {
+            return nil
+        }
+        return UUID(uuidString: value)
     }
 }
 

@@ -14,7 +14,26 @@ impl Database {
         model: &str,
         title: Option<&str>,
     ) -> Result<Session> {
-        let id = Uuid::new_v4();
+        self.create_session_with_id(
+            Uuid::new_v4(),
+            project_id,
+            provider_id,
+            vendor,
+            model,
+            title,
+        )
+    }
+
+    /// 使用调用方提供的稳定 Disco session ID 创建会话。
+    pub fn create_session_with_id(
+        &self,
+        id: Uuid,
+        project_id: Uuid,
+        provider_id: ProviderId,
+        vendor: Vendor,
+        model: &str,
+        title: Option<&str>,
+    ) -> Result<Session> {
         let now = Self::now_iso8601();
         let vendor_str = serde_json::to_string(&vendor)
             .context("Failed to serialize vendor")?

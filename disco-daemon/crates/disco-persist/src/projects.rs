@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use disco_protocol::types::Project;
+use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use crate::Database;
@@ -7,7 +8,11 @@ use crate::Database;
 impl Database {
     /// Create a new project and persist it.
     pub fn create_project(&self, name: &str, path: &str) -> Result<Project> {
-        let id = Uuid::new_v4();
+        self.create_project_with_id(Uuid::new_v4(), name, path)
+    }
+
+    /// 使用调用方提供的稳定 ID 创建项目。
+    pub fn create_project_with_id(&self, id: Uuid, name: &str, path: &str) -> Result<Project> {
         let created_at = Self::now_iso8601();
 
         let conn = self.conn.lock().unwrap();
@@ -23,6 +28,26 @@ impl Database {
             path: path.to_string(),
             created_at,
         })
+    }
+
+    /// 按持久化路径查找项目。
+    pub fn get_project_by_path(&self, path: &str) -> Result<Option<Project>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, path, created_at FROM projects WHERE path = ?1",
+            rusqlite::params![path],
+            |row| {
+                let id: String = row.get(0)?;
+                Ok(Project {
+                    id: Uuid::parse_str(&id).unwrap_or(Uuid::nil()),
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to query project by path")
     }
 
     /// Get a single project by ID.

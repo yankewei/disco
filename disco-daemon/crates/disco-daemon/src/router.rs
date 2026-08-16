@@ -439,6 +439,7 @@ async fn handle_run_start(req: &Request, app: &Arc<AppState>, out_tx: &Sender<St
                         &out_tx_clone,
                         &Event::approval_resolved(ApprovalResolvedData {
                             run_id,
+                            session_id,
                             approval_id,
                             decision,
                         }),
@@ -653,7 +654,30 @@ fn handle_session_create(req: &Request, app: &Arc<AppState>) -> Response {
         Ok(provider_id) => provider_id,
         Err(error) => return error_response(req.id, error),
     };
-    match app.db.create_session(
+    if let Some(session_id) = params.session_id {
+        match app.db.get_session(session_id) {
+            Ok(Some(session))
+                if session.project_id == params.project_id
+                    && session.provider_id == provider_id
+                    && session.vendor == params.vendor
+                    && session.model == params.model =>
+            {
+                return success_response(req.id, SessionCreateResult { session });
+            }
+            Ok(Some(_)) => {
+                return error_response(
+                    req.id,
+                    RpcError::invalid_params("会话 ID 已绑定到不同的项目或 Provider"),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return error_response(req.id, RpcError::internal(&error.to_string()));
+            }
+        }
+    }
+    match app.db.create_session_with_id(
+        params.session_id.unwrap_or_else(Uuid::new_v4),
         params.project_id,
         provider_id,
         params.vendor,
@@ -748,7 +772,18 @@ fn handle_session_project_create(req: &Request, app: &Arc<AppState>) -> Response
         Err(e) => return error_response(req.id, RpcError::invalid_params(&e.to_string())),
     };
 
-    match app.db.create_project(&params.name, &params.path) {
+    match app.db.get_project_by_path(&params.path) {
+        Ok(Some(project)) => {
+            return success_response(req.id, SessionProjectCreateResult { project });
+        }
+        Ok(None) => {}
+        Err(error) => return error_response(req.id, RpcError::internal(&error.to_string())),
+    }
+    match app.db.create_project_with_id(
+        params.project_id.unwrap_or_else(Uuid::new_v4),
+        &params.name,
+        &params.path,
+    ) {
         Ok(project) => success_response(req.id, SessionProjectCreateResult { project }),
         Err(e) => error_response(req.id, RpcError::internal(&e.to_string())),
     }
@@ -1120,11 +1155,13 @@ mod tests {
     #[test]
     fn test_session_project_create_and_list() {
         let app = make_test_app();
+        let project_id = Uuid::new_v4();
 
         let req = Request {
             id: 1,
             method: "session/project/create".to_string(),
             params: serde_json::to_value(SessionProjectCreateParams {
+                project_id: Some(project_id),
                 name: "Test Project".to_string(),
                 path: "/tmp/test-project".to_string(),
             })
@@ -1135,7 +1172,12 @@ mod tests {
         assert!(resp.error.is_none());
         let result: SessionProjectCreateResult =
             serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.project.id, project_id);
         assert_eq!(result.project.name, "Test Project");
+        let repeated = handle_session_project_create(&req, &app);
+        let repeated: SessionProjectCreateResult =
+            serde_json::from_value(repeated.result.unwrap()).unwrap();
+        assert_eq!(repeated.project.id, project_id);
 
         let req = Request {
             id: 2,
@@ -1153,11 +1195,13 @@ mod tests {
     fn test_session_create_and_list() {
         let app = make_test_app();
         let project = app.db.create_project("Test", "/tmp/test").unwrap();
+        let session_id = Uuid::new_v4();
 
         let req = Request {
             id: 1,
             method: "session/create".to_string(),
             params: serde_json::to_value(SessionCreateParams {
+                session_id: Some(session_id),
                 project_id: project.id,
                 provider_id: None,
                 vendor: Vendor::Openai,
@@ -1169,8 +1213,13 @@ mod tests {
         let resp = handle_session_create(&req, &app);
         assert!(resp.error.is_none());
         let result: SessionCreateResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.session.id, session_id);
         assert_eq!(result.session.model, "gpt-4");
         assert_eq!(result.session.provider_id.as_str(), "openai_api");
+        let repeated = handle_session_create(&req, &app);
+        let repeated: SessionCreateResult =
+            serde_json::from_value(repeated.result.unwrap()).unwrap();
+        assert_eq!(repeated.session.id, session_id);
 
         let req = Request {
             id: 2,

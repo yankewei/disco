@@ -408,11 +408,15 @@ Provider，不共享会话或配置。
   "id": 9,
   "method": "session/project/create",
   "params": {
+    "projectID": "proj_456",
     "name": "my-project",
     "path": "/Users/dev/projects/my-project"
   }
 }
 ```
+
+`projectID` 可选。客户端可提供稳定 ID；相同路径已存在时，daemon 返回已有项目，
+因此该请求可安全重试。
 
 **响应**：
 
@@ -479,6 +483,7 @@ Provider，不共享会话或配置。
   "id": 11,
   "method": "session/create",
   "params": {
+    "sessionID": "sess_abc",
     "projectID": "proj_123",
     "providerID": "deepseek_api",
     "vendor": "deepseek",
@@ -506,7 +511,9 @@ Provider，不共享会话或配置。
 ```
 
 会话创建后 `providerID` 不可变。切换 Provider 需要创建新会话。旧客户端可以在
-`session/create` 中省略该字段，daemon 会从 `vendor` 映射到默认 Provider。
+`session/create` 中省略 `providerID`，daemon 会从 `vendor` 映射到默认 Provider。
+`sessionID` 也可省略；客户端提供稳定 ID 时，相同会话参数的重复请求返回已有会话，
+参数不一致则返回 `invalid_params`。
 
 #### `session/delete`
 
@@ -854,6 +861,7 @@ Provider，不共享会话或配置。
   "event": "approval.resolved",
   "data": {
     "runID": "run_def",
+    "sessionID": "sess_abc",
     "approvalID": "appr_xyz",
     "decision": "approve_once"
   }

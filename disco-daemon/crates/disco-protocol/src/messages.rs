@@ -130,6 +130,8 @@ pub struct SessionProjectsResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionProjectCreateParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
     pub name: String,
     pub path: String,
 }
@@ -155,6 +157,8 @@ pub struct SessionListResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCreateParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
     pub project_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<ProviderId>,
@@ -360,6 +364,7 @@ pub struct ApprovalRequestedData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalResolvedData {
     pub run_id: Uuid,
+    pub session_id: Uuid,
     pub approval_id: Uuid,
     pub decision: ApprovalDecision,
 }

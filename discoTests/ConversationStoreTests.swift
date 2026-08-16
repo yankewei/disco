@@ -377,6 +377,176 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.threadID)
     }
 
+    func testDaemonRunStreamsIntoTheConversationAndCompletes() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "  通过 daemon 运行  "
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(client.startedRuns.first?.sessionID, sessionID)
+        XCTAssertEqual(client.startedRuns.first?.text, "通过 daemon 运行")
+
+        store.handleDaemonNotification(daemonEvent(
+            "message.delta",
+            runID: runID,
+            sessionID: sessionID,
+            fields: ["delta": .string("daemon 回答")]
+        ))
+        store.handleDaemonNotification(daemonEvent(
+            "run.completed",
+            runID: runID,
+            sessionID: sessionID
+        ))
+
+        XCTAssertEqual(store.messages.map(\.text), ["通过 daemon 运行", "daemon 回答"])
+        XCTAssertEqual(store.runState, .completed)
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    func testCancellingADaemonRunUsesTheDaemonRunID() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "停止"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        store.stop()
+        for _ in 0..<100 where client.cancelledRunIDs.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(client.cancelledRunIDs, [runID])
+        XCTAssertEqual(store.runState, .cancelling)
+        store.handleDaemonNotification(daemonEvent(
+            "run.cancelled",
+            runID: runID,
+            sessionID: sessionID
+        ))
+        XCTAssertEqual(store.runState, .cancelled)
+        XCTAssertFalse(store.isStreaming)
+    }
+
+    func testDaemonApprovalIsDisplayedAndSubmitted() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let approvalID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "执行需要审批的操作"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        store.handleDaemonNotification(daemonEvent(
+            "approval.requested",
+            runID: runID,
+            sessionID: sessionID,
+            fields: [
+                "approvalId": .string(approvalID.uuidString),
+                "kind": .string("command"),
+                "title": .string("执行命令"),
+                "reason": .string("需要修改工作区"),
+                "impact": .object([
+                    "type": .string("command"),
+                    "executable": .string("git"),
+                    "arguments": .array([.string("status")]),
+                ]),
+                "fingerprint": .string("command:git-status"),
+                "allowsSessionApproval": .boolean(true),
+            ]
+        ))
+
+        XCTAssertEqual(store.pendingApproval?.approvalId, approvalID.uuidString)
+        XCTAssertEqual(store.runState, .waitingForApproval)
+
+        store.respondToApproval(decision: "approve_once")
+        for _ in 0..<100 where client.approvals.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(client.approvals.first?.0, approvalID)
+        XCTAssertEqual(client.approvals.first?.1, "approve_once")
+        XCTAssertNil(store.pendingApproval)
+
+        store.handleDaemonNotification(daemonEvent(
+            "run.completed",
+            runID: runID,
+            sessionID: sessionID
+        ))
+    }
+
+    func testDaemonDisconnectionFailsTheActiveRun() async throws {
+        let client = RecordingDiscoDaemonClient(runID: UUID())
+        let store = ConversationStore()
+        store.configure(runtime: GenericAgentRuntime(
+            provider: NeverEndingProvider(),
+            configuration: .init(model: "fallback-model", reasoningEnabled: false)
+        ))
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: UUID())
+        store.draft = "等待 daemon"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        store.handleDaemonDisconnection("daemon 连接已中断。")
+
+        XCTAssertEqual(store.runState, .failed)
+        XCTAssertEqual(store.errorMessage, "daemon 连接已中断。")
+        XCTAssertEqual(store.messages.map(\.text), ["等待 daemon"])
+        XCTAssertFalse(store.isStreaming)
+        XCTAssertFalse(store.hasRuntime)
+    }
+
+    func testClearingAnActiveDaemonConversationDeletesItAfterCancellation() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "随后清空"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        store.clear()
+
+        XCTAssertEqual(store.runState, .cancelling)
+        XCTAssertEqual(store.messages.map(\.text), ["随后清空", ""])
+        XCTAssertTrue(client.deletedSessionIDs.isEmpty)
+
+        store.handleDaemonNotification(daemonEvent(
+            "run.cancelled",
+            runID: runID,
+            sessionID: sessionID
+        ))
+        for _ in 0..<100 where client.deletedSessionIDs.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(client.deletedSessionIDs, [sessionID])
+        XCTAssertTrue(store.messages.isEmpty)
+        XCTAssertEqual(store.runState, .idle)
+    }
+
     private func waitUntil(
         _ store: ConversationStore,
         condition: (ConversationStore) -> Bool
@@ -386,6 +556,60 @@ final class ConversationStoreTests: XCTestCase {
         }
         XCTAssertTrue(condition(store))
     }
+}
+
+@MainActor
+private final class RecordingDiscoDaemonClient: DiscoDaemonClient {
+    struct StartedRun: Equatable {
+        let sessionID: UUID
+        let text: String
+    }
+
+    let runID: UUID
+    private(set) var startedRuns: [StartedRun] = []
+    private(set) var cancelledRunIDs: [UUID] = []
+    private(set) var approvals: [(UUID, String)] = []
+    private(set) var deletedSessionIDs: [UUID] = []
+
+    init(runID: UUID) {
+        self.runID = runID
+    }
+
+    func events() -> AsyncThrowingStream<DaemonEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
+    func startRun(sessionID: UUID, text: String) async throws -> UUID {
+        startedRuns.append(StartedRun(sessionID: sessionID, text: text))
+        return runID
+    }
+
+    func cancelRun(runID: UUID) async throws {
+        cancelledRunIDs.append(runID)
+    }
+
+    func approve(approvalID: UUID, decision: String) async throws {
+        approvals.append((approvalID, decision))
+    }
+
+    func deleteSession(sessionID: UUID) async throws {
+        deletedSessionIDs.append(sessionID)
+    }
+}
+
+private func daemonEvent(
+    _ name: String,
+    runID: UUID,
+    sessionID: UUID,
+    fields: [String: DaemonJSONValue] = [:]
+) -> DaemonEvent {
+    DaemonEvent(
+        eventName: name,
+        data: .object(fields.merging([
+            "runId": .string(runID.uuidString),
+            "sessionId": .string(sessionID.uuidString),
+        ]) { current, _ in current })
+    )
 }
 
 /// 等待一次运行结束。

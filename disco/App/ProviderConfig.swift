@@ -15,6 +15,29 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// 迁移期 DAP 使用的 Rust Vendor wire value。
+    var daemonVendor: String {
+        switch self {
+        case .deepseek: "deepseek"
+        case .openai: "openai"
+        case .moonshot: "moonshot_kimi"
+        case .kimiCode: "kimi_code"
+        case .zhipu: "glm"
+        case .chatgpt: "codex"
+        case .anthropic: "anthropic"
+        case .gemini: "gemini"
+        }
+    }
+
+    /// 会话创建后固定使用的 daemon Provider profile。
+    var daemonProviderID: String {
+        switch self {
+        case .openai: "codex_api"
+        case .chatgpt: "codex_app_server"
+        default: "\(daemonVendor)_api"
+        }
+    }
+
     var title: String {
         switch self {
         case .deepseek: "DeepSeek"
