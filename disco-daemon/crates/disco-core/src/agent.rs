@@ -242,22 +242,29 @@ impl AgentLoop {
                         })
                         .await;
 
-                    // Request approval
-                    let decision = request_tool_approval(
-                        &approval_manager,
-                        &tx,
-                        run_id,
-                        name,
-                        arguments,
-                    )
-                    .await;
+                    // 等待审批时仍必须响应取消，不能把取消误判为用户拒绝。
+                    let (approval_id, decision) = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = tx.send(AgentOutput::Cancelled).await;
+                            return;
+                        }
+                        decision = request_tool_approval(
+                            &approval_manager,
+                            &tx,
+                            run_id,
+                            name,
+                            arguments,
+                        ) => decision,
+                    };
 
                     // Send approval resolved event
-                    let _ = tx.send(AgentOutput::ApprovalResolved {
-                        approval_id: Uuid::new_v4(),
-                        decision,
-                    })
-                    .await;
+                    let _ = tx
+                        .send(AgentOutput::ApprovalResolved {
+                            approval_id,
+                            decision,
+                        })
+                        .await;
 
                     let output = if decision == ApprovalDecision::Decline {
                         "Tool execution declined by user".to_string()
@@ -268,7 +275,17 @@ impl AgentLoop {
                             name: name.clone(),
                             arguments: arguments.clone(),
                         };
-                        match executor.execute(&tool_call, &tool_context).await {
+                        let execution = executor.execute(&tool_call, &tool_context);
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                executor.cancel(run_id).await;
+                                let _ = tx.send(AgentOutput::Cancelled).await;
+                                return;
+                            }
+                            result = execution => result,
+                        };
+                        match result {
                             Ok(result) => result.output,
                             Err(e) => format!("Error: {e}"),
                         }
@@ -312,7 +329,7 @@ async fn request_tool_approval(
     run_id: Uuid,
     tool_name: &str,
     arguments: &str,
-) -> ApprovalDecision {
+) -> (Uuid, ApprovalDecision) {
     let approval_id = Uuid::new_v4();
     let fingerprint = make_fingerprint(tool_name, arguments);
     let impact = impact_from_tool_call(tool_name, arguments);
@@ -348,7 +365,7 @@ async fn request_tool_approval(
         .await;
 
     // Block until the user responds
-    manager.request_approval(&request).await
+    (approval_id, manager.request_approval(&request).await)
 }
 
 fn accumulate_usage(prev: &Option<TokenUsage>, current: &TokenUsage) -> TokenUsage {
@@ -376,7 +393,36 @@ fn accumulate_usage(prev: &Option<TokenUsage>, current: &TokenUsage) -> TokenUsa
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+
+    use disco_tools::ToolDefinition;
+
     use super::*;
+
+    struct ToolCallingProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ToolCallingProvider {
+        fn vendor_name(&self) -> &'static str {
+            "test"
+        }
+
+        async fn stream<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: Option<&'a [ToolDefinition]>,
+        ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<ProviderEvent>> + Send + 'a>>>
+        {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(ProviderEvent::ToolCallCompleted {
+                    call_id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"sleep 30"}"#.to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ])))
+        }
+    }
 
     #[test]
     fn agent_output_variants() {
@@ -451,5 +497,45 @@ mod tests {
     fn max_constants() {
         assert_eq!(MAX_MODEL_ROUNDS, 8);
         assert_eq!(MAX_TOOL_CALLS, 16);
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_waiting_for_approval_emits_cancelled() {
+        let cancellation = CancellationToken::new();
+        let approval_manager = Arc::new(ApprovalManager::new(Arc::new(tokio::sync::Mutex::new(
+            Vec::new(),
+        ))));
+        let agent = AgentLoop::new(
+            Arc::new(ToolCallingProvider),
+            Arc::new(CompositeExecutor::new()),
+            approval_manager,
+        );
+        let mut output = agent
+            .run(
+                vec![ChatMessage {
+                    role: "user".to_string(),
+                    text: "test".to_string(),
+                    ..Default::default()
+                }],
+                cancellation.clone(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+            )
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(event) = output.next().await {
+                match event {
+                    AgentOutput::ApprovalWaiting { .. } => cancellation.cancel(),
+                    AgentOutput::Cancelled => return,
+                    AgentOutput::Completed => panic!("取消不应该被当成正常完成"),
+                    _ => {}
+                }
+            }
+            panic!("运行结束前未发送 cancelled 事件");
+        })
+        .await
+        .expect("等待 cancelled 事件超时");
     }
 }

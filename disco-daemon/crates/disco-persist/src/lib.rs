@@ -71,6 +71,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(id),
+                provider_id TEXT NOT NULL,
                 vendor TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
@@ -94,9 +95,71 @@ impl Database {
                 thinking_enabled INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS provider_profiles (
+                id TEXT PRIMARY KEY,
+                vendor TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                model TEXT NOT NULL,
+                thinking_enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            INSERT OR IGNORE INTO provider_profiles
+                (id, vendor, base_url, api_key, model, thinking_enabled, updated_at)
+            SELECT
+                CASE vendor
+                    WHEN 'openai' THEN 'openai_api'
+                    WHEN 'deepseek' THEN 'deepseek_api'
+                    WHEN 'moonshot_kimi' THEN 'moonshot_kimi_api'
+                    WHEN 'kimi_code' THEN 'kimi_code_api'
+                    WHEN 'glm' THEN 'glm_api'
+                    WHEN 'codex' THEN 'codex_app_server'
+                END,
+                vendor, base_url, api_key, model, thinking_enabled, updated_at
+            FROM provider_configs;
+
+            DELETE FROM provider_configs;
             ",
         )
         .context("Failed to create tables")?;
+
+        let has_provider_id = {
+            let mut statement = conn
+                .prepare("PRAGMA table_info(sessions)")
+                .context("Failed to inspect sessions schema")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("Failed to list sessions columns")?;
+            let mut found = false;
+            for column in columns {
+                if column.context("Failed to read sessions column")? == "provider_id" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        if !has_provider_id {
+            conn.execute_batch(
+                "
+                ALTER TABLE sessions ADD COLUMN provider_id TEXT;
+                UPDATE sessions
+                SET provider_id = CASE vendor
+                    WHEN 'openai' THEN 'openai_api'
+                    WHEN 'deepseek' THEN 'deepseek_api'
+                    WHEN 'moonshot_kimi' THEN 'moonshot_kimi_api'
+                    WHEN 'kimi_code' THEN 'kimi_code_api'
+                    WHEN 'glm' THEN 'glm_api'
+                    WHEN 'codex' THEN 'codex_app_server'
+                END
+                WHERE provider_id IS NULL;
+                ",
+            )
+            .context("Failed to migrate sessions provider_id")?;
+        }
         Ok(())
     }
 
@@ -133,11 +196,69 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','sessions','messages','provider_configs')",
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','sessions','messages','provider_configs','provider_profiles')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn open_migrates_legacy_vendor_records_to_provider_ids() {
+        let dir = std::env::temp_dir().join(format!("disco-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy.db");
+        let project_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "
+                CREATE TABLE projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    vendor TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    title TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE provider_configs (
+                    vendor TEXT PRIMARY KEY,
+                    base_url TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    thinking_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO projects VALUES ('{project_id}', 'Test', '/tmp/legacy', '1');
+                INSERT INTO sessions VALUES ('{session_id}', '{project_id}', 'codex', 'o4-mini', NULL, '1', '1');
+                INSERT INTO provider_configs VALUES ('codex', '', '', 'o4-mini', 0, '1');
+                "
+            ))
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&db_path).unwrap();
+        let session = db.get_session(session_id).unwrap().unwrap();
+        assert_eq!(
+            session.provider_id.as_str(),
+            disco_protocol::types::ProviderId::CODEX_APP_SERVER
+        );
+
+        let configs = db.list_provider_configs().unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].provider_id.as_str(),
+            disco_protocol::types::ProviderId::CODEX_APP_SERVER
+        );
     }
 }

@@ -45,6 +45,8 @@ pub struct ShutdownResult {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfigureParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     pub vendor: Vendor,
     pub base_url: String,
     pub api_key: String,
@@ -55,6 +57,7 @@ pub struct ProviderConfigureParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfigureResult {
+    pub provider_id: ProviderId,
     pub vendor: Vendor,
 }
 
@@ -70,6 +73,7 @@ pub struct ProviderListResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderEntry {
+    pub provider_id: ProviderId,
     pub vendor: Vendor,
     pub base_url: String,
     pub model: String,
@@ -80,6 +84,8 @@ pub struct ProviderEntry {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModelsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     pub vendor: Vendor,
 }
 
@@ -150,6 +156,8 @@ pub struct SessionListResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCreateParams {
     pub project_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     pub vendor: Vendor,
     pub model: String,
 }
@@ -782,6 +790,7 @@ mod tests {
             id: 3,
             method: "provider/configure".into(),
             params: serde_json::to_value(ProviderConfigureParams {
+                provider_id: Some(ProviderId::legacy_default_for_vendor(Vendor::Deepseek)),
                 vendor: Vendor::Deepseek,
                 base_url: "https://api.deepseek.com/v1".into(),
                 api_key: "sk-xxx".into(),

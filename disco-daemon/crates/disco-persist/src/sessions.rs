@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use disco_protocol::types::{Session, Vendor};
+use disco_protocol::types::{ProviderId, Session, Vendor};
 use uuid::Uuid;
 
 use crate::Database;
@@ -9,6 +9,7 @@ impl Database {
     pub fn create_session(
         &self,
         project_id: Uuid,
+        provider_id: ProviderId,
         vendor: Vendor,
         model: &str,
         title: Option<&str>,
@@ -22,11 +23,13 @@ impl Database {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, project_id, vendor, model, title, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions
+             (id, project_id, provider_id, vendor, model, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 id.to_string(),
                 project_id.to_string(),
+                provider_id.as_str(),
                 vendor_str,
                 model,
                 title,
@@ -39,6 +42,7 @@ impl Database {
         Ok(Session {
             id,
             project_id,
+            provider_id,
             vendor,
             model: model.to_string(),
             title: title.map(|s| s.to_string()),
@@ -52,7 +56,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, project_id, vendor, model, title, created_at, updated_at
+                "SELECT id, project_id, provider_id, vendor, model, title, created_at, updated_at
                  FROM sessions
                  WHERE project_id = ?1
                  ORDER BY updated_at DESC",
@@ -63,17 +67,19 @@ impl Database {
             .query_map(rusqlite::params![project_id.to_string()], |row| {
                 let id_str: String = row.get(0)?;
                 let pid_str: String = row.get(1)?;
-                let vendor_str: String = row.get(2)?;
-                let vendor: Vendor = serde_json::from_str(&format!("\"{vendor_str}\""))
-                    .unwrap_or(Vendor::Openai);
+                let provider_id = ProviderId::new(row.get::<_, String>(2)?);
+                let vendor_str: String = row.get(3)?;
+                let vendor: Vendor =
+                    serde_json::from_str(&format!("\"{vendor_str}\"")).unwrap_or(Vendor::Openai);
                 Ok(Session {
                     id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
                     project_id: Uuid::parse_str(&pid_str).unwrap_or(Uuid::nil()),
+                    provider_id,
                     vendor,
-                    model: row.get(3)?,
-                    title: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    model: row.get(4)?,
+                    title: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })
             .context("Failed to query sessions")?;
@@ -90,7 +96,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, project_id, vendor, model, title, created_at, updated_at
+                "SELECT id, project_id, provider_id, vendor, model, title, created_at, updated_at
                  FROM sessions
                  WHERE id = ?1",
             )
@@ -100,17 +106,19 @@ impl Database {
             .query_map(rusqlite::params![session_id.to_string()], |row| {
                 let id_str: String = row.get(0)?;
                 let pid_str: String = row.get(1)?;
-                let vendor_str: String = row.get(2)?;
-                let vendor: Vendor = serde_json::from_str(&format!("\"{vendor_str}\""))
-                    .unwrap_or(Vendor::Openai);
+                let provider_id = ProviderId::new(row.get::<_, String>(2)?);
+                let vendor_str: String = row.get(3)?;
+                let vendor: Vendor =
+                    serde_json::from_str(&format!("\"{vendor_str}\"")).unwrap_or(Vendor::Openai);
                 Ok(Session {
                     id: Uuid::parse_str(&id_str).unwrap_or(Uuid::nil()),
                     project_id: Uuid::parse_str(&pid_str).unwrap_or(Uuid::nil()),
+                    provider_id,
                     vendor,
-                    model: row.get(3)?,
-                    title: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    model: row.get(4)?,
+                    title: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })
             .context("Failed to query session")?;
@@ -156,15 +164,28 @@ mod tests {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/test").unwrap();
         let s1 = db
-            .create_session(project.id, Vendor::Openai, "gpt-4", Some("Chat 1"))
+            .create_session(
+                project.id,
+                ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                Some("Chat 1"),
+            )
             .unwrap();
         let _s2 = db
-            .create_session(project.id, Vendor::Deepseek, "deepseek-chat", None)
+            .create_session(
+                project.id,
+                ProviderId::legacy_default_for_vendor(Vendor::Deepseek),
+                Vendor::Deepseek,
+                "deepseek-chat",
+                None,
+            )
             .unwrap();
 
         let sessions = db.list_sessions(project.id).unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, s1.id);
+        assert_eq!(sessions[0].provider_id.as_str(), "openai_api");
         assert_eq!(sessions[0].vendor, Vendor::Openai);
     }
 
@@ -173,7 +194,13 @@ mod tests {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/test2").unwrap();
         let session = db
-            .create_session(project.id, Vendor::Openai, "gpt-4", None)
+            .create_session(
+                project.id,
+                ProviderId::legacy_default_for_vendor(Vendor::Openai),
+                Vendor::Openai,
+                "gpt-4",
+                None,
+            )
             .unwrap();
 
         db.add_message(session.id, "user", "hello").unwrap();

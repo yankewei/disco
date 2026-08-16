@@ -186,6 +186,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 3,
   "method": "provider/configure",
   "params": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek",
     "baseURL": "https://api.deepseek.com/v1",
     "apiKey": "sk-xxx",
@@ -201,6 +202,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
 {
   "id": 3,
   "result": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek"
   }
 }
@@ -228,12 +230,14 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "result": {
     "providers": [
       {
+        "providerID": "deepseek_api",
         "vendor": "deepseek",
         "baseURL": "https://api.deepseek.com/v1",
         "model": "deepseek-chat",
         "thinkingEnabled": true
       },
       {
+        "providerID": "openai_api",
         "vendor": "openai",
         "baseURL": "https://api.openai.com/v1",
         "model": "gpt-4",
@@ -255,10 +259,15 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "id": 5,
   "method": "provider/models",
   "params": {
+    "providerID": "deepseek_api",
     "vendor": "deepseek"
   }
 }
 ```
+
+`providerID` 是稳定的 Provider profile 标识。迁移期客户端可以省略，daemon 会根据
+`vendor` 选择旧版默认 profile。`codex_app_server` 和 `codex_api` 是两个不同
+Provider，不共享会话或配置。
 
 **响应**：
 
@@ -447,6 +456,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
       {
         "id": "sess_789",
         "projectID": "proj_123",
+        "providerID": "deepseek_api",
         "vendor": "deepseek",
         "model": "deepseek-chat",
         "createdAt": "2026-01-15T10:30:00Z",
@@ -470,6 +480,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   "method": "session/create",
   "params": {
     "projectID": "proj_123",
+    "providerID": "deepseek_api",
     "vendor": "deepseek",
     "model": "deepseek-chat"
   }
@@ -485,6 +496,7 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
     "session": {
       "id": "sess_abc",
       "projectID": "proj_123",
+      "providerID": "deepseek_api",
       "vendor": "deepseek",
       "model": "deepseek-chat",
       "createdAt": "2026-01-20T15:00:00Z"
@@ -492,6 +504,9 @@ DAP 定义三种消息类型，所有消息均为单行 JSON 对象。
   }
 }
 ```
+
+会话创建后 `providerID` 不可变。切换 Provider 需要创建新会话。旧客户端可以在
+`session/create` 中省略该字段，daemon 会从 `vendor` 映射到默认 Provider。
 
 #### `session/delete`
 

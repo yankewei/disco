@@ -8,12 +8,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
-
 use daemon::{AppState, default_socket_path};
+use disco_core::RunCoordinator;
 use disco_persist::{Database, default_db_path};
 use disco_providers::{CodexProvider, ModelProvider, OpenAIResponsesProvider};
-use disco_protocol::types::Vendor;
+use disco_protocol::types::{ProviderId, Vendor};
 use disco_tools::CompositeExecutor;
 use disco_tools::shell::ShellExecutor;
 use disco_tools::file_edit::FileEditExecutor;
@@ -40,11 +39,14 @@ async fn main() {
 
     // 默认服务商可选：没有环境变量时 daemon 仍可启动，
     // 用户可通过 UI 配置服务商（含 Codex 订阅，无需 API Key）。
-    let default_provider: Option<Arc<dyn ModelProvider>> =
+    let environment_provider: Option<Arc<dyn ModelProvider>> =
         match OpenAIResponsesProvider::from_env() {
-            Ok(p) => {
-                info!("Default provider: model={} base_url={}", p.model, p.base_url);
-                Some(p)
+            Ok(provider) => {
+                info!(
+                    "Default provider: model={} base_url={}",
+                    provider.model, provider.base_url
+                );
+                Some(provider)
             }
             Err(e) => {
                 tracing::warn!("No default provider from environment: {e}");
@@ -54,32 +56,39 @@ async fn main() {
         };
 
     // Load saved provider configs from database and populate the providers map.
-    // Codex 走本地 codex app-server（ChatGPT 订阅，由用户 codex login 登录），
-    // 其余服务商走 OpenAI 兼容 API。
-    let mut providers = HashMap::new();
+    // codex_app_server 走本地子进程；codex_api 和其他模型 Provider 走模型 API。
+    let mut provider_by_id = HashMap::new();
     match db.list_provider_configs() {
         Ok(configs) => {
             for config in configs {
-                let p: Arc<dyn ModelProvider> = match config.vendor {
-                    Vendor::Codex => Arc::new(CodexProvider::new(
-                        CodexProvider::find_codex(),
-                        config.model,
-                        None, // 推理档位暂由 UI 控制，未落库
-                        None, // 会话续接暂不启用
-                    )),
-                    _ => Arc::new(OpenAIResponsesProvider::new(
-                        config.base_url,
-                        config.api_key,
-                        config.model,
-                    )),
-                };
-                providers.insert(config.vendor, p);
-                info!("Loaded provider config: {:?}", config.vendor);
+                let provider: Arc<dyn ModelProvider> =
+                    if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
+                        Arc::new(CodexProvider::new(
+                            CodexProvider::find_codex(),
+                            config.model,
+                            None, // 推理档位暂由 UI 控制，未落库
+                            None, // 会话续接暂不启用
+                        ))
+                    } else {
+                        Arc::new(OpenAIResponsesProvider::new(
+                            config.base_url,
+                            config.api_key,
+                            config.model,
+                        ))
+                    };
+                info!("Loaded provider config: {}", config.provider_id);
+                provider_by_id.insert(config.provider_id, provider);
             }
         }
         Err(e) => {
             tracing::warn!("Failed to load provider configs: {e}");
         }
+    }
+
+    if let Some(provider) = environment_provider {
+        provider_by_id
+            .entry(ProviderId::legacy_default_for_vendor(Vendor::Openai))
+            .or_insert(provider);
     }
 
     // Create tool executor
@@ -94,10 +103,8 @@ async fn main() {
     let shutdown = CancellationToken::new();
     let app = Arc::new(AppState {
         db,
-        provider: default_provider,
-        providers: Mutex::new(providers),
-        active_runs: Mutex::new(HashMap::<Uuid, CancellationToken>::new()),
-        active_approval: Mutex::new(HashMap::<Uuid, Arc<disco_core::ApprovalManager>>::new()),
+        provider_by_id: Mutex::new(provider_by_id),
+        run_coordinator: RunCoordinator::new(),
         executor,
         shutdown: shutdown.clone(),
     });

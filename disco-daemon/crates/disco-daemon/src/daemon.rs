@@ -5,31 +5,25 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use disco_core::ApprovalManager;
+use disco_core::RunCoordinator;
 use disco_persist::Database;
 use disco_providers::ModelProvider;
-use disco_protocol::types::Vendor;
+use disco_protocol::types::ProviderId;
 use disco_tools::CompositeExecutor;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
-
 use crate::router;
 
 /// Shared application state accessible from all connection handlers.
 pub struct AppState {
     pub db: Database,
-    /// 默认/主服务商（来自环境变量；可为 None，表示尚未配置任何服务商）。
-    pub provider: Option<Arc<dyn ModelProvider>>,
-    /// Map of configured providers by vendor.
-    pub providers: Mutex<HashMap<Vendor, Arc<dyn ModelProvider>>>,
-    /// Active runs keyed by run ID.
-    pub active_runs: Mutex<HashMap<Uuid, CancellationToken>>,
-    /// Active approval managers keyed by run ID.
-    pub active_approval: Mutex<HashMap<Uuid, Arc<ApprovalManager>>>,
+    /// 按稳定 Provider profile ID 索引的已配置 Provider。
+    pub provider_by_id: Mutex<HashMap<ProviderId, Arc<dyn ModelProvider>>>,
+    /// 活动运行、会话互斥、取消和审批路由。
+    pub run_coordinator: RunCoordinator,
     /// Tool executor composite.
     pub executor: Arc<CompositeExecutor>,
     /// Shutdown signal.
@@ -37,28 +31,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Get the provider for a given vendor. Falls back to the default provider.
-    pub async fn get_provider(&self, vendor: Option<Vendor>) -> Option<Arc<dyn ModelProvider>> {
-        if let Some(vendor) = vendor {
-            let providers = self.providers.lock().await;
-            if let Some(provider) = providers.get(&vendor) {
-                return Some(provider.clone());
-            }
-        }
-        self.provider.clone()
+    /// Get the exact configured Provider for a session.
+    pub async fn get_provider(&self, provider_id: &ProviderId) -> Option<Arc<dyn ModelProvider>> {
+        self.provider_by_id.lock().await.get(provider_id).cloned()
     }
 
-    /// Register a provider for a vendor.
-    pub async fn set_provider(&self, vendor: Vendor, provider: Arc<dyn ModelProvider>) {
-        let mut providers = self.providers.lock().await;
-        providers.insert(vendor, provider);
-    }
-
-    /// Remove a provider for a vendor.
-    #[allow(dead_code)]
-    pub async fn remove_provider(&self, vendor: &Vendor) {
-        let mut providers = self.providers.lock().await;
-        providers.remove(vendor);
+    /// Register a Provider profile.
+    pub async fn set_provider(&self, provider_id: ProviderId, provider: Arc<dyn ModelProvider>) {
+        let mut provider_by_id = self.provider_by_id.lock().await;
+        provider_by_id.insert(provider_id, provider);
     }
 }
 
