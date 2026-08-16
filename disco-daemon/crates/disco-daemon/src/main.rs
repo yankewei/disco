@@ -93,6 +93,7 @@ async fn main() {
                             config.model,
                             None,
                             None,
+                            None,
                         )),
                         backend: Arc::new(CodexAdapter::new(executable, None)),
                     }

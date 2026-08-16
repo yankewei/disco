@@ -3,7 +3,10 @@ pub mod codex;
 pub mod openai_responses;
 
 pub use chat_completions::ChatCompletionsProvider;
-pub use codex::CodexProvider;
+pub use codex::{
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexProvider,
+    CodexProviderEvent, CodexToolCall, CodexToolResult,
+};
 pub use openai_responses::{ChatMessage, OpenAIResponsesProvider, ProviderEvent, StreamOptions};
 
 use std::pin::Pin;

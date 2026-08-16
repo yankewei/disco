@@ -757,6 +757,7 @@ async fn handle_provider_configure(req: &Request, app: &Arc<AppState>) -> Respon
                 params.model.clone(),
                 None,
                 None,
+                None,
             )),
             backend: Arc::new(CodexAdapter::new(executable, None)),
         }
