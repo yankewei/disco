@@ -66,6 +66,8 @@ pub enum ProviderEvent {
     },
     /// The response completed successfully.
     Completed,
+    /// The response was cancelled by the backend.
+    Cancelled,
     /// The response failed with an error message.
     Failed(String),
 }
@@ -101,12 +103,11 @@ impl OpenAIResponsesProvider {
     /// - `OPENAI_BASE_URL` (optional, defaults to `https://api.openai.com/v1`)
     /// - `OPENAI_MODEL` (optional, defaults to `gpt-4o`)
     pub fn from_env() -> Result<Arc<Self>> {
-        let api_key =
-            std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY environment variable not set")?;
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .context("OPENAI_API_KEY environment variable not set")?;
         let base_url = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
         Ok(Arc::new(Self::new(base_url, api_key, model)))
     }
@@ -371,43 +372,40 @@ fn parse_responses_usage(usage: &serde_json::Map<String, serde_json::Value>) -> 
 
 /// Parse a single SSE data line into a Vec of ProviderEvents (for testing).
 /// Returns a vec because some events may produce multiple provider events.
-pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>> {    if data == "[DONE]" {
+pub fn parse_sse_data(data: &str) -> Result<Vec<ProviderEvent>> {
+    if data == "[DONE]" {
         return Ok(vec![ProviderEvent::Completed]);
     }
 
-    let json: serde_json::Value =
-        serde_json::from_str(data).context("Failed to parse SSE JSON")?;
+    let json: serde_json::Value = serde_json::from_str(data).context("Failed to parse SSE JSON")?;
     let event_type = json["type"].as_str().unwrap_or("");
 
     let mut events = Vec::new();
 
     match event_type {
         "response.output_text.delta" => {
-            let delta = json["delta"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let delta = json["delta"].as_str().unwrap_or("").to_string();
             events.push(ProviderEvent::TextDelta(delta));
         }
         "response.reasoning_summary_text.delta" => {
-            let delta = json["delta"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let delta = json["delta"].as_str().unwrap_or("").to_string();
             events.push(ProviderEvent::ReasoningDelta(delta));
         }
         "response.output_item.added" => {
             if let Some(item) = json["item"].as_object() {
                 if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                    let call_id = item.get("call_id")
+                    let call_id = item
+                        .get("call_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let name = item.get("name")
+                    let name = item
+                        .get("name")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let arguments = item.get("arguments")
+                    let arguments = item
+                        .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
@@ -715,7 +713,11 @@ mod tests {
         }"#;
         let events = parse_sse_data(data).unwrap();
         // Non-function items are silently ignored
-        assert!(events.is_empty(), "Expected no events for non-function item, got {:?}", events);
+        assert!(
+            events.is_empty(),
+            "Expected no events for non-function item, got {:?}",
+            events
+        );
     }
 }
 

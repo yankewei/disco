@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-use disco_providers::openai_responses::{ChatMessage, ProviderEvent, ToolCallInfo};
-use disco_providers::ModelProvider;
 use disco_protocol::types::{ApprovalDecision, ApprovalImpact, TokenUsage};
+use disco_providers::ModelProvider;
+use disco_providers::openai_responses::{ChatMessage, ProviderEvent, ToolCallInfo};
 use disco_tools::{CompositeExecutor, ToolCall, ToolContext, ToolExecutor};
-use futures_core::Stream;
-use tokio_util::sync::CancellationToken;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -76,7 +75,7 @@ impl AgentLoop {
         run_id: Uuid,
         _session_id: Uuid,
         workspace_path: Option<String>,
-    ) -> impl Stream<Item = AgentOutput> {
+    ) -> ReceiverStream<AgentOutput> {
         let (tx, rx) = tokio::sync::mpsc::channel::<AgentOutput>(64);
         let provider = self.provider.clone();
         let executor = self.executor.clone();
@@ -172,6 +171,10 @@ impl AgentLoop {
                                     }
                                     Some(Ok(ProviderEvent::Completed)) => {
                                         break;
+                                    }
+                                    Some(Ok(ProviderEvent::Cancelled)) => {
+                                        let _ = tx.send(AgentOutput::Cancelled).await;
+                                        return;
                                     }
                                     Some(Ok(ProviderEvent::Failed(error))) => {
                                         error!("Agent loop failed: {error}");
@@ -396,6 +399,7 @@ mod tests {
     use std::pin::Pin;
 
     use disco_tools::ToolDefinition;
+    use futures_core::Stream;
 
     use super::*;
 

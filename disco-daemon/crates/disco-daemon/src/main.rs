@@ -4,19 +4,20 @@ mod router;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use daemon::{AppState, ProviderRuntime, default_socket_path};
+use disco_backends::{CodexAdapter, ModelApiBackend};
+use disco_core::{AgentBackend, RunCoordinator};
+use disco_persist::{Database, default_db_path};
+use disco_protocol::types::{ProviderId, Vendor};
+use disco_providers::{CodexProvider, ModelProvider, OpenAIResponsesProvider};
+use disco_tools::CompositeExecutor;
+use disco_tools::file_edit::FileEditExecutor;
+use disco_tools::search::SearchExecutor;
+use disco_tools::shell::ShellExecutor;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use daemon::{AppState, default_socket_path};
-use disco_core::RunCoordinator;
-use disco_persist::{Database, default_db_path};
-use disco_providers::{CodexProvider, ModelProvider, OpenAIResponsesProvider};
-use disco_protocol::types::{ProviderId, Vendor};
-use disco_tools::CompositeExecutor;
-use disco_tools::shell::ShellExecutor;
-use disco_tools::file_edit::FileEditExecutor;
-use disco_tools::search::SearchExecutor;
 
 #[tokio::main]
 async fn main() {
@@ -37,6 +38,17 @@ async fn main() {
         }
     };
 
+    // Create tool executor
+    let mut composite = CompositeExecutor::new();
+    composite.register(Box::new(ShellExecutor::new()));
+    composite.register(Box::new(FileEditExecutor::new()));
+    composite.register(Box::new(SearchExecutor::new()));
+    let executor = Arc::new(composite);
+    info!(
+        "Tool executor registered: {} tools",
+        executor.all_definitions().len()
+    );
+
     // 默认服务商可选：没有环境变量时 daemon 仍可启动，
     // 用户可通过 UI 配置服务商（含 Codex 订阅，无需 API Key）。
     let environment_provider: Option<Arc<dyn ModelProvider>> =
@@ -55,29 +67,43 @@ async fn main() {
             }
         };
 
-    // Load saved provider configs from database and populate the providers map.
-    // codex_app_server 走本地子进程；codex_api 和其他模型 Provider 走模型 API。
-    let mut provider_by_id = HashMap::new();
+    // Provider 保存账户/模型配置；Backend 保存 agent 运行语义。二者都按稳定 Provider ID 索引。
+    let mut runtime_by_provider_id = HashMap::new();
     match db.list_provider_configs() {
         Ok(configs) => {
             for config in configs {
-                let provider: Arc<dyn ModelProvider> =
-                    if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
+                let (compaction_provider, backend): (
+                    Arc<dyn ModelProvider>,
+                    Arc<dyn AgentBackend>,
+                ) = if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
+                    let executable = CodexProvider::find_codex();
+                    (
                         Arc::new(CodexProvider::new(
-                            CodexProvider::find_codex(),
+                            executable.clone(),
                             config.model,
-                            None, // 推理档位暂由 UI 控制，未落库
-                            None, // 会话续接暂不启用
-                        ))
-                    } else {
-                        Arc::new(OpenAIResponsesProvider::new(
-                            config.base_url,
-                            config.api_key,
-                            config.model,
-                        ))
-                    };
+                            None,
+                            None,
+                        )),
+                        Arc::new(CodexAdapter::new(executable, None)),
+                    )
+                } else {
+                    let provider: Arc<dyn ModelProvider> = Arc::new(OpenAIResponsesProvider::new(
+                        config.base_url,
+                        config.api_key,
+                        config.model,
+                    ));
+                    let backend =
+                        Arc::new(ModelApiBackend::new(provider.clone(), executor.clone()));
+                    (provider, backend)
+                };
                 info!("Loaded provider config: {}", config.provider_id);
-                provider_by_id.insert(config.provider_id, provider);
+                runtime_by_provider_id.insert(
+                    config.provider_id,
+                    ProviderRuntime {
+                        backend,
+                        compaction_provider,
+                    },
+                );
             }
         }
         Err(e) => {
@@ -86,24 +112,23 @@ async fn main() {
     }
 
     if let Some(provider) = environment_provider {
-        provider_by_id
-            .entry(ProviderId::legacy_default_for_vendor(Vendor::Openai))
-            .or_insert(provider);
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        runtime_by_provider_id
+            .entry(provider_id)
+            .or_insert_with(|| {
+                let backend = Arc::new(ModelApiBackend::new(provider.clone(), executor.clone()));
+                ProviderRuntime {
+                    backend,
+                    compaction_provider: provider,
+                }
+            });
     }
-
-    // Create tool executor
-    let mut composite = CompositeExecutor::new();
-    composite.register(Box::new(ShellExecutor::new()));
-    composite.register(Box::new(FileEditExecutor::new()));
-    composite.register(Box::new(SearchExecutor::new()));
-    let executor = Arc::new(composite);
-    info!("Tool executor registered: {} tools", executor.all_definitions().len());
 
     // Create application state
     let shutdown = CancellationToken::new();
     let app = Arc::new(AppState {
         db,
-        provider_by_id: Mutex::new(provider_by_id),
+        runtime_by_provider_id: Mutex::new(runtime_by_provider_id),
         run_coordinator: RunCoordinator::new(),
         executor,
         shutdown: shutdown.clone(),

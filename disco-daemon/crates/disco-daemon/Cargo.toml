@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 disco-protocol = { path = "../disco-protocol" }
 disco-core = { path = "../disco-core" }
+disco-backends = { path = "../disco-backends" }
 disco-providers = { path = "../disco-providers" }
 disco-tools = { path = "../disco-tools" }
 disco-persist = { path = "../disco-persist" }
@@ -19,3 +20,6 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

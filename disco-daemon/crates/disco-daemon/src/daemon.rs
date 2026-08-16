@@ -4,24 +4,31 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::router;
 use anyhow::{Context, Result};
-use disco_core::RunCoordinator;
+use disco_core::{AgentBackend, RunCoordinator};
 use disco_persist::Database;
-use disco_providers::ModelProvider;
 use disco_protocol::types::ProviderId;
+use disco_providers::ModelProvider;
 use disco_tools::CompositeExecutor;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use crate::router;
+
+/// 一个 Provider profile 对应的运行时依赖。
+pub struct ProviderRuntime {
+    pub backend: Arc<dyn AgentBackend>,
+    /// 迁移期仅供上下文压缩使用；RigBackend 落地后由 Backend 自己实现 compact capability。
+    pub compaction_provider: Arc<dyn ModelProvider>,
+}
 
 /// Shared application state accessible from all connection handlers.
 pub struct AppState {
     pub db: Database,
-    /// 按稳定 Provider profile ID 索引的已配置 Provider。
-    pub provider_by_id: Mutex<HashMap<ProviderId, Arc<dyn ModelProvider>>>,
+    /// Provider 配置对应的运行时依赖，配置更新时原子替换。
+    pub runtime_by_provider_id: Mutex<HashMap<ProviderId, ProviderRuntime>>,
     /// 活动运行、会话互斥、取消和审批路由。
     pub run_coordinator: RunCoordinator,
     /// Tool executor composite.
@@ -31,15 +38,30 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Get the exact configured Provider for a session.
-    pub async fn get_provider(&self, provider_id: &ProviderId) -> Option<Arc<dyn ModelProvider>> {
-        self.provider_by_id.lock().await.get(provider_id).cloned()
+    pub async fn get_backend(&self, provider_id: &ProviderId) -> Option<Arc<dyn AgentBackend>> {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .get(provider_id)
+            .map(|runtime| runtime.backend.clone())
     }
 
-    /// Register a Provider profile.
-    pub async fn set_provider(&self, provider_id: ProviderId, provider: Arc<dyn ModelProvider>) {
-        let mut provider_by_id = self.provider_by_id.lock().await;
-        provider_by_id.insert(provider_id, provider);
+    pub async fn get_compaction_provider(
+        &self,
+        provider_id: &ProviderId,
+    ) -> Option<Arc<dyn ModelProvider>> {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .get(provider_id)
+            .map(|runtime| runtime.compaction_provider.clone())
+    }
+
+    pub async fn set_provider_runtime(&self, provider_id: ProviderId, runtime: ProviderRuntime) {
+        self.runtime_by_provider_id
+            .lock()
+            .await
+            .insert(provider_id, runtime);
     }
 }
 

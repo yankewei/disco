@@ -102,6 +102,15 @@ impl RunCoordinator {
         finished_run.approval_manager.cancel_all().await;
     }
 
+    pub async fn active_run_id(&self, session_id: Uuid) -> Option<Uuid> {
+        self.state
+            .lock()
+            .await
+            .run_by_session
+            .get(&session_id)
+            .copied()
+    }
+
     pub async fn cancel_run(&self, run_id: Uuid) -> CancelRunOutcome {
         let run_controls = {
             let state = self.state.lock().await;
@@ -177,6 +186,20 @@ mod tests {
         coordinator.finish_run(first.run_id).await;
 
         coordinator.begin_run(session_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exposes_the_active_run_for_session_lifecycle_operations() {
+        let coordinator = RunCoordinator::new();
+        let session_id = Uuid::new_v4();
+        let run = coordinator.begin_run(session_id).await.unwrap();
+
+        assert_eq!(
+            coordinator.active_run_id(session_id).await,
+            Some(run.run_id)
+        );
+        coordinator.finish_run(run.run_id).await;
+        assert_eq!(coordinator.active_run_id(session_id).await, None);
     }
 
     #[tokio::test]

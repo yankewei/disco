@@ -130,6 +130,36 @@ impl Database {
         }
     }
 
+    /// 读取后端持有的原生会话句柄。该值只在 daemon 内部使用，不进入 App 协议 DTO。
+    pub fn get_session_backend_handle(&self, session_id: Uuid) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT backend_handle FROM sessions WHERE id = ?1")
+            .context("Failed to prepare backend handle query")?;
+        let mut rows = statement
+            .query(rusqlite::params![session_id.to_string()])
+            .context("Failed to query backend handle")?;
+        match rows.next().context("Failed to read backend handle row")? {
+            Some(row) => row.get(0).context("Failed to decode backend handle"),
+            None => Ok(None),
+        }
+    }
+
+    /// 保存后端为 Disco 会话分配的不透明恢复句柄。
+    pub fn set_session_backend_handle(&self, session_id: Uuid, handle: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET backend_handle = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![handle, Self::now_iso8601(), session_id.to_string()],
+            )
+            .context("Failed to update backend handle")?;
+        if updated == 0 {
+            anyhow::bail!("会话 {session_id} 不存在");
+        }
+        Ok(())
+    }
+
     /// Delete a session and all its messages.
     pub fn delete_session(&self, session_id: Uuid) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -214,5 +244,33 @@ mod tests {
         // Messages should also be gone
         let messages = db.list_messages(session.id).unwrap();
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn backend_handle_is_internal_and_persists_for_resume() {
+        let db = temp_db();
+        let project = db.create_project("Test", "/tmp/backend-handle").unwrap();
+        let session = db
+            .create_session(
+                project.id,
+                ProviderId::new(ProviderId::CODEX_APP_SERVER),
+                Vendor::Codex,
+                "gpt-5-codex",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(db.get_session_backend_handle(session.id).unwrap(), None);
+        db.set_session_backend_handle(session.id, "thread-123")
+            .unwrap();
+        assert_eq!(
+            db.get_session_backend_handle(session.id)
+                .unwrap()
+                .as_deref(),
+            Some("thread-123")
+        );
+
+        let serialized = serde_json::to_value(db.get_session(session.id).unwrap()).unwrap();
+        assert!(serialized.get("backend_handle").is_none());
     }
 }

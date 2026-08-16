@@ -182,11 +182,7 @@ impl CodexProvider {
 
     /// Find the codex executable in PATH or well-known locations.
     pub fn find_codex() -> String {
-        let candidates = [
-            "codex",
-            "/usr/local/bin/codex",
-            "/opt/homebrew/bin/codex",
-        ];
+        let candidates = ["codex", "/usr/local/bin/codex", "/opt/homebrew/bin/codex"];
 
         // Check PATH
         if let Ok(path) = std::env::var("PATH") {
@@ -241,13 +237,8 @@ impl CodexProvider {
 
         tokio::spawn(async move {
             // Ensure transport is initialized
-            if let Err(e) = Self::ensure_ready(
-                &state,
-                &executable,
-                &model,
-                resume_thread_id.as_deref(),
-            )
-            .await
+            if let Err(e) =
+                Self::ensure_ready(&state, &executable, &model, resume_thread_id.as_deref()).await
             {
                 let _ = tx.send(Err(e)).await;
                 return;
@@ -276,55 +267,25 @@ impl CodexProvider {
                 });
             }
 
-            // Send turn/start request
-            let request_id = {
-                let mut s = state.lock().await;
-                s.next_id()
-            };
-
-            let turn_start = serde_json::json!({
-                "id": request_id,
-                "method": "turn/start",
-                "params": {
+            // pending 必须在写入前登记，否则极快响应可能先于 pending 到达。
+            if let Err(error) = Self::send_request(
+                &state,
+                "turn/start",
+                serde_json::json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": user_input}],
                     "effort": reasoning_effort,
-                }
-            });
-
-            // Send the request via the writer
-            if let Err(e) = Self::send_line(&state, &turn_start.to_string()).await {
-                let _ = tx.send(Err(e)).await;
+                }),
+            )
+            .await
+            {
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("turn/start failed: {error}")))
+                    .await;
+                state.lock().await.active_turn = None;
                 return;
             }
-
-            // Set up a pending request for the turn/start response
-            let (resp_tx, resp_rx) = oneshot::channel();
-            {
-                let mut s = state.lock().await;
-                s.pending.insert(request_id, PendingRequest { sender: resp_tx });
-            }
-
-            // Wait for the turn/start response (with timeout)
-            match timeout(Duration::from_secs(30), resp_rx).await {
-                Ok(Ok(Ok(_result))) => {
-                    debug!("turn/start response received");
-                }
-                Ok(Ok(Err(e))) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("turn/start failed: {e}"))).await;
-                    return;
-                }
-                Ok(Err(_)) => {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!("turn/start response channel closed")))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("turn/start timed out"))).await;
-                    return;
-                }
-            }
+            debug!("turn/start response received");
 
             // Now forward turn events as ProviderEvents
             let tx2 = tx.clone();
@@ -358,7 +319,7 @@ impl CodexProvider {
                                 let _ = tx2.send(Ok(ProviderEvent::Completed)).await;
                             }
                             CodexTurnStatus::Interrupted => {
-                                let _ = tx2.send(Ok(ProviderEvent::Completed)).await;
+                                let _ = tx2.send(Ok(ProviderEvent::Cancelled)).await;
                             }
                             CodexTurnStatus::Failed(msg) => {
                                 let _ = tx2.send(Ok(ProviderEvent::Failed(msg))).await;
@@ -373,7 +334,11 @@ impl CodexProvider {
             }
 
             // If we get here, the turn channel closed without a completed event
-            let _ = tx.send(Ok(ProviderEvent::Completed)).await;
+            let _ = tx
+                .send(Ok(ProviderEvent::Failed(
+                    "Codex turn 事件流在终止事件前关闭".to_string(),
+                )))
+                .await;
             let mut s = state.lock().await;
             s.active_turn = None;
         });
@@ -480,7 +445,8 @@ impl CodexProvider {
             let (resp_tx, resp_rx) = oneshot::channel();
             {
                 let mut s = state.lock().await;
-                s.pending.insert(init_id, PendingRequest { sender: resp_tx });
+                s.pending
+                    .insert(init_id, PendingRequest { sender: resp_tx });
             }
 
             Self::send_line(state, &init_request.to_string()).await?;
@@ -538,7 +504,9 @@ impl CodexProvider {
 
                     if let Some(tx) = &write_tx {
                         let (ok_tx, ok_rx) = oneshot::channel();
-                        let _ = tx.send(WriteRequest::Line(request.to_string(), ok_tx)).await;
+                        let _ = tx
+                            .send(WriteRequest::Line(request.to_string(), ok_tx))
+                            .await;
                         let _ = ok_rx.await;
                     }
 
@@ -577,7 +545,9 @@ impl CodexProvider {
 
                     if let Some(tx) = &write_tx {
                         let (ok_tx, ok_rx) = oneshot::channel();
-                        let _ = tx.send(WriteRequest::Line(request.to_string(), ok_tx)).await;
+                        let _ = tx
+                            .send(WriteRequest::Line(request.to_string(), ok_tx))
+                            .await;
                         let _ = ok_rx.await;
                     }
 
@@ -625,7 +595,10 @@ impl CodexProvider {
                     continue;
                 }
             };
-            debug!("codex <<< {}", trimmed.chars().take(160).collect::<String>());
+            debug!(
+                "codex <<< {}",
+                trimmed.chars().take(160).collect::<String>()
+            );
 
             Self::handle_envelope(&state, envelope).await;
         }
@@ -814,6 +787,63 @@ impl CodexProvider {
             .map_err(|_| anyhow::anyhow!("Writer response channel closed"))?
     }
 
+    /// 初始化 app-server 并创建或恢复当前 thread。
+    pub async fn ensure_session(&self) -> Result<String> {
+        Self::ensure_ready(
+            &self.state,
+            &self.executable,
+            &self.model,
+            self.resume_thread_id.as_deref(),
+        )
+        .await?;
+
+        self.state
+            .lock()
+            .await
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex thread 初始化后仍缺少 thread ID"))
+    }
+
+    /// 发送需要响应的 JSON-RPC 请求，并集中处理 request ID、超时和 pending 清理。
+    async fn send_request(
+        state: &Arc<Mutex<CodexState>>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (request_id, response_rx) = {
+            let mut state = state.lock().await;
+            let request_id = state.next_id();
+            let (response_tx, response_rx) = oneshot::channel();
+            state.pending.insert(
+                request_id,
+                PendingRequest {
+                    sender: response_tx,
+                },
+            );
+            (request_id, response_rx)
+        };
+
+        let request = serde_json::json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(error) = Self::send_line(state, &request.to_string()).await {
+            state.lock().await.pending.remove(&request_id);
+            return Err(error);
+        }
+
+        match timeout(Duration::from_secs(30), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow::anyhow!("{method} 响应通道已关闭")),
+            Err(_) => {
+                state.lock().await.pending.remove(&request_id);
+                Err(anyhow::anyhow!("{method} 请求超时"))
+            }
+        }
+    }
+
     /// Interrupt the current turn.
     pub async fn interrupt(&self) -> Result<()> {
         let s = self.state.lock().await;
@@ -827,33 +857,38 @@ impl CodexProvider {
             .as_ref()
             .and_then(|a| a.turn_id.clone())
             .ok_or_else(|| anyhow::anyhow!("No active turn"))?;
-        let write_tx = s
-            .write_tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Writer not initialized"))?
-            .clone();
-        let req_id = s.next_request_id;
         drop(s);
 
-        let request = serde_json::json!({
-            "id": req_id,
-            "method": "turn/interrupt",
-            "params": {
+        Self::send_request(
+            &self.state,
+            "turn/interrupt",
+            serde_json::json!({
                 "threadId": thread_id,
                 "turnId": turn_id,
-            }
-        });
+            }),
+        )
+        .await?;
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        write_tx
-            .send(WriteRequest::Line(request.to_string(), resp_tx))
+        Ok(())
+    }
+
+    /// 删除当前 Codex thread。调用方必须在删除本地会话前等待该操作成功。
+    pub async fn delete_thread(&self) -> Result<()> {
+        let thread_id = self
+            .state
+            .lock()
             .await
-            .map_err(|_| anyhow::anyhow!("Writer task closed"))?;
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No active thread"))?;
 
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("Writer response channel closed"))??;
-
+        Self::send_request(
+            &self.state,
+            "thread/delete",
+            serde_json::json!({ "threadId": thread_id }),
+        )
+        .await?;
+        self.state.lock().await.thread_id = None;
         Ok(())
     }
 
@@ -982,11 +1017,7 @@ mod tests {
 
     #[test]
     fn encode_thread_start_request() {
-        let json = encode_rpc_request(
-            1,
-            "thread/start",
-            serde_json::json!({"model": "o4-mini"}),
-        );
+        let json = encode_rpc_request(1, "thread/start", serde_json::json!({"model": "o4-mini"}));
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 1);
         assert_eq!(parsed["method"], "thread/start");
@@ -1150,9 +1181,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 42);
         assert_eq!(parsed["error"]["code"], -32601);
-        assert!(parsed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("approval/request"));
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("approval/request")
+        );
     }
 }

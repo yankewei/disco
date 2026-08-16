@@ -135,6 +135,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "disco-backends"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "disco-core",
+ "disco-providers",
+ "disco-tools",
+ "futures-core",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "disco-core"
 version = "0.1.0"
 dependencies = [
@@ -157,6 +173,8 @@ name = "disco-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "disco-backends",
  "disco-core",
  "disco-persist",
  "disco-protocol",

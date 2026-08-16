@@ -74,6 +74,7 @@ impl Database {
                 provider_id TEXT NOT NULL,
                 vendor TEXT NOT NULL,
                 model TEXT NOT NULL,
+                backend_handle TEXT,
                 title TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -125,24 +126,21 @@ impl Database {
         )
         .context("Failed to create tables")?;
 
-        let has_provider_id = {
+        let session_columns = {
             let mut statement = conn
                 .prepare("PRAGMA table_info(sessions)")
                 .context("Failed to inspect sessions schema")?;
             let columns = statement
                 .query_map([], |row| row.get::<_, String>(1))
                 .context("Failed to list sessions columns")?;
-            let mut found = false;
+            let mut names = Vec::new();
             for column in columns {
-                if column.context("Failed to read sessions column")? == "provider_id" {
-                    found = true;
-                    break;
-                }
+                names.push(column.context("Failed to read sessions column")?);
             }
-            found
+            names
         };
 
-        if !has_provider_id {
+        if !session_columns.iter().any(|name| name == "provider_id") {
             conn.execute_batch(
                 "
                 ALTER TABLE sessions ADD COLUMN provider_id TEXT;
@@ -159,6 +157,10 @@ impl Database {
                 ",
             )
             .context("Failed to migrate sessions provider_id")?;
+        }
+        if !session_columns.iter().any(|name| name == "backend_handle") {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN backend_handle TEXT;")
+                .context("Failed to migrate sessions backend_handle")?;
         }
         Ok(())
     }
