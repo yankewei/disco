@@ -1331,14 +1331,6 @@ private struct ComposerView: View {
             .lineLimit(1...6)
             .focused($isFocused)
             .disabled(!isConfigured)
-            .onKeyPress(.return, phases: .down) { keyPress in
-                if keyPress.modifiers.contains(.command) {
-                    store.draft.append("\n")
-                    return .handled
-                }
-                store.send()
-                return .handled
-            }
 
             HStack(spacing: 8) {
                 if isConfigured {
@@ -1582,7 +1574,6 @@ private struct ComposerView: View {
                     .background(DiscoTheme.accent, in: Circle())
             }
             .buttonStyle(DiscoPressButtonStyle())
-            .keyboardShortcut(.return)
             .disabled(!store.canSend)
             .opacity(store.canSend ? 1 : 0.38)
             .help("发送")
