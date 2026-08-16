@@ -1,15 +1,23 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use disco_core::{
-    AgentBackend, AgentLoop, BackendCapabilities, BackendRun, BackendRunRequest, BackendSession,
+    AgentBackend, AgentOutput, ApprovalManager, BackendCapabilities, BackendRun, BackendRunRequest,
+    BackendSession, tool_approval_request,
 };
-use disco_protocol::types::TokenUsage;
+use disco_protocol::types::{ApprovalDecision, TokenUsage};
 use disco_providers::{ChatMessage, ModelProvider, ProviderEvent};
-use disco_tools::{CompositeExecutor, ToolDefinition};
+use disco_tools::{CompositeExecutor, ToolCall, ToolContext, ToolDefinition, ToolExecutor};
 use futures_core::Stream;
+use rig_agent::AgentBuilder;
+use rig_agent::agent::{
+    AgentHook, MultiTurnStreamItem, StepEventKind, ToolCall as ToolCallEvent, ToolCallAction,
+    ToolResultAction, ToolResultEvent,
+};
+use rig_agent::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{CompletionModel, GetTokenUsage};
@@ -18,25 +26,43 @@ use rig_core::message::{
     ToolResult as RigToolResult, ToolResultContent,
 };
 use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+const MAX_MODEL_ROUNDS: usize = 8;
+const MAX_TOOL_CALLS: usize = 16;
+
+/// 一份 API Key Provider 配置对应的两个运行时接口。
+///
+/// 两者共享同一个 Rig model：AgentBackend 负责正常运行，ModelProvider 暂时供上下文压缩使用。
+pub struct RigRuntime {
+    pub backend: Arc<dyn AgentBackend>,
+    pub compaction_provider: Arc<dyn ModelProvider>,
+}
 
 /// Rig 模型后端。
 ///
-/// 当前切片由 Rig 负责 provider 请求与流式事件规范化，Disco 的 AgentLoop 继续负责
-/// 审批和工具执行。后续迁移到 `rig-agent` 时，daemon 仍只依赖 AgentBackend。
-pub struct RigBackend {
-    provider: Arc<dyn ModelProvider>,
+/// Rig 负责模型续轮和工具调度，Disco hook 负责审批、工具安全策略和公共事件。
+struct RigBackend<M> {
+    model: M,
     executor: Arc<CompositeExecutor>,
 }
 
-impl RigBackend {
-    pub fn new(provider: Arc<dyn ModelProvider>, executor: Arc<CompositeExecutor>) -> Self {
-        Self { provider, executor }
+impl<M> RigBackend<M> {
+    fn new(model: M, executor: Arc<CompositeExecutor>) -> Self {
+        Self { model, executor }
     }
 }
 
 #[async_trait]
-impl AgentBackend for RigBackend {
+impl<M> AgentBackend for RigBackend<M>
+where
+    M: CompletionModel + Send + Sync + 'static,
+    M::StreamingResponse: 'static,
+{
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             has_persistent_sessions: false,
@@ -45,23 +71,99 @@ impl AgentBackend for RigBackend {
     }
 
     async fn start_run(&self, request: BackendRunRequest) -> Result<BackendRun> {
-        let agent = AgentLoop::new(
-            self.provider.clone(),
+        let mut messages = request
+            .messages
+            .iter()
+            .map(to_rig_message)
+            .collect::<Result<Vec<_>>>()?;
+        let prompt = messages
+            .pop()
+            .ok_or_else(|| anyhow!("模型请求至少需要一条消息"))?;
+        let tools = build_dynamic_tools(
             self.executor.clone(),
-            request.approval_manager,
+            request.run_id,
+            request.workspace_path.clone(),
         );
-        let events = agent
-            .run(
-                request.messages,
-                request.cancellation,
-                request.run_id,
-                request.session.id,
-                request.workspace_path,
-            )
-            .await;
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let hook = DiscoToolHook {
+            run_id: request.run_id,
+            approval_manager: request.approval_manager.clone(),
+            event_tx: event_tx.clone(),
+            cancellation: request.cancellation.clone(),
+            tool_call_count: AtomicUsize::new(0),
+        };
+        let agent = AgentBuilder::new(self.model.clone())
+            .dynamic_tools(tools)
+            .add_hook(hook)
+            .build();
+        let executor = self.executor.clone();
+
+        tokio::spawn(async move {
+            let mut stream = agent
+                .runner(prompt)
+                .history(messages)
+                .max_turns(MAX_MODEL_ROUNDS)
+                .tool_concurrency(1)
+                .stream()
+                .await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = request.cancellation.cancelled() => {
+                        request.approval_manager.cancel_all().await;
+                        executor.cancel(request.run_id).await;
+                        let _ = event_tx.send(AgentOutput::Cancelled).await;
+                        return;
+                    }
+                    item = stream.next() => {
+                        let output = match item {
+                            Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::Text(text),
+                            ))) => Some(AgentOutput::TextDelta(text.text)),
+                            Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::Reasoning(reasoning),
+                            ))) => {
+                                let text = reasoning_text(&reasoning);
+                                (!text.is_empty()).then_some(AgentOutput::ReasoningDelta(text))
+                            }
+                            Some(Ok(MultiTurnStreamItem::StreamAssistantItem(
+                                StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+                            ))) => Some(AgentOutput::ReasoningDelta(reasoning)),
+                            Some(Ok(MultiTurnStreamItem::CompletionCall(call)))
+                                if call.usage.has_values() => {
+                                    Some(AgentOutput::Usage(to_token_usage(call.usage)))
+                                }
+                            Some(Ok(MultiTurnStreamItem::FinalResponse(_))) => {
+                                Some(AgentOutput::Completed)
+                            }
+                            Some(Ok(_)) => None,
+                            Some(Err(_)) if request.cancellation.is_cancelled() => {
+                                Some(AgentOutput::Cancelled)
+                            }
+                            Some(Err(error)) => Some(AgentOutput::Failed(error.to_string())),
+                            None => Some(AgentOutput::Failed(
+                                "Rig agent 事件流未产生终止结果".to_string(),
+                            )),
+                        };
+
+                        if let Some(output) = output {
+                            let terminal = matches!(
+                                output,
+                                AgentOutput::Completed
+                                    | AgentOutput::Cancelled
+                                    | AgentOutput::Failed(_)
+                            );
+                            if event_tx.send(output).await.is_err() || terminal {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         Ok(BackendRun {
-            events: Box::pin(events),
+            events: Box::pin(ReceiverStream::new(event_rx)),
             backend_handle: None,
         })
     }
@@ -72,56 +174,231 @@ impl AgentBackend for RigBackend {
     }
 }
 
-/// 构造使用 OpenAI Responses API 的 Rig provider。
-pub fn openai_responses_provider(
+/// 构造使用 OpenAI Responses API 的 Rig runtime。
+pub fn openai_responses_runtime(
     base_url: String,
     api_key: String,
     model: String,
-) -> Result<Arc<dyn ModelProvider>> {
+    executor: Arc<CompositeExecutor>,
+) -> Result<RigRuntime> {
     let client = rig_core::providers::openai::Client::builder()
         .api_key(&api_key)
         .base_url(&base_url)
         .build()
         .context("无法创建 Rig OpenAI Responses client")?;
-    Ok(Arc::new(RigModelProvider::new(
+    Ok(build_runtime(
         client.completion_model(model),
         "openai_responses",
-    )))
+        executor,
+    ))
 }
 
-/// 构造使用 OpenAI Chat Completions 兼容协议的 Rig provider。
-pub fn openai_chat_provider(
+/// 构造使用 OpenAI Chat Completions 兼容协议的 Rig runtime。
+pub fn openai_chat_runtime(
     base_url: String,
     api_key: String,
     model: String,
-) -> Result<Arc<dyn ModelProvider>> {
+    executor: Arc<CompositeExecutor>,
+) -> Result<RigRuntime> {
     let client = rig_core::providers::openai::Client::builder()
         .api_key(&api_key)
         .base_url(&base_url)
         .build()
         .context("无法创建 Rig OpenAI client")?
         .completions_api();
-    Ok(Arc::new(RigModelProvider::new(
+    Ok(build_runtime(
         client.completion_model(model),
         "openai_chat_completions",
-    )))
+        executor,
+    ))
 }
 
-/// 构造使用 Rig 原生 DeepSeek 适配器的 provider。
-pub fn deepseek_provider(
+/// 构造使用 Rig 原生 DeepSeek 适配器的 runtime。
+pub fn deepseek_runtime(
     base_url: String,
     api_key: String,
     model: String,
-) -> Result<Arc<dyn ModelProvider>> {
+    executor: Arc<CompositeExecutor>,
+) -> Result<RigRuntime> {
     let client = rig_core::providers::deepseek::Client::builder()
         .api_key(&api_key)
         .base_url(&base_url)
         .build()
         .context("无法创建 Rig DeepSeek client")?;
-    Ok(Arc::new(RigModelProvider::new(
+    Ok(build_runtime(
         client.completion_model(model),
         "deepseek",
-    )))
+        executor,
+    ))
+}
+
+fn build_runtime<M>(
+    model: M,
+    vendor_name: &'static str,
+    executor: Arc<CompositeExecutor>,
+) -> RigRuntime
+where
+    M: CompletionModel + Send + Sync + 'static,
+    M::StreamingResponse: 'static,
+{
+    RigRuntime {
+        backend: Arc::new(RigBackend::new(model.clone(), executor)),
+        compaction_provider: Arc::new(RigModelProvider::new(model, vendor_name)),
+    }
+}
+
+struct DiscoToolHook {
+    run_id: Uuid,
+    approval_manager: Arc<ApprovalManager>,
+    event_tx: mpsc::Sender<AgentOutput>,
+    cancellation: CancellationToken,
+    tool_call_count: AtomicUsize,
+}
+
+impl AgentHook for DiscoToolHook {
+    async fn on_tool_call(
+        &self,
+        _context: &rig_agent::agent::HookContext,
+        event: ToolCallEvent<'_>,
+    ) -> ToolCallAction {
+        if self.tool_call_count.fetch_add(1, Ordering::Relaxed) >= MAX_TOOL_CALLS {
+            return ToolCallAction::stop(format!("工具调用超过上限 {MAX_TOOL_CALLS}"));
+        }
+
+        let call_id = event.tool_call_id.unwrap_or(event.internal_call_id);
+        if self
+            .event_tx
+            .send(AgentOutput::ToolStarted {
+                tool_call_id: call_id.to_string(),
+                tool_name: event.tool_name.to_string(),
+                arguments: event.args.to_string(),
+            })
+            .await
+            .is_err()
+        {
+            return ToolCallAction::stop("Disco 事件通道已关闭");
+        }
+
+        let request = tool_approval_request(self.run_id, event.tool_name, event.args);
+        if self
+            .event_tx
+            .send(AgentOutput::ApprovalWaiting {
+                approval_id: request.id,
+                kind: request.kind.clone(),
+                title: request.title.clone(),
+                impact: request.impact.clone(),
+                fingerprint: request.fingerprint.clone(),
+                allows_session_approval: request.allows_session_approval,
+            })
+            .await
+            .is_err()
+        {
+            return ToolCallAction::stop("Disco 事件通道已关闭");
+        }
+
+        let decision = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => {
+                return ToolCallAction::stop("运行已取消");
+            }
+            decision = self.approval_manager.request_approval(&request) => decision,
+        };
+        if self
+            .event_tx
+            .send(AgentOutput::ApprovalResolved {
+                approval_id: request.id,
+                decision,
+            })
+            .await
+            .is_err()
+        {
+            return ToolCallAction::stop("Disco 事件通道已关闭");
+        }
+
+        match decision {
+            ApprovalDecision::Decline => ToolCallAction::skip("Tool execution declined by user"),
+            ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveForSession => {
+                ToolCallAction::run()
+            }
+        }
+    }
+
+    async fn on_tool_result(
+        &self,
+        _context: &rig_agent::agent::HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let call_id = event.tool_call_id.unwrap_or(event.internal_call_id);
+        let _ = self
+            .event_tx
+            .send(AgentOutput::ToolCompleted {
+                tool_call_id: call_id.to_string(),
+                tool_name: event.tool_name.to_string(),
+                output: event.presentation.render(),
+            })
+            .await;
+        ToolResultAction::keep()
+    }
+
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(kind, StepEventKind::ToolCall | StepEventKind::ToolResult)
+    }
+}
+
+fn build_dynamic_tools(
+    executor: Arc<CompositeExecutor>,
+    run_id: Uuid,
+    workspace_path: Option<String>,
+) -> Vec<DynamicTool> {
+    executor
+        .definitions()
+        .into_iter()
+        .map(|definition| {
+            let executor = executor.clone();
+            let tool_name = definition.name.clone();
+            let workspace_path = workspace_path.clone();
+            DynamicTool::new(
+                definition.name,
+                definition.description,
+                definition.input_schema,
+                move |_context, arguments| {
+                    let executor = executor.clone();
+                    let tool_name = tool_name.clone();
+                    let workspace_path = workspace_path.clone();
+                    Box::pin(async move {
+                        let arguments = serde_json::to_string(&arguments).map_err(|error| {
+                            ToolExecutionError::invalid_args(format!("无法序列化工具参数: {error}"))
+                        })?;
+                        let result = executor
+                            .execute(
+                                &ToolCall {
+                                    call_id: Uuid::new_v4().to_string(),
+                                    name: tool_name,
+                                    arguments,
+                                },
+                                &ToolContext {
+                                    run_id,
+                                    workspace_path,
+                                },
+                            )
+                            .await
+                            .map_err(ToolExecutionError::other)?;
+                        Ok(ToolOutput::text(result.output))
+                    })
+                },
+            )
+        })
+        .collect()
+}
+
+fn to_token_usage(usage: rig_core::completion::Usage) -> TokenUsage {
+    TokenUsage {
+        input: usage.input_tokens.try_into().unwrap_or(i64::MAX),
+        output: usage.output_tokens.try_into().unwrap_or(i64::MAX),
+        total: usage.total_tokens.try_into().unwrap_or(i64::MAX),
+        cached_input: Some(usage.cached_input_tokens.try_into().unwrap_or(i64::MAX)),
+        reasoning_output: Some(usage.reasoning_tokens.try_into().unwrap_or(i64::MAX)),
+    }
 }
 
 struct RigModelProvider<M> {
@@ -213,17 +490,7 @@ where
                     StreamedAssistantContent::Final(raw_response) => {
                         let usage = raw_response.token_usage();
                         if usage.has_values() {
-                            yield ProviderEvent::Usage(TokenUsage {
-                                input: usage.input_tokens.try_into().unwrap_or(i64::MAX),
-                                output: usage.output_tokens.try_into().unwrap_or(i64::MAX),
-                                total: usage.total_tokens.try_into().unwrap_or(i64::MAX),
-                                cached_input: Some(
-                                    usage.cached_input_tokens.try_into().unwrap_or(i64::MAX),
-                                ),
-                                reasoning_output: Some(
-                                    usage.reasoning_tokens.try_into().unwrap_or(i64::MAX),
-                                ),
-                            });
+                            yield ProviderEvent::Usage(to_token_usage(usage));
                         }
                     }
                     StreamedAssistantContent::Unknown(_) => {}
@@ -293,6 +560,7 @@ fn reasoning_text(reasoning: &Reasoning) -> String {
 mod tests {
     use disco_core::{AgentOutput, ApprovalManager};
     use disco_providers::openai_responses::ToolCallInfo;
+    use disco_tools::ToolResult;
     use rig_core::completion::Usage;
     use rig_core::test_utils::{MockCompletionModel, MockStreamEvent};
     use tokio::sync::Mutex;
@@ -301,6 +569,39 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    struct RecordingToolExecutor {
+        calls: Arc<Mutex<Vec<ToolCall>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for RecordingToolExecutor {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "echo".to_string(),
+                description: "返回输入值".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _context: &ToolContext,
+        ) -> Result<ToolResult, String> {
+            self.calls.lock().await.push(call.clone());
+            Ok(ToolResult {
+                call_id: call.call_id.clone(),
+                output: "echo:ok".to_string(),
+            })
+        }
+
+        async fn cancel(&self, _run_id: Uuid) {}
+    }
 
     #[test]
     fn maps_tool_call_history_with_provider_correlation_id() {
@@ -405,12 +706,17 @@ mod tests {
 
     #[tokio::test]
     async fn rig_backend_exposes_the_common_run_contract() {
+        let usage = Usage {
+            input_tokens: 8,
+            output_tokens: 3,
+            total_tokens: 11,
+            ..Usage::new()
+        };
         let model = MockCompletionModel::from_stream_turns([[
             MockStreamEvent::text("完成"),
-            MockStreamEvent::final_response_with_default_usage(),
+            MockStreamEvent::final_response(usage),
         ]]);
-        let provider: Arc<dyn ModelProvider> = Arc::new(RigModelProvider::new(model, "test"));
-        let backend = RigBackend::new(provider, Arc::new(CompositeExecutor::new()));
+        let backend = RigBackend::new(model, Arc::new(CompositeExecutor::new()));
         let request = BackendRunRequest {
             run_id: Uuid::new_v4(),
             session: BackendSession {
@@ -432,6 +738,166 @@ mod tests {
         assert_eq!(run.backend_handle, None);
         let events = run.events.collect::<Vec<_>>().await;
         assert!(matches!(&events[0], AgentOutput::TextDelta(text) if text == "完成"));
-        assert!(matches!(&events[1], AgentOutput::Completed));
+        assert!(matches!(
+            &events[1],
+            AgentOutput::Usage(usage)
+                if usage.input == 8 && usage.output == 3 && usage.total == 11
+        ));
+        assert!(matches!(&events[2], AgentOutput::Completed));
+    }
+
+    #[tokio::test]
+    async fn rig_backend_runs_approved_tool_and_continues_model_loop() {
+        let model = MockCompletionModel::from_stream_turns([
+            [
+                MockStreamEvent::tool_call(
+                    "internal-call-1",
+                    "echo",
+                    serde_json::json!({"value": "ok"}),
+                )
+                .with_call_id("provider-call-1"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+            [
+                MockStreamEvent::text("工具已执行"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = CompositeExecutor::new();
+        executor.register(Box::new(RecordingToolExecutor {
+            calls: calls.clone(),
+        }));
+        let approval_manager = Arc::new(ApprovalManager::new(Arc::new(Mutex::new(Vec::new()))));
+        let backend = RigBackend::new(model.clone(), Arc::new(executor));
+        let request = BackendRunRequest {
+            run_id: Uuid::new_v4(),
+            session: BackendSession {
+                id: Uuid::new_v4(),
+                model: "test-model".to_string(),
+                backend_handle: None,
+            },
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                text: "调用 echo".to_string(),
+                ..Default::default()
+            }],
+            workspace_path: Some("/workspace".to_string()),
+            cancellation: CancellationToken::new(),
+            approval_manager: approval_manager.clone(),
+        };
+
+        let mut events = backend.start_run(request).await.unwrap().events;
+        let mut received = Vec::new();
+        while let Some(event) = events.next().await {
+            if let AgentOutput::ApprovalWaiting { approval_id, .. } = &event {
+                let mut responded = approval_manager
+                    .respond(*approval_id, ApprovalDecision::ApproveOnce)
+                    .await;
+                for _ in 0..100 {
+                    if responded {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    responded = approval_manager
+                        .respond(*approval_id, ApprovalDecision::ApproveOnce)
+                        .await;
+                }
+                assert!(responded, "审批请求应在事件发出后完成注册");
+            }
+            received.push(event);
+        }
+
+        assert!(matches!(
+            &received[0],
+            AgentOutput::ToolStarted {
+                tool_call_id,
+                tool_name,
+                ..
+            } if tool_call_id == "provider-call-1" && tool_name == "echo"
+        ));
+        assert!(matches!(&received[1], AgentOutput::ApprovalWaiting { .. }));
+        assert!(matches!(
+            &received[2],
+            AgentOutput::ApprovalResolved {
+                decision: ApprovalDecision::ApproveOnce,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &received[3],
+            AgentOutput::ToolCompleted { output, .. } if output == "echo:ok"
+        ));
+        assert!(matches!(
+            &received[4],
+            AgentOutput::TextDelta(text) if text == "工具已执行"
+        ));
+        assert!(matches!(&received[5], AgentOutput::Completed));
+        assert_eq!(model.request_count(), 2);
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "echo");
+        assert_eq!(calls[0].arguments, r#"{"value":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_waiting_for_rig_tool_approval_is_terminal() {
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::tool_call(
+                "internal-call-1",
+                "echo",
+                serde_json::json!({"value": "ok"}),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = CompositeExecutor::new();
+        executor.register(Box::new(RecordingToolExecutor {
+            calls: calls.clone(),
+        }));
+        let cancellation = CancellationToken::new();
+        let backend = RigBackend::new(model, Arc::new(executor));
+        let request = BackendRunRequest {
+            run_id: Uuid::new_v4(),
+            session: BackendSession {
+                id: Uuid::new_v4(),
+                model: "test-model".to_string(),
+                backend_handle: None,
+            },
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                text: "调用 echo".to_string(),
+                ..Default::default()
+            }],
+            workspace_path: None,
+            cancellation: cancellation.clone(),
+            approval_manager: Arc::new(ApprovalManager::new(Arc::new(Mutex::new(Vec::new())))),
+        };
+
+        let mut events = backend.start_run(request).await.unwrap().events;
+        assert!(matches!(
+            events.next().await,
+            Some(AgentOutput::ToolStarted { .. })
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(AgentOutput::ApprovalWaiting { .. })
+        ));
+        cancellation.cancel();
+        let remaining = events.collect::<Vec<_>>().await;
+
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|event| matches!(event, AgentOutput::Cancelled))
+                .count(),
+            1
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|event| matches!(event, AgentOutput::Completed | AgentOutput::Failed(_)))
+        );
+        assert!(calls.lock().await.is_empty());
     }
 }

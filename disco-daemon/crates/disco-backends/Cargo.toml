@@ -13,11 +13,12 @@ async-stream = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 rig-core = { workspace = true }
+rig-agent = { workspace = true }
 serde_json = { workspace = true }
 futures-core = { workspace = true }
 
 [dev-dependencies]
-tokio-util = { workspace = true }
 rig-core = { workspace = true, features = ["test-utils"] }

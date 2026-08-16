@@ -6,9 +6,7 @@ use std::sync::Arc;
 
 use crate::router;
 use anyhow::{Context, Result};
-use disco_backends::{
-    RigBackend, deepseek_provider, openai_chat_provider, openai_responses_provider,
-};
+use disco_backends::{deepseek_runtime, openai_chat_runtime, openai_responses_runtime};
 use disco_core::{AgentBackend, RunCoordinator};
 use disco_persist::Database;
 use disco_protocol::types::{ProviderId, Vendor};
@@ -23,7 +21,7 @@ use tracing::{debug, error, info, warn};
 /// 一个 Provider profile 对应的运行时依赖。
 pub struct ProviderRuntime {
     pub backend: Arc<dyn AgentBackend>,
-    /// 迁移期仅供上下文压缩使用；RigBackend 落地后由 Backend 自己实现 compact capability。
+    /// 迁移期仅供上下文压缩使用；后续由 Backend 自己实现 compact capability。
     pub compaction_provider: Arc<dyn ModelProvider>,
 }
 
@@ -35,16 +33,18 @@ pub fn api_key_provider_runtime(
     model: String,
     executor: Arc<CompositeExecutor>,
 ) -> Result<ProviderRuntime> {
-    let provider = match vendor {
-        Vendor::Openai | Vendor::Codex => openai_responses_provider(base_url, api_key, model)?,
-        Vendor::Deepseek => deepseek_provider(base_url, api_key, model)?,
+    let runtime = match vendor {
+        Vendor::Openai | Vendor::Codex => {
+            openai_responses_runtime(base_url, api_key, model, executor)?
+        }
+        Vendor::Deepseek => deepseek_runtime(base_url, api_key, model, executor)?,
         Vendor::MoonshotKimi | Vendor::KimiCode | Vendor::Glm => {
-            openai_chat_provider(base_url, api_key, model)?
+            openai_chat_runtime(base_url, api_key, model, executor)?
         }
     };
     Ok(ProviderRuntime {
-        backend: Arc::new(RigBackend::new(provider.clone(), executor)),
-        compaction_provider: provider,
+        backend: runtime.backend,
+        compaction_provider: runtime.compaction_provider,
     })
 }
 

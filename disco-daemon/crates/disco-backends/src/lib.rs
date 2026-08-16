@@ -2,4 +2,4 @@ mod codex;
 mod rig;
 
 pub use codex::CodexAdapter;
-pub use rig::{RigBackend, deepseek_provider, openai_chat_provider, openai_responses_provider};
+pub use rig::{RigRuntime, deepseek_runtime, openai_chat_runtime, openai_responses_runtime};

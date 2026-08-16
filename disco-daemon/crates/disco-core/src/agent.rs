@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::approval::{ApprovalManager, ApprovalRequest, impact_from_tool_call, make_fingerprint};
+use crate::approval::{ApprovalManager, tool_approval_request};
 
 const MAX_MODEL_ROUNDS: usize = 8;
 const MAX_TOOL_CALLS: usize = 16;
@@ -333,42 +333,22 @@ async fn request_tool_approval(
     tool_name: &str,
     arguments: &str,
 ) -> (Uuid, ApprovalDecision) {
-    let approval_id = Uuid::new_v4();
-    let fingerprint = make_fingerprint(tool_name, arguments);
-    let impact = impact_from_tool_call(tool_name, arguments);
-
-    let kind = match &impact {
-        ApprovalImpact::Command { .. } => "command",
-        ApprovalImpact::FileChange { .. } => "file_change",
-        ApprovalImpact::Network { .. } => "network",
-        ApprovalImpact::Permission { .. } => "permission",
-    };
-
-    let request = ApprovalRequest {
-        id: approval_id,
-        run_id,
-        kind: kind.to_string(),
-        title: format!("Execute tool: {tool_name}"),
-        reason: None,
-        impact: impact.clone(),
-        fingerprint: fingerprint.clone(),
-        allows_session_approval: true,
-    };
+    let request = tool_approval_request(run_id, tool_name, arguments);
 
     // Notify the daemon that we're waiting for approval
     let _ = tx
         .send(AgentOutput::ApprovalWaiting {
-            approval_id,
-            kind: kind.to_string(),
-            title: format!("Execute tool: {tool_name}"),
-            impact,
-            fingerprint,
-            allows_session_approval: true,
+            approval_id: request.id,
+            kind: request.kind.clone(),
+            title: request.title.clone(),
+            impact: request.impact.clone(),
+            fingerprint: request.fingerprint.clone(),
+            allows_session_approval: request.allows_session_approval,
         })
         .await;
 
     // Block until the user responds
-    (approval_id, manager.request_approval(&request).await)
+    (request.id, manager.request_approval(&request).await)
 }
 
 fn accumulate_usage(prev: &Option<TokenUsage>, current: &TokenUsage) -> TokenUsage {

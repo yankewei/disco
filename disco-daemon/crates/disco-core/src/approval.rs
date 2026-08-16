@@ -126,6 +126,28 @@ pub fn make_fingerprint(tool_name: &str, arguments: &str) -> String {
     format!("{tool_name}:{arguments}")
 }
 
+/// 为一次工具调用构造稳定的审批请求。
+pub fn tool_approval_request(run_id: Uuid, tool_name: &str, arguments: &str) -> ApprovalRequest {
+    let impact = impact_from_tool_call(tool_name, arguments);
+    let kind = match &impact {
+        ApprovalImpact::Command { .. } => "command",
+        ApprovalImpact::FileChange { .. } => "file_change",
+        ApprovalImpact::Network { .. } => "network",
+        ApprovalImpact::Permission { .. } => "permission",
+    };
+
+    ApprovalRequest {
+        id: Uuid::new_v4(),
+        run_id,
+        kind: kind.to_string(),
+        title: format!("Execute tool: {tool_name}"),
+        reason: None,
+        impact,
+        fingerprint: make_fingerprint(tool_name, arguments),
+        allows_session_approval: true,
+    }
+}
+
 /// Build an `ApprovalImpact` from a tool call. Currently produces a
 /// generic Command impact; in the future each executor can provide its
 /// own impact details.
@@ -342,5 +364,28 @@ mod tests {
             }
             _ => panic!("Expected Permission impact"),
         }
+    }
+
+    #[test]
+    fn tool_approval_request_preserves_policy_metadata() {
+        let run_id = Uuid::new_v4();
+        let request = tool_approval_request(
+            run_id,
+            "shell",
+            r#"{"command":"git status","cwd":"/workspace"}"#,
+        );
+
+        assert_eq!(request.run_id, run_id);
+        assert_eq!(request.kind, "command");
+        assert_eq!(
+            request.fingerprint,
+            r#"shell:{"command":"git status","cwd":"/workspace"}"#
+        );
+        assert!(request.allows_session_approval);
+        assert!(matches!(
+            request.impact,
+            ApprovalImpact::Command { ref executable, ref cwd, .. }
+                if executable == "git" && cwd == "/workspace"
+        ));
     }
 }
