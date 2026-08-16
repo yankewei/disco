@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, BackendCapabilities, BackendRun, BackendRunRequest,
-    BackendSession, tool_approval_request,
+    BackendSession, PreparedApproval, tool_approval_request,
 };
 use disco_protocol::types::{ApprovalDecision, TokenUsage};
 use disco_providers::{ChatMessage, ModelProvider, ProviderEvent};
@@ -280,28 +280,25 @@ impl AgentHook for DiscoToolHook {
         }
 
         let request = tool_approval_request(self.run_id, event.tool_name, event.args);
-        if self
-            .event_tx
-            .send(AgentOutput::ApprovalWaiting {
-                approval_id: request.id,
-                kind: request.kind.clone(),
-                title: request.title.clone(),
-                impact: request.impact.clone(),
-                fingerprint: request.fingerprint.clone(),
-                allows_session_approval: request.allows_session_approval,
-            })
-            .await
-            .is_err()
-        {
-            return ToolCallAction::stop("Disco 事件通道已关闭");
-        }
-
-        let decision = tokio::select! {
-            biased;
-            _ = self.cancellation.cancelled() => {
-                return ToolCallAction::stop("运行已取消");
+        let decision = match self.approval_manager.prepare_approval(&request).await {
+            PreparedApproval::SessionApproved => ApprovalDecision::ApproveOnce,
+            PreparedApproval::Pending(pending) => {
+                if self
+                    .event_tx
+                    .send(AgentOutput::approval_waiting(&request))
+                    .await
+                    .is_err()
+                {
+                    return ToolCallAction::stop("Disco 事件通道已关闭");
+                }
+                tokio::select! {
+                    biased;
+                    _ = self.cancellation.cancelled() => {
+                        return ToolCallAction::stop("运行已取消");
+                    }
+                    decision = pending.wait() => decision,
+                }
             }
-            decision = self.approval_manager.request_approval(&request) => decision,
         };
         if self
             .event_tx

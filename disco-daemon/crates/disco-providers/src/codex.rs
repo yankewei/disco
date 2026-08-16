@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
@@ -158,6 +158,15 @@ struct ActiveTurn {
     turn_id: Option<String>,
 }
 
+/// 事件流被取消时同步终止尚未完成的 turn/start 任务，避免留下 detached turn。
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 // MARK: - Write request for the writer task
 
 enum WriteRequest {
@@ -286,64 +295,28 @@ impl CodexProvider {
         messages: &[ChatMessage],
     ) -> Result<impl Stream<Item = Result<CodexProviderEvent>>> {
         let (event_tx, mut event_rx) = mpsc::channel::<CodexProviderEvent>(64);
-        let state = self.state.clone();
-        let executable = self.executable.clone();
-        let model = self.model.clone();
-        let reasoning_effort = self.reasoning_effort.clone();
-        let cwd = self.cwd.clone();
-        let resume_thread_id = self.resume_thread_id.clone();
-        let shutdown_tx = self.shutdown_tx.clone();
-
-        // Extract the user input (last user message)
         let user_input = messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
             .map(|m| m.text.clone())
             .unwrap_or_default();
-
-        tokio::spawn(async move {
-            if let Err(e) = Self::ensure_ready(
-                &state,
-                &executable,
-                &model,
-                resume_thread_id.as_deref(),
-                cwd.as_deref(),
-                &shutdown_tx,
-            )
+        self.ensure_session().await?;
+        let thread_id = self
+            .state
+            .lock()
             .await
-            {
-                let _ = event_tx
-                    .send(CodexProviderEvent::Failed(e.to_string()))
-                    .await;
-                return;
-            }
-
-            // Get the thread ID
-            let thread_id = {
-                let s = state.lock().await;
-                s.thread_id.clone()
-            };
-
-            let Some(thread_id) = thread_id else {
-                let _ = event_tx
-                    .send(CodexProviderEvent::Failed(
-                        "Codex thread 尚未初始化".to_string(),
-                    ))
-                    .await;
-                return;
-            };
-
-            {
-                let mut s = state.lock().await;
-                s.active_turn = Some(ActiveTurn {
-                    sender: event_tx.clone(),
-                    turn_id: None,
-                });
-            }
-
-            // pending 必须在写入前登记，否则极快响应可能先于 pending 到达。
-            if let Err(error) = Self::send_request(
+            .thread_id
+            .clone()
+            .context("Codex thread 尚未初始化")?;
+        self.state.lock().await.active_turn = Some(ActiveTurn {
+            sender: event_tx,
+            turn_id: None,
+        });
+        let state = self.state.clone();
+        let reasoning_effort = self.reasoning_effort.clone();
+        let startup = AbortTaskOnDrop(tokio::spawn(async move {
+            let response = Self::send_request(
                 &state,
                 "turn/start",
                 serde_json::json!({
@@ -352,20 +325,35 @@ impl CodexProvider {
                     "effort": reasoning_effort,
                 }),
             )
-            .await
-            {
-                let _ = event_tx
-                    .send(CodexProviderEvent::Failed(format!(
-                        "turn/start failed: {error}"
-                    )))
-                    .await;
-                state.lock().await.active_turn = None;
-                return;
+            .await;
+            match response {
+                Ok(response) => {
+                    if let Some(turn_id) = response["turn"]["id"].as_str() {
+                        let mut state = state.lock().await;
+                        if let Some(active_turn) = &mut state.active_turn
+                            && active_turn.turn_id.is_none()
+                        {
+                            active_turn.turn_id = Some(turn_id.to_string());
+                        }
+                    }
+                    debug!("turn/start response received");
+                }
+                Err(error) => {
+                    let active_turn = state.lock().await.active_turn.take();
+                    if let Some(active_turn) = active_turn {
+                        let _ = active_turn
+                            .sender
+                            .send(CodexProviderEvent::Failed(format!(
+                                "turn/start failed: {error}"
+                            )))
+                            .await;
+                    }
+                }
             }
-            debug!("turn/start response received");
-        });
+        }));
 
         let stream = async_stream::try_stream! {
+            let _startup = startup;
             while let Some(event) = event_rx.recv().await {
                 yield event;
             }
@@ -955,6 +943,28 @@ impl CodexProvider {
         Ok(())
     }
 
+    /// turn/start 已提交但 turn ID 尚未到达时短暂等待，避免把取消误报为成功。
+    pub async fn interrupt_when_ready(&self) -> Result<()> {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let turn_is_ready = {
+                    let state = self.state.lock().await;
+                    let Some(active_turn) = state.active_turn.as_ref() else {
+                        return Err(anyhow::anyhow!("No active turn"));
+                    };
+                    active_turn.turn_id.is_some()
+                };
+                if turn_is_ready {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("等待 Codex turn ID 超时")??;
+        self.interrupt().await
+    }
+
     /// 删除当前 Codex thread。调用方必须在删除本地会话前等待该操作成功。
     pub async fn delete_thread(&self) -> Result<()> {
         let thread_id = self
@@ -985,6 +995,15 @@ impl CodexProvider {
 
     /// Stop the codex subprocess.
     pub async fn stop(&self) {
+        self.stop_transport(true).await;
+    }
+
+    /// 无法按 turn 中断时终止 transport，但保留 thread ID 供下一次运行恢复。
+    pub async fn abort_active_transport(&self) {
+        self.stop_transport(false).await;
+    }
+
+    async fn stop_transport(&self, clear_thread: bool) {
         let mut s = self.state.lock().await;
 
         // Fail pending requests
@@ -1010,8 +1029,10 @@ impl CodexProvider {
             .take();
 
         s.is_initialized = false;
-        s.thread_id = None;
         s.is_thread_attached = false;
+        if clear_thread {
+            s.thread_id = None;
+        }
     }
 }
 

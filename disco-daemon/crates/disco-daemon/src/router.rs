@@ -222,35 +222,6 @@ async fn handle_run_start(req: &Request, app: &Arc<AppState>, out_tx: &Sender<St
             return error_response(req.id, RpcError::internal(&error.to_string()));
         }
     };
-    let backend_run = match backend
-        .start_run(BackendRunRequest {
-            run_id,
-            session: BackendSession {
-                id: session_id,
-                model: session.model,
-                backend_handle,
-            },
-            messages: chat_messages,
-            workspace_path,
-            cancellation: cancel,
-            approval_manager,
-        })
-        .await
-    {
-        Ok(run) => run,
-        Err(error) => {
-            app.run_coordinator.finish_run(run_id).await;
-            return error_response(req.id, RpcError::internal(&error.to_string()));
-        }
-    };
-    if let Some(handle) = backend_run.backend_handle.as_deref() {
-        if let Err(error) = app.db.set_session_backend_handle(session_id, handle) {
-            app.run_coordinator.cancel_run(run_id).await;
-            app.run_coordinator.finish_run(run_id).await;
-            return error_response(req.id, RpcError::internal(&error.to_string()));
-        }
-    }
-
     send_event(
         out_tx,
         &Event::run_state(RunStateData {
@@ -263,9 +234,65 @@ async fn handle_run_start(req: &Request, app: &Arc<AppState>, out_tx: &Sender<St
     // Spawn the agent task
     let out_tx_clone = out_tx.clone();
     let app_clone = Arc::clone(app);
-    let mut stream = backend_run.events;
+    let cancellation = cancel.clone();
+    let backend_request = BackendRunRequest {
+        run_id,
+        session: BackendSession {
+            id: session_id,
+            model: session.model,
+            backend_handle,
+        },
+        messages: chat_messages,
+        workspace_path,
+        cancellation: cancel,
+        approval_manager,
+    };
 
     tokio::spawn(async move {
+        let backend_run = match backend.start_run(backend_request).await {
+            Ok(run) => run,
+            Err(error) => {
+                let event = if cancellation.is_cancelled() {
+                    Event::run_cancelled(RunCancelledData { run_id, session_id })
+                } else {
+                    Event::run_failed(RunFailedData {
+                        run_id,
+                        session_id,
+                        error: RunError {
+                            code: ErrorCode::Generic,
+                            message: error.to_string(),
+                            recovery_suggestion: None,
+                            retryable: false,
+                        },
+                    })
+                };
+                send_event(&out_tx_clone, &event);
+                app_clone.run_coordinator.finish_run(run_id).await;
+                return;
+            }
+        };
+        if let Some(handle) = backend_run.backend_handle.as_deref()
+            && let Err(error) = app_clone.db.set_session_backend_handle(session_id, handle)
+        {
+            app_clone.run_coordinator.cancel_run(run_id).await;
+            send_event(
+                &out_tx_clone,
+                &Event::run_failed(RunFailedData {
+                    run_id,
+                    session_id,
+                    error: RunError {
+                        code: ErrorCode::Generic,
+                        message: error.to_string(),
+                        recovery_suggestion: None,
+                        retryable: false,
+                    },
+                }),
+            );
+            app_clone.run_coordinator.finish_run(run_id).await;
+            return;
+        }
+        let mut stream = backend_run.events;
+
         // Send run state: running
         send_event(
             &out_tx_clone,
@@ -964,10 +991,16 @@ mod tests {
     use disco_tools::CompositeExecutor;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
+    use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
 
     struct FailingDeleteBackend;
+
+    struct BlockingStartBackend {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
 
     #[async_trait::async_trait]
     impl AgentBackend for FailingDeleteBackend {
@@ -987,6 +1020,39 @@ mod tests {
 
         async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
             Err(anyhow::anyhow!("上游不可用"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for BlockingStartBackend {
+        fn capabilities(&self) -> disco_core::BackendCapabilities {
+            disco_core::BackendCapabilities {
+                has_persistent_sessions: true,
+                can_delete_session: true,
+            }
+        }
+
+        async fn start_run(
+            &self,
+            request: BackendRunRequest,
+        ) -> anyhow::Result<disco_core::BackendRun> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+            let terminal = if request.cancellation.is_cancelled() {
+                AgentOutput::Cancelled
+            } else {
+                AgentOutput::Completed
+            };
+            event_tx.send(terminal).await.unwrap();
+            Ok(disco_core::BackendRun {
+                events: Box::pin(tokio_stream::wrappers::ReceiverStream::new(event_rx)),
+                backend_handle: Some("blocking-session".to_string()),
+            })
+        }
+
+        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -1205,6 +1271,79 @@ mod tests {
 
         let resp = handle_run_cancel(&req, &app).await;
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_start_returns_before_backend_connects_and_can_be_cancelled() {
+        let app = make_test_app();
+        let provider_id = ProviderId::legacy_default_for_vendor(Vendor::Openai);
+        let compaction_provider = app.get_compaction_provider(&provider_id).await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        app.set_provider_runtime(
+            provider_id.clone(),
+            ProviderRuntime {
+                backend: Arc::new(BlockingStartBackend {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+                compaction_provider,
+            },
+        )
+        .await;
+        let project = app
+            .db
+            .create_project("连接阶段取消", "/tmp/disco-connect-cancel")
+            .unwrap();
+        let session = app
+            .db
+            .create_session(project.id, provider_id, Vendor::Openai, "gpt-4", None)
+            .unwrap();
+        let request = Request {
+            id: 1,
+            method: "run/start".to_string(),
+            params: serde_json::to_value(RunStartParams {
+                session_id: session.id,
+                text: "开始".to_string(),
+            })
+            .unwrap(),
+        };
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(16);
+
+        let response = timeout(
+            Duration::from_millis(100),
+            handle_run_start(&request, &app, &out_tx),
+        )
+        .await
+        .expect("run/start 不应等待 backend 连接完成");
+        let result: RunStartResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+
+        let cancel = Request {
+            id: 2,
+            method: "run/cancel".to_string(),
+            params: serde_json::to_value(RunCancelParams {
+                run_id: result.run_id,
+            })
+            .unwrap(),
+        };
+        assert!(handle_run_cancel(&cancel, &app).await.error.is_none());
+        release.notify_one();
+
+        let terminal = timeout(Duration::from_secs(1), async {
+            while let Some(line) = out_rx.recv().await {
+                let event = disco_protocol::decode_event(&line).unwrap();
+                if event.event.starts_with("run.") && event.event != "run.state" {
+                    return event.event;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal, "run.cancelled");
     }
 
     #[test]

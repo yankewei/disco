@@ -6,7 +6,9 @@ pub mod run;
 pub mod session;
 
 pub use agent::{AgentLoop, AgentOutput};
-pub use approval::{ApprovalManager, ApprovalRequest, tool_approval_request};
+pub use approval::{
+    ApprovalManager, ApprovalRequest, PendingApproval, PreparedApproval, tool_approval_request,
+};
 pub use backend::{
     AgentBackend, BackendCapabilities, BackendEventStream, BackendRun, BackendRunRequest,
     BackendSession,

@@ -18,10 +18,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, ApprovalRequest, BackendCapabilities, BackendRun,
-    BackendRunRequest, BackendSession,
+    BackendRunRequest, BackendSession, PreparedApproval,
 };
 use disco_protocol::types::{ApprovalDecision, ApprovalImpact};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -214,6 +215,13 @@ impl AgentBackend for AcpAdapter {
         let session_id = self.ensure_session_for_run(&request).await?;
         let backend_handle = session_id.to_string();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        if request.cancellation.is_cancelled() {
+            let _ = event_tx.send(AgentOutput::Cancelled);
+            return Ok(BackendRun {
+                events: Box::pin(UnboundedReceiverStream::new(event_rx)),
+                backend_handle: Some(backend_handle),
+            });
+        }
         let run_context = AcpRunContext {
             run_id: request.run_id,
             approval_manager: request.approval_manager.clone(),
@@ -234,7 +242,11 @@ impl AgentBackend for AcpAdapter {
             .send_request(PromptRequest::new(session_id.clone(), vec![prompt.into()]));
         let connection = self.connection.clone();
         let active_runs = self.active_run_by_session.clone();
+        let shutdown = self.shutdown.clone();
+        let connection_alive = self.connection_alive.clone();
         tokio::spawn(async move {
+            let prompt_task = prompt_request.block_task();
+            tokio::pin!(prompt_task);
             let terminal = tokio::select! {
                 biased;
                 _ = request.cancellation.cancelled() => {
@@ -244,9 +256,18 @@ impl AgentBackend for AcpAdapter {
                     {
                         tracing::warn!(%error, "无法向 ACP agent 发送 session/cancel");
                     }
-                    AgentOutput::Cancelled
+                    match timeout(Duration::from_secs(10), &mut prompt_task).await {
+                        Ok(_) => AgentOutput::Cancelled,
+                        Err(_) => {
+                            connection_alive.store(false, Ordering::Release);
+                            shutdown.cancel();
+                            AgentOutput::Failed(
+                                "ACP agent 未在取消后结束 prompt，连接已关闭".to_string(),
+                            )
+                        }
+                    }
                 }
-                response = prompt_request.block_task() => match response {
+                response = &mut prompt_task => match response {
                     Ok(response) => output_for_stop_reason(response.stop_reason),
                     Err(_) if request.cancellation.is_cancelled() => AgentOutput::Cancelled,
                     Err(error) => AgentOutput::Failed(format!("ACP prompt 失败: {error}")),
@@ -322,31 +343,29 @@ async fn forward_permission_request(
 
     connection.spawn(async move {
         let approval = approval_request_from_acp(run.run_id, &request, &run.tool_title_by_id);
-        if run
-            .event_tx
-            .send(AgentOutput::ApprovalWaiting {
-                approval_id: approval.id,
-                kind: approval.kind.clone(),
-                title: approval.title.clone(),
-                impact: approval.impact.clone(),
-                fingerprint: approval.fingerprint.clone(),
-                allows_session_approval: approval.allows_session_approval,
-            })
-            .is_err()
-        {
-            return responder.respond(RequestPermissionResponse::new(
-                RequestPermissionOutcome::Cancelled,
-            ));
-        }
-
-        let decision = tokio::select! {
-            biased;
-            _ = run.cancellation.cancelled() => {
-                return responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Cancelled,
-                ));
+        let decision = match run.approval_manager.prepare_approval(&approval).await {
+            PreparedApproval::SessionApproved => ApprovalDecision::ApproveOnce,
+            PreparedApproval::Pending(pending) => {
+                if run.cancellation.is_cancelled()
+                    || run
+                        .event_tx
+                        .send(AgentOutput::approval_waiting(&approval))
+                        .is_err()
+                {
+                    return responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    _ = run.cancellation.cancelled() => {
+                        return responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                    }
+                    decision = pending.wait() => decision,
+                }
             }
-            decision = run.approval_manager.request_approval(&approval) => decision,
         };
         let _ = run.event_tx.send(AgentOutput::ApprovalResolved {
             approval_id: approval.id,
@@ -473,19 +492,21 @@ fn approval_request_from_acp(
         .map(json_text)
         .unwrap_or_else(|| "{}".to_string());
     let impact = approval_impact(&request.tool_call, &title, &arguments);
+    let fingerprint = format!("acp:{title}:{arguments}");
 
     ApprovalRequest {
         id: Uuid::new_v4(),
         run_id,
         kind: "acp_permission".to_string(),
-        title: title.clone(),
+        title,
         reason: None,
         impact,
-        fingerprint: format!("acp:{title}:{arguments}"),
+        fingerprint,
+        // “本会话允许”由 Disco 的 fingerprint 缓存实现；下游仍只获得单次授权。
         allows_session_approval: request
             .options
             .iter()
-            .any(|option| option.kind == PermissionOptionKind::AllowAlways),
+            .any(|option| option.kind == PermissionOptionKind::AllowOnce),
     }
 }
 
@@ -518,23 +539,15 @@ fn permission_outcome(
     decision: ApprovalDecision,
     options: &[PermissionOption],
 ) -> RequestPermissionOutcome {
-    let preferred = match decision {
-        ApprovalDecision::ApproveOnce => [
-            PermissionOptionKind::AllowOnce,
-            PermissionOptionKind::AllowAlways,
-        ],
-        ApprovalDecision::ApproveForSession => [
-            PermissionOptionKind::AllowAlways,
-            PermissionOptionKind::AllowOnce,
-        ],
-        ApprovalDecision::Decline => [
-            PermissionOptionKind::RejectOnce,
-            PermissionOptionKind::RejectAlways,
-        ],
+    let required_kind = match decision {
+        ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveForSession => {
+            PermissionOptionKind::AllowOnce
+        }
+        ApprovalDecision::Decline => PermissionOptionKind::RejectOnce,
     };
-    preferred
+    options
         .iter()
-        .find_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .find(|option| option.kind == required_kind)
         .map(|option| {
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                 option.option_id.clone(),
@@ -581,6 +594,7 @@ mod tests {
         SessionDeleteCapabilities, TextContent, ToolCallUpdateFields,
     };
     use disco_providers::ChatMessage;
+    use tokio::sync::Notify;
     use tokio_stream::StreamExt;
 
     use super::*;
@@ -814,19 +828,12 @@ mod tests {
         let mut events = Vec::new();
         while let Some(event) = run.events.next().await {
             if let AgentOutput::ApprovalWaiting { approval_id, .. } = &event {
-                let mut responded = approval_manager
-                    .respond(*approval_id, ApprovalDecision::ApproveForSession)
-                    .await;
-                for _ in 0..100 {
-                    if responded {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    responded = approval_manager
+                assert!(
+                    approval_manager
                         .respond(*approval_id, ApprovalDecision::ApproveForSession)
-                        .await;
-                }
-                assert!(responded, "审批请求应在事件发出后完成注册");
+                        .await,
+                    "审批事件发出前必须已完成 pending 注册"
+                );
             }
             events.push(event);
         }
@@ -860,7 +867,7 @@ mod tests {
                 .lock()
                 .expect("permission outcome mutex poisoned")
                 .as_slice(),
-            [RequestPermissionOutcome::Selected(selected)] if selected.option_id.to_string() == "allow-always"
+            [RequestPermissionOutcome::Selected(selected)] if selected.option_id.to_string() == "allow-once"
         ));
 
         let second = backend
@@ -915,6 +922,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.delete_session_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn disco_session_approval_never_selects_persistent_acp_permission() {
+        let options = vec![PermissionOption::new(
+            "allow-always",
+            "永久允许",
+            PermissionOptionKind::AllowAlways,
+        )];
+
+        assert!(matches!(
+            permission_outcome(ApprovalDecision::ApproveForSession, &options),
+            RequestPermissionOutcome::Cancelled
+        ));
+        assert!(matches!(
+            permission_outcome(ApprovalDecision::ApproveOnce, &options),
+            RequestPermissionOutcome::Cancelled
+        ));
     }
 
     #[tokio::test]
@@ -1001,5 +1026,97 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(cancel_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_the_acp_prompt_to_finish() {
+        let prompt_responder = Arc::new(StdMutex::new(None::<Responder<PromptResponse>>));
+        let prompt_received = Arc::new(AtomicBool::new(false));
+        let cancel_received = Arc::new(Notify::new());
+        let prompt_handler_responder = prompt_responder.clone();
+        let prompt_handler_received = prompt_received.clone();
+        let cancel_handler_received = cancel_received.clone();
+
+        let agent = Agent
+            .builder()
+            .on_receive_request(
+                async move |request: InitializeRequest,
+                            responder: Responder<InitializeResponse>,
+                            _connection: ConnectionTo<Client>| {
+                    responder.respond(InitializeResponse::new(request.protocol_version))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_request: NewSessionRequest,
+                            responder: Responder<NewSessionResponse>,
+                            _connection: ConnectionTo<Client>| {
+                    responder.respond(NewSessionResponse::new("delayed-cancel-session"))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_request: PromptRequest,
+                            responder: Responder<PromptResponse>,
+                            _connection: ConnectionTo<Client>| {
+                    *prompt_handler_responder
+                        .lock()
+                        .expect("prompt responder mutex poisoned") = Some(responder);
+                    prompt_handler_received.store(true, Ordering::Release);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |_notification: CancelNotification,
+                            _connection: ConnectionTo<Client>| {
+                    cancel_handler_received.notify_one();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            );
+        let backend = AcpAdapter::connect_transport(agent).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let mut run = backend
+            .start_run(backend_request(
+                None,
+                cancellation.clone(),
+                Arc::new(ApprovalManager::new(Arc::new(Mutex::new(Vec::new())))),
+            ))
+            .await
+            .unwrap();
+
+        for _ in 0..100 {
+            if prompt_received.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(prompt_received.load(Ordering::Acquire));
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), cancel_received.notified())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), run.events.next())
+                .await
+                .is_err(),
+            "下游 prompt 结束前不应释放 ACP session"
+        );
+
+        prompt_responder
+            .lock()
+            .expect("prompt responder mutex poisoned")
+            .take()
+            .unwrap()
+            .respond(PromptResponse::new(StopReason::Cancelled))
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), run.events.next())
+                .await
+                .unwrap(),
+            Some(AgentOutput::Cancelled)
+        ));
+        assert!(run.events.next().await.is_none());
     }
 }
