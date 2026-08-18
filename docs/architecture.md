@@ -592,4 +592,4 @@ capability 和 namespaced extension 表达。
 - Codex app-server：https://github.com/openai/codex/tree/main/codex-rs/app-server
 - Codex app-server protocol：https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol
 - Rig：https://github.com/0xPlaygrounds/rig
-- 当前迁移期 DAP：`docs/disco-agent-protocol.md`
+- 已废弃的 DAP 协议存档：`docs/disco-agent-protocol.md`

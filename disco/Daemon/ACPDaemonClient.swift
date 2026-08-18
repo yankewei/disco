@@ -314,9 +314,8 @@ private struct ACPPermissionRequestParams: Decodable, Sendable {
     }
 }
 
-/// 通过 stdin/stdout 与 `disco-daemon --stdio` 通信的 ACP v1 client。
-///
-/// 该 client 目前是迁移期独立 transport，不替换现有 Unix socket `DaemonClient`。
+/// 通过 stdin/stdout 与 `disco-daemon --stdio` 通信的 ACP v1 client，
+/// daemon 唯一 transport。
 @MainActor
 final class ACPDaemonClient {
     enum State: Equatable, Sendable {

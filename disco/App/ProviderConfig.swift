@@ -15,7 +15,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// 迁移期 DAP 使用的 Rust Vendor wire value。
+    /// daemon 侧使用的 Rust Vendor wire value（`_disco/provider/*` 扩展参数）。
     var daemonVendor: String {
         switch self {
         case .deepseek: "deepseek"
