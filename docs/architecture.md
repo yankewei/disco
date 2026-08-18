@@ -2,8 +2,8 @@
 
 > 状态：目标架构基线。
 >
-> 本文描述迁移完成后的系统形态，不代表当前代码已经完成全部实现。当前 DAP、Swift
-> 本地运行时和手写 Provider 均属于迁移期实现；完成对应替代路径前不得直接删除。
+> 本文描述迁移完成后的系统形态。DAP、Swift 本地运行时和手写 Provider 等迁移期实现
+> 已全部删除；尚未完成的部分见各章节标注与 `docs/disco-acp-facade.md`。
 
 ## 1. 需求与约束
 
@@ -147,7 +147,12 @@ App 启动 daemon 子进程，默认使用 stdio 传输 JSON-RPC：
 
 ### 5.2 Disco 产品扩展
 
-产品管理能力使用 `disco/*` 命名空间，候选方法包括：
+产品管理能力使用 `disco/*` 逻辑命名空间，候选方法包括：
+
+ACP v1 SDK 要求自定义 wire method 以 `_` 开头，因此当前实现在线上使用
+`_disco/*`（例如 `_disco/provider/list`）；下划线只属于 ACP transport 兼容层，产品语义
+仍归属于 `disco/*`。未来协议允许非下划线 namespaced extension 时，可以增加等价别名，但
+不得改变产品层语义。
 
 ```text
 disco/provider/list

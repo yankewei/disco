@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// 守护进程路径的审批对话框（Phase 3）。
-/// 当 Agent 需要执行敏感操作时，展示影响范围并等待用户确认。
-struct ApprovalDialogView: View {
+/// 守护进程路径的审批横幅（Phase 3）。
+/// 固定在聊天窗口顶部，当 Agent 需要执行敏感操作时展示影响范围并等待用户确认。
+struct ApprovalBannerView: View {
     let approval: DaemonApprovalRequestedData
     let onApprove: () -> Void
     let onApproveForSession: () -> Void
@@ -10,22 +10,38 @@ struct ApprovalDialogView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // 标题栏
-            HStack(spacing: 8) {
+            HStack(spacing: 12) {
                 Image(systemName: "shield.checkered")
                     .font(.title3.weight(.semibold))
                     .foregroundColor(.orange)
-                Text(approval.title)
-                    .font(.headline)
-                Spacer()
-            }
 
-            // 原因说明（如有）
-            if let reason = approval.reason {
-                Text(reason)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(approval.title)
+                        .font(.headline)
+
+                    // 原因说明（如有）
+                    if let reason = approval.reason {
+                        Text(reason)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                // 操作按钮：始终提供三个选项
+                HStack(spacing: 8) {
+                    Button("拒绝", role: .destructive, action: onDecline)
+                        .keyboardShortcut(.cancelAction)
+
+                    Button("本次会话始终允许", action: onApproveForSession)
+                        .buttonStyle(.bordered)
+
+                    Button("允许一次", action: onApprove)
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                }
             }
 
             // 影响范围详情
@@ -36,28 +52,9 @@ struct ApprovalDialogView: View {
                     cornerRadius: DiscoRadius.small,
                     style: .continuous
                 ))
-
-            Divider()
-
-            // 操作按钮
-            HStack {
-                Button("拒绝", role: .destructive, action: onDecline)
-                    .keyboardShortcut(.cancelAction)
-
-                Spacer()
-
-                if approval.allowsSessionApproval {
-                    Button("本次会话始终允许", action: onApproveForSession)
-                        .buttonStyle(.bordered)
-                }
-
-                Button("允许", action: onApprove)
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
-            }
         }
         .padding(16)
-        .frame(maxWidth: 520)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(DiscoTheme.elevatedSurface)
         .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
         .overlay {
@@ -200,7 +197,7 @@ struct ApprovalDialogView: View {
 }
 
 #Preview("命令审批") {
-    ApprovalDialogView(
+    ApprovalBannerView(
         approval: DaemonApprovalRequestedData(
             runId: "run-1",
             sessionId: "session-1",
@@ -234,7 +231,7 @@ struct ApprovalDialogView: View {
 }
 
 #Preview("文件变更审批") {
-    ApprovalDialogView(
+    ApprovalBannerView(
         approval: DaemonApprovalRequestedData(
             runId: "run-1",
             sessionId: "session-1",

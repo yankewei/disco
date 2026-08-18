@@ -501,18 +501,7 @@ private struct VendorDetailPanel: View {
     /// 是否处于"更换 Key"的输入状态
     @State private var isEditingKey = false
     @State private var contextWindowText = ""
-    /// 订阅服务商（ChatGPT/Codex）的登录检测状态
-    @State private var codexLoginState: CodexLoginState = .checking
     @FocusState private var focusedField: CredentialField?
-
-    /// 订阅登录检测结果（单一来源，避免散落的条件分支产生矛盾文案）
-    private enum CodexLoginState: Equatable {
-        case checking
-        case signedIn(email: String?, planTitle: String)
-        case signedOut
-        case apiKeyMode
-        case failed(String)
-    }
 
     private enum CredentialField: Hashable {
         case baseURL
@@ -627,11 +616,7 @@ private struct VendorDetailPanel: View {
             }
 
             do {
-                let loadedModels = try await appState.availableModels(
-                    vendor: vendor,
-                    baseURL: draft.baseURL,
-                    apiKey: draft.apiKey
-                )
+                let loadedModels = try await appState.availableModels(vendor: vendor)
                 guard !Task.isCancelled else { return }
                 draft.models = loadedModels
                 draft.modelSearch = ""
@@ -648,10 +633,6 @@ private struct VendorDetailPanel: View {
                 verifiedFingerprint = nil
                 verifyError = error.localizedDescription
             }
-        }
-        .task(id: vendor) {
-            guard vendor == .chatgpt else { return }
-            await refreshCodexLoginStatus()
         }
         .confirmationDialog(
             "移除 \(vendor.title) 的配置？",
@@ -733,128 +714,28 @@ private struct VendorDetailPanel: View {
 
     /// 订阅服务商说明卡：无需 API Key，登录态由 codex CLI 管理（ADR-003）
     private var subscriptionCard: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 14) {
-                Image(systemName: "person.crop.circle.badge.checkmark")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(DiscoTheme.accent)
-                    .frame(width: 30, height: 30)
-                    .background(DiscoTheme.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+        HStack(spacing: 14) {
+            Image(systemName: "person.crop.circle.badge.checkmark")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(DiscoTheme.accent)
+                .frame(width: 30, height: 30)
+                .background(DiscoTheme.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: DiscoRadius.small))
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("使用 Codex (OpenAI) 登录")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer()
-
-                Button {
-                    Task { await refreshCodexLoginStatus() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(codexLoginState == .checking)
-                .help("重新检测登录状态")
+            VStack(alignment: .leading, spacing: 3) {
+                Text("使用 Codex (OpenAI) 登录")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            loginStatusRow
+            Spacer()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
-    }
-
-    /// 登录状态行：绿=已登录订阅，红=未登录，橙=其他认证/检测失败
-    @ViewBuilder
-    private var loginStatusRow: some View {
-        HStack(spacing: 8) {
-            switch codexLoginState {
-            case .checking:
-                ProgressView()
-                    .controlSize(.small)
-                Text("正在检测登录状态…")
-            case let .signedIn(email, planTitle):
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                Text(loginStatusText(email: email, planTitle: planTitle))
-            case .signedOut:
-                Image(systemName: "exclamationmark.circle.fill")
-                    .foregroundStyle(.red)
-                Text("未登录 Codex (OpenAI)。请先在终端运行 codex login。")
-            case .apiKeyMode:
-                Image(systemName: "key.fill")
-                    .foregroundStyle(.orange)
-                Text("当前为 API Key 模式，未使用 Codex (OpenAI) 登录。")
-            case let .failed(message):
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text("无法检测登录状态：\(message)")
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 0)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
-
-    private func loginStatusText(email: String?, planTitle: String) -> String {
-        var text = "已登录"
-        if let email, !email.isEmpty {
-            text += "（\(email)）"
-        }
-        if !planTitle.isEmpty {
-            text += " · \(planTitle) 计划"
-        }
-        return text
-    }
-
-    /// 订阅计划展示名（未知计划回退原始值）
-    private static func planTitle(_ planType: String?) -> String {
-        switch planType {
-        case "free": "Free"
-        case "plus": "Plus"
-        case "pro": "Pro"
-        case "team": "Team"
-        case "business": "Business"
-        case "enterprise": "Enterprise"
-        case "edu": "Edu"
-        case let .some(other): other
-        case .none: ""
-        }
-    }
-
-    /// 检测 codex 登录状态（走 account/read，不触碰 auth.json）
-    private func refreshCodexLoginStatus() async {
-        codexLoginState = .checking
-        do {
-            let status = try await appState.codexAccountStatus()
-            guard !Task.isCancelled else { return }
-            switch status.kind {
-            case let .chatgpt(email, planType):
-                codexLoginState = .signedIn(email: email, planTitle: Self.planTitle(planType))
-            case .apiKey:
-                codexLoginState = .apiKeyMode
-            case let .other(type):
-                codexLoginState = .signedIn(email: nil, planTitle: type)
-            case .signedOut:
-                codexLoginState = .signedOut
-            }
-        } catch is CancellationError {
-            return
-        } catch {
-            guard !Task.isCancelled else { return }
-            codexLoginState = .failed(error.localizedDescription)
-        }
     }
 
     /// Key 行三态：已保存（掩码，可查看/更换）、查看明文、输入新 Key

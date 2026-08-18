@@ -53,35 +53,39 @@ final class AppState: ObservableObject {
     var hasAPIKey: Bool { providerConfigs[activeVendor]?.hasAPIKey ?? false }
     var isActiveVendorConfigured: Bool { activeVendor.isConfigured(providerConfigs[activeVendor]) }
 
-    /// 是否通过守护进程路由请求（守护进程已连接并完成初始化握手）。
+    /// 当前 daemon 运行边界（ACP adapter 建立后才非 nil）。
+    private var activeDaemonClient: (any DiscoDaemonClient)? {
+        acpDaemonAdapter
+    }
+
     private var useDaemon: Bool {
-        daemonClient.state == .connected && isDaemonAvailable
+        acpDaemonClient.state == .connected
+            && acpDaemonAdapter != nil
+            && isDaemonAvailable
     }
 
     private let keyStores: [ProviderVendor: APIKeyStoring]
     private let defaults: UserDefaults
     private let persistence: any ConversationPersisting
     private let projectPersistence: any ProjectPersisting
-    private let codexTransportFactory: @MainActor () -> CodexAppServerTransport
     private let workspaceResolver = WorkspaceResolver()
-    /// ChatGPT/Codex 使用一条应用级长连接；连接内按 threadId 隔离各会话。
-    private var codexTransport: CodexAppServerTransport?
     /// 设置页验证前可能还没有 ProviderConfig，先暂存本次完整模型目录。
     private var discoveredModelCatalogs: [ProviderVendor: [ModelCatalogEntry]] = [:]
     /// 用户按模型填写的上下文窗口覆盖值，不随模型目录刷新删除。
     private var contextWindowOverrides: [ProviderVendor: [String: Int]] = [:]
     private var daemonEventTask: Task<Void, Never>?
 
-    // MARK: - 守护进程（迁移期运行路径）
+    // MARK: - 守护进程（ACP stdio）
 
-    /// 守护进程客户端（通过 Unix 域套接字与 Rust daemon 通信）。
-    let daemonClient = DaemonClient()
-    /// 守护进程进程管理器（启动/停止 daemon 二进制）。
+    /// ACP stdio client；App 以子进程方式启动 `disco-daemon --stdio`。
+    let acpDaemonClient = ACPDaemonClient()
+    private var acpDaemonAdapter: ACPDaemonClientAdapter?
+    /// 守护进程进程管理器（查找 daemon 二进制、清理旧版 socket daemon）。
     let daemonProcessManager = DaemonProcessManager()
     /// App 退出时停止 daemon 的观察者，避免留下孤儿进程。
     private var daemonTerminationObserver: NSObjectProtocol?
     /// 守护进程连接状态（供 UI 观察）。
-    @Published private(set) var daemonConnectionState: DaemonClient.State = .disconnected
+    @Published private(set) var daemonConnectionState: ACPDaemonClient.State = .disconnected
     /// 守护进程是否可用（已连接并完成初始化握手）。
     @Published private(set) var isDaemonAvailable = false
 
@@ -93,10 +97,7 @@ final class AppState: ObservableObject {
     init(
         keychain: APIKeyStoring? = nil,
         defaults: UserDefaults? = nil,
-        persistence: (any ConversationPersisting & ProjectPersisting)? = nil,
-        codexTransportFactory: @MainActor @escaping () -> CodexAppServerTransport = {
-            CodexAppServerTransport()
-        }
+        persistence: (any ConversationPersisting & ProjectPersisting)? = nil
     ) {
         let baseKeyStore = keychain ?? AuthFileStore()
         let defaults = defaults ?? .standard
@@ -115,7 +116,6 @@ final class AppState: ObservableObject {
         self.defaults = defaults
         self.persistence = resolvedPersistence
         self.projectPersistence = resolvedPersistence
-        self.codexTransportFactory = codexTransportFactory
         self.keyStores = Dictionary(
             uniqueKeysWithValues: ProviderVendor.allCases.map {
                 ($0, baseKeyStore.forAccount($0.keychainAccount))
@@ -342,12 +342,12 @@ final class AppState: ObservableObject {
         defaults.set(verifiedAt.timeIntervalSince1970, forKey: vendor.verifiedAtDefaultsKey)
         authError = nil
 
-        // Phase 2：守护进程可用时，同步服务商配置到守护进程
+        // 守护进程可用时，同步服务商配置到守护进程
         if useDaemon {
             Task { [weak self] in
                 guard let self else { return }
                 let resolvedKey = (try? self.resolvedAPIKey(vendor: vendor, apiKey: apiKey)) ?? ""
-                _ = try? await self.daemonClient.configureProvider(
+                _ = try? await self.acpDaemonClient.configureProvider(
                     providerID: vendor.daemonProviderID,
                     vendor: vendor.daemonVendor,
                     baseURL: providerBaseURL,
@@ -399,56 +399,35 @@ final class AppState: ObservableObject {
         authError = nil
     }
 
-    func availableModels(vendor: ProviderVendor, baseURL: String, apiKey: String) async throws -> [String] {
-        if vendor == .chatgpt {
-            // 订阅服务商：模型列表来自 codex app-server 的 model/list（按订阅计划过滤）
-            let transport = codexTransportFactory()
-            defer { transport.stop() }
-            try await transport.start()
-            let catalog = try await transport.listModels()
-            let modelCatalog = catalog.map {
-                vendor.enrichingCatalogEntry(ModelCatalogEntry(
-                    id: $0.id,
-                    displayName: $0.displayName,
-                    supportedReasoningEfforts: $0.supportedReasoningEfforts,
-                    defaultReasoningEffort: $0.defaultReasoningEffort
-                ))
-            }
-            let models = modelCatalog.map(\.id)
-            discoveredModelCatalogs[vendor] = modelCatalog
-            if var config = providerConfigs[vendor] {
-                config.modelCatalog = modelCatalog
-                providerConfigs[vendor] = config
-                persistModelCatalog(modelCatalog, for: vendor)
-            }
-            codexModelCatalogError = nil
-            return models
+    /// 模型目录来自 daemon 的 `_disco/provider/models` 扩展（内置默认目录，
+    /// 不做实时连通性验证）。
+    func availableModels(vendor: ProviderVendor) async throws -> [String] {
+        guard useDaemon else {
+            throw DaemonError.notConnected
         }
-
-        let providerBaseURL = try Self.validatedBaseURL(baseURL)
-        let resolvedKey = try resolvedAPIKey(vendor: vendor, apiKey: apiKey)
-
-        let catalog: [ModelCatalogEntry]
-        if vendor == .kimiCode {
-            catalog = try await OpenAIChatCompletionsProvider(
-                apiKey: resolvedKey,
-                baseURL: providerBaseURL,
-                dialect: .kimi
-            ).modelCatalog()
-        } else {
-            catalog = try await OpenAIResponsesProvider(
-                apiKey: resolvedKey,
-                baseURL: providerBaseURL
-            ).modelCatalog()
+        let entries = try await acpDaemonClient.listProviderModels(
+            providerID: vendor.daemonProviderID,
+            vendor: vendor.daemonVendor
+        )
+        let modelCatalog = entries.map { entry in
+            vendor.enrichingCatalogEntry(ModelCatalogEntry(
+                id: entry.id,
+                displayName: entry.displayName,
+                contextWindow: entry.contextWindow.map { Int(clamping: $0) },
+                supportedReasoningEfforts: entry.supportedReasoningEfforts,
+                defaultReasoningEffort: entry.defaultReasoningEffort
+            ))
         }
-        let enrichedCatalog = catalog.map(vendor.enrichingCatalogEntry)
-        discoveredModelCatalogs[vendor] = enrichedCatalog
+        discoveredModelCatalogs[vendor] = modelCatalog
         if var config = providerConfigs[vendor] {
-            config.modelCatalog = enrichedCatalog
+            config.modelCatalog = modelCatalog
             providerConfigs[vendor] = config
-            persistModelCatalog(enrichedCatalog, for: vendor)
+            persistModelCatalog(modelCatalog, for: vendor)
         }
-        return enrichedCatalog.map(\.id)
+        if vendor == .chatgpt {
+            codexModelCatalogError = nil
+        }
+        return modelCatalog.map(\.id)
     }
 
     /// 已保存的 Codex 配置可能来自旧版本；聊天页进入时按需补齐模型推理能力目录。
@@ -464,7 +443,7 @@ final class AppState: ObservableObject {
         defer { isRefreshingCodexModelCatalog = false }
 
         do {
-            let models = try await availableModels(vendor: .chatgpt, baseURL: "", apiKey: "")
+            let models = try await availableModels(vendor: .chatgpt)
             guard !Task.isCancelled,
                   activeVendor == .chatgpt,
                   providerConfigs[.chatgpt]?.model == config.model else { return }
@@ -477,15 +456,6 @@ final class AppState: ObservableObject {
         } catch {
             codexModelCatalogError = "无法加载推理强度：\(error.localizedDescription)"
         }
-    }
-
-    /// 检测 codex 登录状态（订阅设置页展示；真实拉起 codex app-server，走 account/read）。
-    /// 应用不读取 `~/.codex/auth.json`（ADR-003），登录判断统一走服务端接口。
-    func codexAccountStatus() async throws -> CodexAccountStatus {
-        let transport = codexTransportFactory()
-        defer { transport.stop() }
-        try await transport.start()
-        return try await transport.accountStatus()
     }
 
     /// 读取已保存的 API Key 明文，仅供设置页用户主动点击"查看"时使用
@@ -751,12 +721,12 @@ final class AppState: ObservableObject {
             if !isProjectAvailable(projectID) {
                 guard conversation.store.hasRuntime else { continue }
                 conversation.store.stop()
-                let oldRuntime = conversation.store.configure(runtime: nil)
-                if let oldRuntime {
-                    Task { await oldRuntime.shutdown() }
-                }
+                conversation.store.revertDaemonRegistration()
             } else if !conversation.store.hasRuntime {
-                conversation.store.configure(runtime: makeRuntime(for: conversation))
+                Task { [weak self] in
+                    guard let self else { return }
+                    await registerDaemonConversation(conversation)
+                }
             }
         }
     }
@@ -787,12 +757,11 @@ final class AppState: ObservableObject {
         }
 
         let conversation = makeConversation(projectID: projectID)
-        conversation.store.configure(runtime: makeRuntime(for: conversation))
         conversations.insert(conversation, at: 0)
         selectedConversationID = conversation.id
         persistEmptyProjectConversation(conversation)
 
-        if useDaemon, projectID != nil {
+        if useDaemon {
             Task { [weak self] in
                 guard let self else { return }
                 await self.registerDaemonConversation(conversation)
@@ -813,7 +782,7 @@ final class AppState: ObservableObject {
     func deleteConversation(id: ConversationSession.ID) {
         guard let conversation = conversations.first(where: { $0.id == id }) else { return }
         if conversation.store.hasDaemonSession {
-            guard useDaemon else {
+            guard useDaemon, let daemonClient = activeDaemonClient else {
                 storageError = "daemon 当前不可用，无法同时删除原始 Agent 会话；本地会话已保留。"
                 return
             }
@@ -835,11 +804,7 @@ final class AppState: ObservableObject {
     private func removeConversationLocally(id: ConversationSession.ID) {
         guard let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].store.stop()
-        let oldRuntime = conversations[index].store.configure(runtime: nil)
         conversations.remove(at: index)
-        if let oldRuntime {
-            Task { await oldRuntime.shutdown() }
-        }
         do {
             try persistence.deleteConversation(id: id)
             storageError = nil
@@ -848,9 +813,7 @@ final class AppState: ObservableObject {
         }
 
         if conversations.isEmpty {
-            let conversation = makeConversation()
-            conversation.store.configure(runtime: makeRuntime(for: conversation))
-            conversations = [conversation]
+            conversations = [makeConversation()]
         }
         if selectedConversationID == id {
             selectedConversationID = conversations.first?.id
@@ -884,8 +847,8 @@ final class AppState: ObservableObject {
                 contextState: contextState
             )
         }
-        // Phase 3：注入守护进程客户端，用于审批响应
-        session.store.configure(daemonClient: daemonClient)
+        // 注入当前 transport 的公共 daemon client，用于运行和审批响应。
+        session.store.configure(daemonClient: activeDaemonClient)
         return session
     }
 
@@ -943,113 +906,34 @@ final class AppState: ObservableObject {
         conversations.insert(conversation, at: 0)
     }
 
-    // MARK: - Runtime
+    // MARK: - 运行时（daemon 托管）
 
     private func refreshRuntimes(stopActiveStreams: Bool) {
-        // 配置或 active vendor 变化后，旧连接上的 thread 不再属于当前运行时。
-        // CodexRuntime.shutdown() 不会关闭共享连接，因此由拥有者统一处理。
-        codexTransport?.stop()
-        codexTransport = nil
-        for conversation in conversations {
-            if stopActiveStreams {
+        if stopActiveStreams {
+            for conversation in conversations {
                 conversation.store.stop()
             }
-            let oldRuntime = conversation.store.configure(runtime: makeRuntime(for: conversation))
-            if let oldRuntime {
-                // 释放旧运行时（如终止 codex 子进程），避免切换配置后遗留孤儿进程
-                Task { await oldRuntime.shutdown() }
-            }
         }
+        syncActiveProviderToDaemon()
     }
 
-    /// 按当前服务商装配运行时（运行时按会话独立，Codex transport 共享）：
-    /// - 订阅类（ChatGPT/Codex）：`CodexRuntime`（ADR-003，经 codex app-server）；
-    ///   一条应用级长连接承载多个线程，续接已持久化的 thread id；
-    /// - API Key 类：`GenericAgentRuntime` + 对应的 Responses/Chat Completions Provider。
-    /// 会话配置在运行时创建时固定（计划 §6.3）。
-    private func makeRuntime(for conversation: ConversationSession) -> AgentRuntime? {
-        let workspace: WorkspaceContext?
-        if let projectID = conversation.projectID {
-            guard case let .available(context) = projectAvailability[projectID] else { return nil }
-            workspace = context
-        } else {
-            workspace = nil
-        }
+    /// 把当前服务商配置推给 daemon，后续运行使用新配置。
+    private func syncActiveProviderToDaemon() {
+        guard useDaemon, let config = providerConfigs[activeVendor] else { return }
         let vendor = activeVendor
-        guard let config = providerConfigs[vendor], vendor.isConfigured(config) else {
-            return nil
-        }
-        if vendor == .chatgpt {
-            let store = conversation.store
-            return CodexRuntime(
-                transport: codexTransportForRuntime(),
-                configuration: CodexRuntime.Configuration(
-                    model: config.model,
-                    reasoningEffort: selectedReasoningEffort(for: vendor),
-                    resumeThreadID: store.threadID,
-                    cwd: workspace?.rootURL.path
-                ),
-                onThreadReady: { threadID in
-                    // 线程就绪（新建或续接）：写回会话并触发持久化
-                    store.updateThreadID(threadID)
-                }
-            )
-        }
-        guard let provider = makeProvider(vendor: vendor) else { return nil }
-        let catalogEntry = config.catalogEntry(for: config.model)
-        return GenericAgentRuntime(
-            provider: provider,
-            configuration: GenericAgentRuntime.Configuration(
+        let apiKey = vendor.requiresAPIKey
+            ? ((try? keyStores[vendor]?.load()) ?? "")
+            : ""
+        Task { [weak self] in
+            _ = try? await self?.acpDaemonClient.configureProvider(
+                providerID: vendor.daemonProviderID,
+                vendor: vendor.daemonVendor,
+                baseURL: config.baseURL,
+                apiKey: apiKey,
                 model: config.model,
-                reasoningEnabled: config.thinkingEnabled,
-                reasoningEffort: selectedReasoningEffort(for: vendor),
-                hostedTools: catalogEntry?.hostedTools
-                    ?? vendor.hostedTools(for: config.model),
-                userInputEnabled: vendor == .openai
-                    && catalogEntry?.supportsToolCalling != false,
-                workspace: workspace,
-                contextWindow: contextWindow(for: vendor, model: config.model)
-            )
-        )
-    }
-
-    private func codexTransportForRuntime() -> CodexAppServerTransport {
-        if let codexTransport { return codexTransport }
-        let transport = codexTransportFactory()
-        codexTransport = transport
-        return transport
-    }
-
-    private func makeProvider(vendor: ProviderVendor) -> (any ModelProvider)? {
-        guard let config = providerConfigs[vendor],
-              config.hasAPIKey,
-              let providerBaseURL = try? Self.validatedBaseURL(config.baseURL),
-              let storedKey = try? keyStores[vendor]?.load(),
-              !storedKey.isEmpty else {
-            return nil
-        }
-        if vendor == .kimiCode {
-            return OpenAIChatCompletionsProvider(
-                apiKey: storedKey,
-                baseURL: providerBaseURL,
-                dialect: .kimi
+                thinkingEnabled: config.thinkingEnabled
             )
         }
-
-        let dialect: OpenAIResponsesProvider.Dialect
-        switch vendor {
-        case .openai:
-            dialect = .openAI
-        case .deepseek:
-            dialect = .deepSeek
-        default:
-            dialect = .compatible
-        }
-        return OpenAIResponsesProvider(
-            apiKey: storedKey,
-            baseURL: providerBaseURL,
-            dialect: dialect
-        )
     }
 
     private func persistModelCatalog(
@@ -1116,65 +1000,61 @@ final class AppState: ObservableObject {
         return url
     }
 
-    // MARK: - 守护进程管理（Phase 1）
+    // MARK: - 守护进程管理
 
-    /// 启动守护进程并建立连接。
+    /// 启动 `disco-daemon --stdio` 子进程并建立 ACP 连接。
     ///
-    /// Phase 1 策略：
-    /// - 尝试启动守护进程（如果不存在则静默降级）
-    /// - 连接到套接字并执行初始化握手
-    /// - 失败时记录日志，不影响现有功能
+    /// 启动前清理旧版 socket daemon（与当前 daemon 共享 SQLite 数据库，
+    /// 避免两个 daemon 同时持有不同的 AppState）。
     private func startDaemonIfNeeded() async {
-        // 检查是否已经有守护进程在运行
-        let socketPath = daemonProcessManager.daemonSocketPath()
-
-        do {
-            // 尝试确保守护进程运行（如果二进制不存在会抛出 daemonNotFound）
-            try await daemonProcessManager.ensureDaemonRunning()
-        } catch let error as DaemonError where error == .daemonNotFound {
-            // 守护进程二进制尚未编译：Phase 1 预期行为，静默降级
+        daemonConnectionState = .connecting
+        guard let binaryPath = daemonProcessManager.daemonBinaryPath() else {
             daemonConnectionState = .failed("守护进程未安装")
-            return
-        } catch {
-            // 其他启动错误：记录但不阻塞
-            daemonConnectionState = .failed(error.localizedDescription)
             return
         }
 
-        // 连接到守护进程
-        do {
-            try await daemonClient.connect(socketPath: socketPath)
-            daemonConnectionState = daemonClient.state
+        daemonProcessManager.stopDaemon()
 
-            // 执行初始化握手
-            _ = try await daemonClient.initialize()
+        do {
+            try await acpDaemonClient.connect(binaryPath: binaryPath)
+            _ = try await acpDaemonClient.initialize()
+            acpDaemonAdapter = ACPDaemonClientAdapter(client: acpDaemonClient)
+            reconfigureConversationDaemonClients()
+            daemonConnectionState = .connected
             isDaemonAvailable = true
             startDaemonEventRouting()
             await synchronizeDaemonConversations()
         } catch {
-            daemonConnectionState = daemonClient.state
+            acpDaemonClient.disconnect()
+            acpDaemonAdapter = nil
+            daemonConnectionState = .failed(error.localizedDescription)
             isDaemonAvailable = false
         }
     }
 
+    private func reconfigureConversationDaemonClients() {
+        for conversation in conversations {
+            conversation.store.configure(daemonClient: activeDaemonClient)
+        }
+    }
+
     /// 停止守护进程并断开连接。
-    ///
-    /// 未接线：当前应用退出时未调用，daemon 进程由系统回收（Phase 1 预留）。
     func stopDaemon() {
         daemonEventTask?.cancel()
         daemonEventTask = nil
         for conversation in conversations {
             conversation.store.handleDaemonDisconnection("daemon 已停止。")
         }
-        daemonClient.disconnect()
-        daemonProcessManager.stopDaemon()
+        acpDaemonClient.disconnect()
+        acpDaemonAdapter = nil
         daemonConnectionState = .disconnected
         isDaemonAvailable = false
     }
 
     private func startDaemonEventRouting() {
         daemonEventTask?.cancel()
-        let events = daemonClient.events()
+        guard let client = activeDaemonClient else { return }
+        let events = client.events()
         daemonEventTask = Task { [weak self] in
             do {
                 for try await event in events {
@@ -1204,30 +1084,34 @@ final class AppState: ObservableObject {
     }
 
     private func synchronizeDaemonConversations() async {
-        // 所有项目会话都尝试与 daemon 对齐：已有 daemon 会话的恢复权威历史，
-        // 没有的新建会话；本地有历史但 daemon 从未注册过的保持直连路径。
-        for conversation in conversations where conversation.projectID != nil {
+        // 所有会话都与 daemon 对齐：已有 daemon 会话的恢复权威历史，没有的新建会话。
+        for conversation in conversations {
             await registerDaemonConversation(conversation)
         }
     }
 
-    /// 对齐项目会话与 daemon：注册缺失的会话，并把 daemon 的权威历史恢复到本地。
+    /// 对齐会话与 daemon：注册缺失的会话，并把 daemon 的权威历史恢复到本地。
     ///
-    /// daemon 可用时项目会话由 daemon 保存消息（单写），本地只保留会话元数据；
-    /// 本地有历史但 daemon 从未注册过（如直连期会话）保持直连路径，不丢上下文。
+    /// daemon 可用时会话消息由 daemon 保存（单写），本地只保留会话元数据。
+    /// 项目会话使用项目工作区；不挂在项目下的会话使用用户主目录作为工作区。
     private func registerDaemonConversation(_ conversation: ConversationSession) async {
-        guard useDaemon,
-              let projectID = conversation.projectID,
-              let project = projects.first(where: { $0.id == projectID }),
-              case let .available(workspace) = projectAvailability[projectID],
-              let config = providerConfigs[activeVendor] else { return }
+        guard useDaemon, providerConfigs[activeVendor] != nil else { return }
+
+        let cwd: String
+        if let projectID = conversation.projectID {
+            guard case let .available(workspace) = projectAvailability[projectID] else { return }
+            cwd = workspace.rootURL.path
+        } else {
+            cwd = FileManager.default.homeDirectoryForCurrentUser.path
+        }
 
         let vendor = activeVendor
+        guard let config = providerConfigs[vendor] else { return }
         let apiKey = vendor.requiresAPIKey
             ? ((try? keyStores[vendor]?.load()) ?? "")
             : ""
         do {
-            try await daemonClient.configureProvider(
+            _ = try await acpDaemonClient.configureProvider(
                 providerID: vendor.daemonProviderID,
                 vendor: vendor.daemonVendor,
                 baseURL: config.baseURL,
@@ -1235,51 +1119,50 @@ final class AppState: ObservableObject {
                 model: config.model,
                 thinkingEnabled: config.thinkingEnabled
             )
-            let daemonProject = try await daemonClient.createProject(
-                projectID: project.id,
-                name: project.name,
-                path: workspace.rootURL.path
-            )
-            guard let daemonProjectID = UUID(uuidString: daemonProject.id) else {
-                throw DaemonError.invalidResponse("session/project/create 返回了无效的项目 ID。")
+
+            let existingSessions = try await acpDaemonClient.listSessions(cwd: cwd).sessions
+            let hasACPSession = existingSessions.contains { info in
+                UUID(uuidString: info.sessionId) == conversation.id
             }
-            let existingSessions = try await daemonClient.listSessions(projectID: daemonProjectID)
-            let hasDaemonSession = existingSessions.contains {
-                $0.id == conversation.id.uuidString
-            }
-            if !hasDaemonSession {
-                // 本地有历史但 daemon 从未注册过：保持直连路径，避免创建空会话丢上下文。
+            if hasACPSession {
+                _ = try await acpDaemonClient.loadSession(
+                    sessionID: conversation.id.uuidString,
+                    cwd: cwd
+                )
+            } else {
+                // 本地有历史但 daemon 没有同一个权威 session：不注册，避免丢上下文。
                 guard conversation.store.messages.isEmpty else {
                     conversation.store.revertDaemonRegistration()
                     return
                 }
-                _ = try await daemonClient.createSession(
-                    sessionID: conversation.id,
-                    projectID: daemonProjectID,
+                let created = try await acpDaemonClient.newSession(
+                    cwd: cwd,
                     providerID: vendor.daemonProviderID,
-                    vendor: vendor.daemonVendor,
-                    model: config.model
+                    sessionID: conversation.id.uuidString
                 )
-            }
-            guard conversations.contains(where: { $0.id == conversation.id }) else {
-                try? await daemonClient.deleteSession(sessionID: conversation.id)
-                return
+                guard UUID(uuidString: created.sessionId) == conversation.id else {
+                    throw DaemonError.invalidResponse(
+                        "ACP session/new 未返回请求的 ConversationSession ID。"
+                    )
+                }
             }
 
-            let storedMessages = (try? await daemonClient.listMessages(
-                sessionID: conversation.id
-            )) ?? []
-            if !storedMessages.isEmpty || conversation.store.messages.isEmpty {
-                conversation.store.enableDaemonRuns(sessionID: conversation.id)
-                if !storedMessages.isEmpty {
-                    conversation.store.restoreMessages(storedMessages.map { message in
-                        ChatMessage(
-                            id: UUID(uuidString: message.id) ?? UUID(),
-                            role: message.role == "user" ? .user : .assistant,
-                            text: message.text
-                        )
-                    })
-                }
+            let storedMessages = try await acpDaemonClient.listMessages(
+                sessionID: conversation.id.uuidString
+            )
+            guard conversations.contains(where: { $0.id == conversation.id }) else {
+                try? await acpDaemonClient.deleteSession(sessionID: conversation.id.uuidString)
+                return
+            }
+            conversation.store.enableDaemonRuns(sessionID: conversation.id)
+            if !storedMessages.isEmpty {
+                conversation.store.restoreMessages(storedMessages.map { message in
+                    ChatMessage(
+                        id: UUID(uuidString: message.id) ?? UUID(),
+                        role: message.role == "user" ? .user : .assistant,
+                        text: message.text
+                    )
+                })
             }
         } catch {
             conversation.store.disableDaemonRuns()

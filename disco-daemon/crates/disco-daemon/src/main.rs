@@ -1,10 +1,14 @@
+mod acp;
+mod compaction_service;
 mod daemon;
-mod router;
+mod provider_service;
+mod run_service;
+mod session_service;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use daemon::{AppState, ProviderRuntime, api_key_provider_runtime, default_socket_path};
+use daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
 use disco_backends::CodexAdapter;
 use disco_core::RunCoordinator;
 use disco_persist::{Database, default_db_path};
@@ -21,7 +25,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // daemon 只以 ACP stdio server 运行；stdout 专用于 JSON-RPC frame，日志统一写 stderr。
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
@@ -139,30 +145,8 @@ async fn main() {
         shutdown: shutdown.clone(),
     });
 
-    // Socket path
-    let socket_path = default_socket_path();
-    info!("Socket path: {}", socket_path.display());
-
-    // Spawn daemon task
-    let daemon_app = app.clone();
-    let daemon_handle = tokio::spawn(async move {
-        if let Err(e) = daemon::run_daemon(&socket_path, daemon_app).await {
-            tracing::error!("Daemon error: {e}");
-        }
-    });
-
-    // Wait for SIGINT or SIGTERM
-    info!("Press Ctrl+C to stop");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received SIGINT, shutting down...");
-            shutdown.cancel();
-        }
-        _ = daemon_handle => {
-            info!("Daemon task completed");
-        }
+    if let Err(error) = acp::run_acp_stdio_server(app).await {
+        tracing::error!(%error, "ACP stdio daemon stopped with an error");
+        std::process::exit(1);
     }
-
-    // Clean up
-    info!("disco-daemon stopped");
 }

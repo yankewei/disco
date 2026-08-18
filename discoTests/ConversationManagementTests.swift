@@ -13,14 +13,10 @@ final class ConversationManagementTests: XCTestCase {
         )
 
         let firstConversation = try XCTUnwrap(appState.selectedConversation)
-        firstConversation.store.configure(runtime: GenericAgentRuntime(
-            provider: ImmediateProvider(text: "Hello"),
-            configuration: .init(model: "test-model", reasoningEnabled: true)
-        ))
-        firstConversation.store.draft = "Hi"
-        firstConversation.store.send()
-
-        try await waitUntilStreamingFinishes(firstConversation.store)
+        firstConversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "Hi"),
+            ChatMessage(role: .assistant, text: "Hello"),
+        ])
 
         let secondID = appState.createConversation()
         XCTAssertEqual(appState.conversations.count, 2)
@@ -44,14 +40,10 @@ final class ConversationManagementTests: XCTestCase {
             persistence: persistence
         )
         let conversation = try XCTUnwrap(firstAppState.selectedConversation)
-        conversation.store.configure(runtime: GenericAgentRuntime(
-            provider: ImmediateProvider(text: "持久化回复"),
-            configuration: .init(model: "test-model", reasoningEnabled: true)
-        ))
-        conversation.store.draft = "保存这段对话"
-        conversation.store.send()
-
-        try await waitUntilStreamingFinishes(conversation.store)
+        conversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "保存这段对话"),
+            ChatMessage(role: .assistant, text: "持久化回复"),
+        ])
 
         let restoredAppState = AppState(
             keychain: InMemoryAuthStore(),
@@ -84,45 +76,22 @@ final class ConversationManagementTests: XCTestCase {
         )
 
         let firstConversation = try XCTUnwrap(appState.selectedConversation)
-        firstConversation.store.configure(runtime: GenericAgentRuntime(
-            provider: ImmediateProvider(text: "第一条回复"),
-            configuration: .init(model: "test-model", reasoningEnabled: true)
-        ))
-        firstConversation.store.draft = "第一段对话"
-        firstConversation.store.send()
-        try await waitUntilStreamingFinishes(firstConversation.store)
+        firstConversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "第一段对话"),
+            ChatMessage(role: .assistant, text: "第一条回复"),
+        ])
 
         let secondID = appState.createConversation()
         let secondConversation = try XCTUnwrap(appState.selectedConversation)
-        secondConversation.store.configure(runtime: GenericAgentRuntime(
-            provider: ImmediateProvider(text: "第二条回复"),
-            configuration: .init(model: "test-model", reasoningEnabled: true)
-        ))
-        secondConversation.store.draft = "第二段对话"
-        secondConversation.store.send()
-        try await waitUntilStreamingFinishes(secondConversation.store)
+        secondConversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "第二段对话"),
+            ChatMessage(role: .assistant, text: "第二条回复"),
+        ])
         XCTAssertEqual(appState.conversations.first?.id, secondID)
 
-        firstConversation.store.draft = "继续第一段对话"
-        firstConversation.store.send()
-        try await waitUntilStreamingFinishes(firstConversation.store)
+        firstConversation.store.restoreMessages(firstConversation.store.messages + [
+            ChatMessage(role: .user, text: "继续第一段对话"),
+        ])
         XCTAssertEqual(appState.conversations.first?.id, firstConversation.id)
-    }
-}
-
-private struct ImmediateProvider: ModelProvider {
-    let text: String
-
-    let descriptor = ProviderDescriptor(id: "immediate", displayName: "Immediate")
-
-    func modelCatalog() async throws -> [ModelCatalogEntry] {
-        [ModelCatalogEntry(id: "test-model")]
-    }
-
-    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
-        AsyncThrowingStream { continuation in
-            continuation.yield(.textDelta(text))
-            continuation.finish()
-        }
     }
 }

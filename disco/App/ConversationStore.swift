@@ -1,26 +1,6 @@
 import Combine
 import Foundation
 
-enum UserInteractionStatus: Equatable {
-    case pending
-    case submitting
-    case resolved(String)
-    case failed(String)
-    case cancelled
-}
-
-struct UserInteractionRecord: Identifiable, Equatable {
-    let interaction: PendingUserInteraction
-    var status: UserInteractionStatus
-
-    var id: PendingUserInteraction.ID { interaction.id }
-}
-
-struct UserInputDraft: Equatable {
-    var values: [String: String] = [:]
-    var customQuestionIDs: Set<String> = []
-}
-
 /// 工具执行在 UI 时间线中的展示模型。
 struct ToolExecutionDisplay: Identifiable, Equatable {
     let id: String  // toolCallId
@@ -36,11 +16,7 @@ final class ConversationStore: ObservableObject {
     @Published var draft = ""
     @Published private(set) var runState: AgentRunState = .idle
     @Published private(set) var errorMessage: String?
-    /// 仅驻留内存的交互记录；不进入 ChatMessage 或持久化回调。
-    @Published private(set) var interactionRecords: [UserInteractionRecord] = []
-    /// 表单草稿按 request ID 保存，切换会话不会丢失；运行终止时清空。
-    @Published private(set) var userInputDrafts: [UserInputRequestID: UserInputDraft] = [:]
-    /// 最近一次上下文占用快照（服务商返回或本地估算）。
+    /// 最近一次上下文占用快照（daemon 上报）。
     @Published private(set) var contextUsage: ContextUsageSnapshot?
     /// 最近一次成功的压缩记录（面板展示用）。
     @Published private(set) var lastSuccessfulCompaction: ContextCompactionSnapshot?
@@ -48,10 +24,10 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var activeCompaction: ContextCompactionSnapshot?
     /// 当前待处理的守护进程审批请求；nil 表示无审批等待。
     @Published var pendingApproval: DaemonApprovalRequestedData?
-    /// 当前运行中活跃/已完成的工具执行记录（守护进程路径）。
+    /// 当前运行中活跃/已完成的工具执行记录。
     @Published private(set) var toolExecutions: [ToolExecutionDisplay] = []
 
-    /// daemon 运行边界；只有成功注册了 daemon session 的会话才启用。
+    /// daemon 运行边界；所有会话都由 daemon 托管，注册 session 后启用。
     private var daemonClient: (any DiscoDaemonClient)?
     private var daemonSessionID: UUID?
     private var daemonRunsEnabled = false
@@ -62,7 +38,6 @@ final class ConversationStore: ObservableObject {
     private var clearAfterDaemonRun = false
     private var isClearingDaemonSession = false
 
-    private var runtime: (any AgentRuntime)?
     private var requestTask: Task<Void, Never>?
     /// 发送前的同步占位标志：防止同一次视图更新内重复点击触发两次发送
     /// （状态突变已延迟到下一个 run loop，详见 send()）。
@@ -71,29 +46,16 @@ final class ConversationStore: ObservableObject {
     private var persistenceTask: Task<Void, Never>?
     private var activeRunID: RunID?
     private let onMessagesChanged: ([ChatMessage], String?, ConversationContextState) -> Void
-    /// 订阅服务商（ChatGPT/Codex）的会话线程 id；其余服务商为 nil。
-    /// 是持久化的单一来源：更新后立即通过 onMessagesChanged 落盘。
+    /// 历史兼容字段：旧版订阅服务商会话的线程 id；daemon 路径不再写入。
     private(set) var threadID: String?
-    /// Generic 压缩 checkpoint 与最近一次成功压缩；随每次持久化回调落盘。
+    /// 压缩状态（最近一次成功压缩）；随每次持久化回调落盘。
     private(set) var contextState: ConversationContextState
 
     var hasRuntime: Bool {
-        if daemonSessionID != nil {
-            return daemonRunsEnabled && daemonClient != nil
-        }
-        return runtime != nil
+        daemonRunsEnabled && daemonClient != nil && daemonSessionID != nil
     }
     var hasDaemonSession: Bool { daemonSessionID != nil }
     var isStreaming: Bool { runState.isActive }
-
-    var firstPendingInteraction: PendingUserInteraction? {
-        interactionRecords.first { record in
-            switch record.status {
-            case .pending, .failed: true
-            case .submitting, .resolved, .cancelled: false
-            }
-        }?.interaction
-    }
 
     var runStatusText: String? {
         switch runState {
@@ -101,7 +63,6 @@ final class ConversationStore: ObservableObject {
         case .running: "回复生成中"
         case .waitingForTool: "正在等待工具"
         case .waitingForApproval: "等待你确认操作"
-        case .waitingForUserInput: "等待你的回答"
         case .cancelling: "正在停止"
         case .idle, .completed, .failed, .cancelled: nil
         }
@@ -144,37 +105,8 @@ final class ConversationStore: ObservableObject {
     }
 
     var canCompactContext: Bool {
-        guard let runtime, !isStreaming, compactionTask == nil else { return false }
-        if runtime is CodexRuntime {
-            return threadID != nil
-        }
-        let userCount = messages.lazy.filter { $0.role == .user }.count
-        return userCount >= ContextCompactor.minimumUserTurnsForManualCompaction
-            && ContextCompactor.compressiblePrefix(
-                messages: messages,
-                afterBoundary: contextState.checkpoint,
-                preservedUserTurns: ContextCompactor.preservedUserTurns
-            ) != nil
-    }
-
-    /// 仅用于发送前 UI 提示的 checkpoint-aware 本地 token 粗略估算。
-    var estimatedContextTokenCount: Int {
-        let visibleMessages: [ChatMessage]
-        if let checkpoint = contextState.checkpoint,
-           let boundary = messages.firstIndex(where: { $0.id == checkpoint.boundaryMessageID }),
-           ContextCompactor.sourceDigest(forMessagesPrefix: Array(messages[...boundary]))
-                == checkpoint.sourceDigest {
-            visibleMessages = [
-                ChatMessage(role: .user, text: ContextCompactor.summaryMarkerText),
-                ChatMessage(role: .assistant, text: checkpoint.summary),
-            ] + Array(messages.dropFirst(boundary + 1))
-        } else {
-            visibleMessages = messages
-        }
-        return TokenEstimator.estimatedTokenCount(forMessages: visibleMessages)
-            + TokenEstimator.estimatedTokenCount(
-                for: draft.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+        guard !isStreaming, compactionTask == nil else { return false }
+        return daemonSessionID != nil && daemonClient != nil && messages.count >= 2
     }
 
     var canRetry: Bool {
@@ -182,20 +114,6 @@ final class ConversationStore: ObservableObject {
         if last.role == .user { return true }
         return last.role == .assistant
             && messages.dropLast().last?.role == .user
-    }
-
-    var canRegenerateLastResponse: Bool {
-        guard runtime != nil, !isStreaming, messages.count >= 2 else { return false }
-        return messages[messages.count - 1].role == .assistant
-            && messages[messages.count - 2].role == .user
-    }
-
-    /// 替换运行时，返回旧的运行时（供调用方释放资源，如终止 codex 子进程）。
-    @discardableResult
-    func configure(runtime: (any AgentRuntime)?) -> (any AgentRuntime)? {
-        let oldRuntime = self.runtime
-        self.runtime = runtime
-        return oldRuntime
     }
 
     /// 设置守护进程客户端引用；注册 session 后再单独启用 daemon 运行。
@@ -212,7 +130,7 @@ final class ConversationStore: ObservableObject {
         daemonRunsEnabled = false
     }
 
-    /// 撤销 daemon 会话注册：会话不再由 daemon 托管，退回直连路径并恢复本地落盘。
+    /// 撤销 daemon 会话注册：会话暂时无法运行（等待重新注册）。
     func revertDaemonRegistration() {
         daemonSessionID = nil
         daemonRunsEnabled = false
@@ -221,7 +139,7 @@ final class ConversationStore: ObservableObject {
         notifyMessagesChanged()
     }
 
-    /// 从 daemon 恢复权威消息（daemon 路径）。
+    /// 从 daemon 恢复权威消息。
     /// 调用前需已 enableDaemonRuns，这样本地只保留会话元数据，不重复落盘消息。
     func restoreMessages(_ restored: [ChatMessage]) {
         messages = restored
@@ -234,17 +152,9 @@ final class ConversationStore: ObservableObject {
         guard let assistantID = daemonAssistantID else { return }
         errorMessage = message
         runState = .failed
-        cancelPendingInteractions()
+        pendingApproval = nil
         removeEmptyPlaceholder(assistantID)
         finishDaemonRun()
-    }
-
-    /// 更新订阅会话的线程 id（CodexRuntime 首次运行时回调）。
-    /// 立即持久化，保证重启后能 thread/resume 续接上下文。
-    func updateThreadID(_ id: String) {
-        guard threadID != id else { return }
-        threadID = id
-        persistImmediately()
     }
 
     /// 发送消息。
@@ -259,13 +169,11 @@ final class ConversationStore: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isSendStarting = false }
-            guard !self.isStreaming else { return }
-            if let sessionID = self.daemonSessionID {
-                guard self.daemonRunsEnabled, let client = self.daemonClient else { return }
-                self.startDaemonRun(text: text, sessionID: sessionID, client: client)
-            } else if let runtime = self.runtime {
-                self.startRun(text: text, runtime: runtime)
-            }
+            guard !self.isStreaming,
+                  let sessionID = self.daemonSessionID,
+                  self.daemonRunsEnabled,
+                  let client = self.daemonClient else { return }
+            self.startDaemonRun(text: text, sessionID: sessionID, client: client)
         }
     }
 
@@ -274,12 +182,6 @@ final class ConversationStore: ObservableObject {
         sessionID: UUID,
         client: any DiscoDaemonClient
     ) {
-        interactionRecords.removeAll { record in
-            switch record.status {
-            case .resolved, .cancelled: true
-            case .pending, .submitting, .failed: false
-            }
-        }
         draft = ""
         errorMessage = nil
         messages.append(ChatMessage(role: .user, text: text))
@@ -316,112 +218,15 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    private func startRun(text: String, runtime: any AgentRuntime) {
-        interactionRecords.removeAll { record in
-            switch record.status {
-            case .resolved, .cancelled: true
-            case .pending, .submitting, .failed: false
-            }
-        }
-        draft = ""
-        errorMessage = nil
-        messages.append(ChatMessage(role: .user, text: text))
-
-        let assistantID = UUID()
-        messages.append(ChatMessage(id: assistantID, role: .assistant))
-        schedulePersistence()
-
-        let requestMessages = Array(messages.dropLast())
-        let runID = RunID()
-        activeRunID = runID
-        runState = .connecting
-
-        requestTask = Task { [weak self] in
-            guard let self else { return }
-
-            do {
-                for try await event in runtime.start(
-                    request: AgentRunRequest(
-                        runID: runID,
-                        messages: requestMessages,
-                        resumeThreadID: self.threadID,
-                        contextCheckpoint: self.contextState.checkpoint
-                    )
-                ) {
-                    guard !Task.isCancelled, activeRunID == runID else { return }
-                    // 让状态发布发生在全新的 MainActor job 中，避免在
-                    // 视图更新事务内同步修改被观察状态。
-                    await Task.yield()
-                    handle(event, assistantID: assistantID)
-                }
-            } catch {
-                guard !Task.isCancelled, activeRunID == runID else { return }
-                errorMessage = "对话中断：\(error.localizedDescription)"
-                runState = .failed
-                removeEmptyPlaceholder(assistantID)
-            }
-
-            finishRun(runID)
-        }
-    }
-
-    private func handle(_ event: AgentEvent, assistantID: UUID) {
-        switch event {
-        case let .runStateChanged(_, state):
-            runState = state
-        case let .messageDelta(delta):
-            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
-            messages[index].appendText(delta)
-            schedulePersistence()
-        case let .reasoningDelta(delta):
-            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
-            messages[index].appendReasoning(delta)
-            schedulePersistence()
-        case let .hostedToolUpdated(snapshot):
-            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
-            messages[index].upsertHostedTool(snapshot)
-            schedulePersistence()
-        case let .citationAdded(citation):
-            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
-            messages[index].appendCitation(citation)
-            schedulePersistence()
-        case let .contextUsageUpdated(snapshot):
-            contextUsage = snapshot
-        case let .contextCompactionUpdated(update):
-            handleCompactionUpdate(update)
-        case let .approvalRequested(request):
-            appendInteraction(.approval(request))
-        case let .approvalResolved(id, decision):
-            resolveInteraction(.approval(id), summary: Self.approvalSummary(decision))
-        case let .userInputRequested(request):
-            appendInteraction(.userInput(request))
-            if userInputDrafts[request.id] == nil {
-                userInputDrafts[request.id] = UserInputDraft()
-            }
-        case let .userInputResolved(id):
-            resolveInteraction(.userInput(id), summary: "已回答")
-            userInputDrafts[id] = nil
-        case let .runFailed(_, failure):
-            errorMessage = failure.message
-            runState = .failed
-            cancelPendingInteractions()
-            removeEmptyPlaceholder(assistantID)
-        case .runCompleted:
-            runState = .completed
-        case .runCancelled:
-            runState = .cancelled
-            cancelPendingInteractions()
-        }
-    }
-
     // MARK: - 守护进程事件处理
 
-    /// 处理守护进程推送的事件，映射到与 AgentEvent 相同的内部状态变更。
-    ///
-    /// 当运行通过守护进程路由时（`useDaemon == true`），事件流来自守护进程通知
-    /// 而非本地 AgentRuntime。此方法将守护进程事件翻译为与 `handle(_:assistantID:)`
-    /// 等价的状态更新，确保 UI 层无需区分数据来源。
+    /// 处理守护进程推送的事件，映射为会话状态变更。
     func handleDaemonNotification(_ event: DaemonEvent) {
+        // 压缩事件与具体 run 解耦:run 结束后仍能更新压缩状态。
+        if event.eventName == "context.compaction" {
+            handleDaemonCompactionEvent(event)
+            return
+        }
         guard let assistantID = daemonAssistantID else { return }
         if let runID = event.runID {
             daemonRunID = runID
@@ -476,32 +281,7 @@ final class ConversationStore: ObservableObject {
             )
 
         case "context.compaction":
-            guard let data = try? event.decoded(as: DaemonContextCompactionData.self) else { return }
-            let runtimeKind: RuntimeKind = data.runtimeKind == "codex" ? .codex : .generic
-            let trigger: ContextCompactionSnapshot.Trigger
-            switch data.trigger {
-            case "automatic": trigger = .automatic
-            case "overflow_recovery": trigger = .overflowRecovery
-            default: trigger = .manual
-            }
-            let status: ContextCompactionSnapshot.Status
-            switch data.status {
-            case "running": status = .running
-            case "completed": status = .completed
-            default: status = .failed
-            }
-            let snapshot = ContextCompactionSnapshot(
-                id: data.id,
-                runtimeKind: runtimeKind,
-                trigger: trigger,
-                status: status,
-                startedAt: Date.now,
-                completedAt: status != .running ? Date.now : nil,
-                beforeTokens: data.beforeTokens,
-                afterTokens: data.afterTokens
-            )
-            let update = ContextCompactionUpdate(snapshot: snapshot)
-            handleCompactionUpdate(update)
+            break
 
         case "run.state":
             guard let data = try? event.decoded(as: DaemonRunStateData.self) else { return }
@@ -510,7 +290,6 @@ final class ConversationStore: ObservableObject {
             case "running": runState = .running
             case "waiting_for_tool": runState = .waitingForTool
             case "waiting_for_approval": runState = .waitingForApproval
-            case "waiting_for_user_input": runState = .waitingForUserInput
             case "cancelling": runState = .cancelling
             default: break
             }
@@ -526,13 +305,13 @@ final class ConversationStore: ObservableObject {
                 errorMessage = "运行失败。"
             }
             runState = .failed
-            cancelPendingInteractions()
+            pendingApproval = nil
             removeEmptyPlaceholder(assistantID)
             finishDaemonRun()
 
         case "run.cancelled":
             runState = .cancelled
-            cancelPendingInteractions()
+            pendingApproval = nil
             finishDaemonRun()
 
         // MARK: - 工具执行事件
@@ -581,28 +360,32 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    private func appendInteraction(_ interaction: PendingUserInteraction) {
-        guard !interactionRecords.contains(where: { $0.id == interaction.id }) else { return }
-        interactionRecords.append(UserInteractionRecord(
-            interaction: interaction,
-            status: .pending
-        ))
-    }
-
-    private func resolveInteraction(
-        _ id: PendingUserInteraction.ID,
-        summary: String
-    ) {
-        guard let index = interactionRecords.firstIndex(where: { $0.id == id }) else { return }
-        interactionRecords[index].status = .resolved(summary)
-    }
-
-    private static func approvalSummary(_ decision: ApprovalDecision) -> String {
-        switch decision {
-        case .approveOnce: "已允许一次"
-        case .approveForSession: "已在本次会话允许"
-        case .decline: "已拒绝"
+    private func handleDaemonCompactionEvent(_ event: DaemonEvent) {
+        guard let data = try? event.decoded(as: DaemonContextCompactionData.self) else { return }
+        let runtimeKind: RuntimeKind = data.runtimeKind == "codex" ? .codex : .generic
+        let trigger: ContextCompactionSnapshot.Trigger
+        switch data.trigger {
+        case "automatic": trigger = .automatic
+        case "overflow_recovery": trigger = .overflowRecovery
+        default: trigger = .manual
         }
+        let status: ContextCompactionSnapshot.Status
+        switch data.status {
+        case "running": status = .running
+        case "completed": status = .completed
+        default: status = .failed
+        }
+        let snapshot = ContextCompactionSnapshot(
+            id: data.id,
+            runtimeKind: runtimeKind,
+            trigger: trigger,
+            status: status,
+            startedAt: Date.now,
+            completedAt: status != .running ? Date.now : nil,
+            beforeTokens: data.beforeTokens,
+            afterTokens: data.afterTokens
+        )
+        handleCompactionUpdate(ContextCompactionUpdate(snapshot: snapshot))
     }
 
     private func removeEmptyPlaceholder(_ assistantID: UUID) {
@@ -611,8 +394,8 @@ final class ConversationStore: ObservableObject {
         messages.remove(at: index)
     }
 
-    /// 压缩状态更新：进行中覆盖 activeCompaction；成功时更新 checkpoint 并立即落盘。
-    /// 失败的压缩不覆盖上一个有效 checkpoint / 成功记录（计划 §2）。
+    /// 压缩状态更新：进行中覆盖 activeCompaction；成功时更新记录并立即落盘。
+    /// 失败的压缩不覆盖上一个成功记录。
     private func handleCompactionUpdate(_ update: ContextCompactionUpdate) {
         switch update.snapshot.status {
         case .running:
@@ -628,14 +411,6 @@ final class ConversationStore: ObservableObject {
         case .failed:
             activeCompaction = nil
         }
-    }
-
-    private func finishRun(_ runID: RunID) {
-        guard activeRunID == runID else { return }
-        persistImmediately()
-        activeRunID = nil
-        requestTask = nil
-        toolExecutions.removeAll()
     }
 
     private func finishDaemonRun() {
@@ -687,17 +462,12 @@ final class ConversationStore: ObservableObject {
         cancelRequest()
         cancelCompaction()
         messages.removeAll()
-        // 清空本地对话也意味着开始新的 Codex 上下文，不能让下一条消息
-        // 继续复用旧的 app-server thread。
         threadID = nil
         errorMessage = nil
-        // 清空会话同时清空 checkpoint、最近压缩记录和 usage（计划 §2）
         contextState = ConversationContextState()
         contextUsage = nil
         lastSuccessfulCompaction = nil
         activeCompaction = nil
-        interactionRecords.removeAll()
-        userInputDrafts.removeAll()
         pendingApproval = nil
         toolExecutions.removeAll()
         runState = .idle
@@ -727,93 +497,7 @@ final class ConversationStore: ObservableObject {
         errorMessage = nil
     }
 
-    func updateUserInput(
-        requestID: UserInputRequestID,
-        questionID: String,
-        value: String,
-        isCustom: Bool
-    ) {
-        guard case let .userInput(request)? = interactionRecords.first(
-            where: { $0.id == .userInput(requestID) }
-        )?.interaction,
-              request.questions.contains(where: { $0.id == questionID }) else { return }
-        var draft = userInputDrafts[requestID] ?? UserInputDraft()
-        draft.values[questionID] = value
-        if isCustom {
-            draft.customQuestionIDs.insert(questionID)
-        } else {
-            draft.customQuestionIDs.remove(questionID)
-        }
-        userInputDrafts[requestID] = draft
-    }
-
-    func canSubmitUserInput(_ request: UserInputRequest) -> Bool {
-        guard let draft = userInputDrafts[request.id] else { return false }
-        return request.questions.allSatisfy { question in
-            guard let value = draft.values[question.id]?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !value.isEmpty else { return false }
-            if question.options.isEmpty || draft.customQuestionIDs.contains(question.id) {
-                return true
-            }
-            return question.options.contains(where: { $0.label == value })
-        }
-    }
-
-    func submitUserInput(_ request: UserInputRequest) {
-        guard let runtime,
-              canSubmitUserInput(request),
-              let index = interactionRecords.firstIndex(where: {
-                  $0.id == .userInput(request.id)
-              }),
-              interactionRecords[index].status != .submitting,
-              let draft = userInputDrafts[request.id] else { return }
-
-        let answers = request.questions.map {
-            UserInputAnswer(
-                questionID: $0.id,
-                answers: [draft.values[$0.id]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""]
-            )
-        }
-        interactionRecords[index].status = .submitting
-        errorMessage = nil
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await runtime.submitUserInput(requestID: request.id, answers: answers)
-            } catch {
-                guard let index = interactionRecords.firstIndex(where: {
-                    $0.id == .userInput(request.id)
-                }) else { return }
-                interactionRecords[index].status = .failed(error.localizedDescription)
-            }
-        }
-    }
-
-    func decideApproval(_ request: ApprovalRequest, decision: ApprovalDecision) {
-        guard let runtime,
-              let index = interactionRecords.firstIndex(where: {
-                  $0.id == .approval(request.id)
-              }),
-              interactionRecords[index].status != .submitting else { return }
-        interactionRecords[index].status = .submitting
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await runtime.respond(to: request.id, decision: decision)
-            } catch {
-                guard let index = interactionRecords.firstIndex(where: {
-                    $0.id == .approval(request.id)
-                }) else { return }
-                interactionRecords[index].status = .failed(error.localizedDescription)
-            }
-        }
-    }
-
-    /// 响应守护进程路径的审批请求。
-    ///
+    /// 响应审批请求。
     func respondToApproval(decision: String) {
         guard let approval = pendingApproval else { return }
         pendingApproval = nil
@@ -845,41 +529,26 @@ final class ConversationStore: ObservableObject {
         send()
     }
 
-    /// 丢弃最后一轮回答，使用同一条用户消息重新运行。
-    func regenerateLastResponse() {
-        guard canRegenerateLastResponse else { return }
-        messages.removeLast()
-        let userMessage = messages.removeLast()
-        draft = userMessage.text
-        send()
-    }
-
     /// 手动压缩当前会话；不创建聊天占位消息。
+    /// daemon 托管会话的压缩状态更新统一来自事件流。
     func compactContext() {
-        guard canCompactContext, let runtime else { return }
+        guard canCompactContext,
+              let client = daemonClient,
+              let sessionID = daemonSessionID else { return }
         compactionTask?.cancel()
         let startedAt = Date.now
-        let running = ContextCompactionSnapshot(
+        activeCompaction = ContextCompactionSnapshot(
             id: UUID().uuidString,
-            runtimeKind: appRuntimeKind,
+            runtimeKind: .generic,
             trigger: .manual,
             status: .running,
             startedAt: startedAt
         )
-        activeCompaction = running
-        let request = ContextCompactionRequest(
-            messages: messages,
-            resumeThreadID: threadID,
-            contextCheckpoint: contextState.checkpoint
-        )
         compactionTask = Task { [weak self] in
             guard let self else { return }
             defer { compactionTask = nil }
-
             do {
-                let update = try await runtime.compactContext(request: request)
-                guard !Task.isCancelled else { return }
-                handleCompactionUpdate(update)
+                try await client.compactContext(sessionID: sessionID)
             } catch is CancellationError {
                 return
             } catch let error as URLError where error.code == .cancelled {
@@ -892,10 +561,6 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    private var appRuntimeKind: RuntimeKind {
-        runtime is CodexRuntime ? .codex : .generic
-    }
-
     private func cancelCompaction() {
         compactionTask?.cancel()
         compactionTask = nil
@@ -903,26 +568,13 @@ final class ConversationStore: ObservableObject {
     }
 
     private func cancelRequest() {
-        if daemonAssistantID != nil {
-            guard isStreaming else { return }
-            runState = .cancelling
-            daemonCancellationRequested = true
-            sendDaemonCancellationIfPossible()
-            cancelPendingInteractions()
-            return
-        }
-        if isStreaming {
-            runState = .cancelling
-        }
         requestTask?.cancel()
         requestTask = nil
-        if let runID = activeRunID {
-            activeRunID = nil
-            let runtime = runtime
-            Task { await runtime?.cancel(runID: runID) }
-        }
-        cancelPendingInteractions()
-        runState = .cancelled
+        guard daemonAssistantID != nil, isStreaming else { return }
+        runState = .cancelling
+        daemonCancellationRequested = true
+        sendDaemonCancellationIfPossible()
+        pendingApproval = nil
     }
 
     private func sendDaemonCancellationIfPossible() {
@@ -934,19 +586,6 @@ final class ConversationStore: ObservableObject {
         Task {
             try? await client.cancelRun(runID: runID)
         }
-    }
-
-    private func cancelPendingInteractions() {
-        for index in interactionRecords.indices {
-            switch interactionRecords[index].status {
-            case .pending, .submitting, .failed:
-                interactionRecords[index].status = .cancelled
-            case .resolved, .cancelled:
-                break
-            }
-        }
-        userInputDrafts.removeAll()
-        pendingApproval = nil
     }
 
     private func schedulePersistence() {

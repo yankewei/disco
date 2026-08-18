@@ -14,38 +14,37 @@ final class StreamingMarkdownTests: XCTestCase {
         let value = 1
         ```
         """
+        let chunks = [
+            "# 标题", "\n\n", "- 第一项", "\n", "- 第二项", "\n\n",
+            "```swift\n", "let value = 1\n", "```",
+        ]
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
         let store = ConversationStore()
-        store.configure(runtime: GenericAgentRuntime(
-            provider: ChunkedMarkdownProvider(chunks: [
-                "# 标题", "\n\n", "- 第一项", "\n", "- 第二项", "\n\n",
-                "```swift\n", "let value = 1\n", "```",
-            ]),
-            configuration: .init(model: "test-model", reasoningEnabled: true)
-        ))
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
         store.draft = "请使用 Markdown 回复"
-        store.send()
 
-        try await waitUntilStreamingFinishes(store)
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        for chunk in chunks {
+            store.handleDaemonNotification(daemonEvent(
+                "message.delta",
+                runID: runID,
+                sessionID: sessionID,
+                fields: ["delta": .string(chunk)]
+            ))
+        }
+        store.handleDaemonNotification(daemonEvent(
+            "run.completed",
+            runID: runID,
+            sessionID: sessionID
+        ))
 
         XCTAssertEqual(store.messages.last?.text, expected)
-    }
-}
-
-private struct ChunkedMarkdownProvider: ModelProvider {
-    let chunks: [String]
-
-    let descriptor = ProviderDescriptor(id: "chunked", displayName: "Chunked")
-
-    func modelCatalog() async throws -> [ModelCatalogEntry] {
-        [ModelCatalogEntry(id: "test-model")]
-    }
-
-    func stream(request: ModelRequest) -> AsyncThrowingStream<ModelEvent, Error> {
-        AsyncThrowingStream { continuation in
-            for chunk in chunks {
-                continuation.yield(.textDelta(chunk))
-            }
-            continuation.finish()
-        }
+        XCTAssertFalse(store.isStreaming)
     }
 }

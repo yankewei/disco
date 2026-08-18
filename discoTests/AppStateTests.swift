@@ -466,16 +466,12 @@ final class AppStateTests: XCTestCase {
 @MainActor
 private func makeAppState(
     keychain: APIKeyStoring? = nil,
-    defaults: UserDefaults,
-    codexTransportFactory: @MainActor @Sendable @escaping () -> CodexAppServerTransport = {
-        CodexAppServerTransport()
-    }
+    defaults: UserDefaults
 ) throws -> AppState {
     AppState(
         keychain: keychain ?? InMemoryAuthStore(),
         defaults: defaults,
-        persistence: try ConversationPersistence(isStoredInMemoryOnly: true),
-        codexTransportFactory: codexTransportFactory
+        persistence: try ConversationPersistence(isStoredInMemoryOnly: true)
     )
 }
 
@@ -619,35 +615,13 @@ extension AppStateTests {
         XCTAssertNil(restored.selectedReasoningEffort(for: .chatgpt))
     }
 
-    /// 旧配置没有模型能力目录时，进入聊天页应自动从 model/list 补齐并持久化。
-    func testRefreshCodexModelCatalogBackfillsMissingReasoningCapabilities() async throws {
+    /// 目录缺失能力声明时会尝试经 daemon 加载；daemon 未连接时记录错误而不是崩溃。
+    func testRefreshCodexModelCatalogReportsDaemonUnavailable() async throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let appState = try makeAppState(defaults: defaults) {
-            let process = ScriptedLineProcess(script: handshakeScript() + [
-                .on("model/list") { request in
-                    [rpcResult(request, result: [
-                        "data": [
-                            [
-                                "id": "gpt-5.6",
-                                "model": "gpt-5.6",
-                                "displayName": "GPT-5.6",
-                                "defaultReasoningEffort": "medium",
-                                "supportedReasoningEfforts": [
-                                    ["reasoningEffort": "low"],
-                                    ["reasoningEffort": "medium"],
-                                    ["reasoningEffort": "high"],
-                                ],
-                            ],
-                        ],
-                        "nextCursor": "",
-                    ])]
-                },
-            ])
-            return CodexAppServerTransport(process: process, configuration: .standard())
-        }
+        let appState = try makeAppState(defaults: defaults)
         try appState.saveProviderConfig(
             vendor: .chatgpt,
             baseURL: "",
@@ -659,22 +633,11 @@ extension AppStateTests {
 
         await appState.refreshCodexModelCatalogIfNeeded()
 
-        XCTAssertEqual(appState.reasoningEfforts(for: .chatgpt), ["low", "medium", "high"])
-        XCTAssertEqual(appState.defaultReasoningEffort(for: .chatgpt), "medium")
-        let data = try XCTUnwrap(
-            defaults.data(forKey: ProviderVendor.chatgpt.modelCatalogDefaultsKey)
-        )
-        let persisted = try JSONDecoder().decode(
-            [ModelCatalogEntry].self,
-            from: data
-        )
-        XCTAssertEqual(
-            persisted.first { $0.id == "gpt-5.6" }?.supportedReasoningEfforts,
-            ["low", "medium", "high"]
-        )
+        XCTAssertNotNil(appState.codexModelCatalogError)
+        XCTAssertFalse(appState.isRefreshingCodexModelCatalog)
     }
 
-    /// 能力目录已明确记录空档位时，表示模型不支持调整，不应反复请求 model/list。
+    /// 能力目录已明确记录空档位时，表示模型不支持调整，不应再次请求加载目录。
     func testRefreshCodexModelCatalogDoesNotReloadKnownUnsupportedModel() async throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -688,14 +651,7 @@ extension AppStateTests {
         )
         defaults.set("", forKey: ProviderVendor.chatgpt.baseURLDefaultsKey)
 
-        var transportCount = 0
-        let appState = try makeAppState(defaults: defaults) {
-            transportCount += 1
-            return CodexAppServerTransport(
-                process: ScriptedLineProcess(script: handshakeScript()),
-                configuration: .standard()
-            )
-        }
+        let appState = try makeAppState(defaults: defaults)
         try appState.saveProviderConfig(
             vendor: .chatgpt,
             baseURL: "",
@@ -703,12 +659,11 @@ extension AppStateTests {
             model: "gpt-4o",
             models: ["gpt-4o"]
         )
-        let transportCountBeforeRefresh = transportCount
 
         await appState.refreshCodexModelCatalogIfNeeded()
 
         XCTAssertTrue(appState.reasoningEfforts(for: .chatgpt).isEmpty)
-        XCTAssertEqual(transportCount, transportCountBeforeRefresh)
+        XCTAssertNil(appState.codexModelCatalogError)
     }
 
 }

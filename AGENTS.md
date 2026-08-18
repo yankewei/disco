@@ -7,14 +7,15 @@
 **disco** 是一款 macOS 原生 AI coding agent 应用，采用 **Rust daemon + SwiftUI 薄客户端** 架构。
 
 - **Rust daemon**（`disco-daemon/`）：agent loop、工具执行（shell/file/search）、多模型服务商适配、上下文压缩、SQLite 持久化
-- **SwiftUI 客户端**（`disco/`）：UI 渲染、用户交互、通过 Unix Domain Socket 与 daemon 通信
-- **通信协议**：JSONL over Unix Domain Socket（`~/Library/Application Support/disco/disco.sock`），详见 `docs/disco-agent-protocol.md`
+- **SwiftUI 客户端**（`disco/`）：UI 渲染、用户交互、通过 stdio 子进程与 daemon 通信
+- **通信协议**：ACP v1 over stdio（daemon 唯一 transport，见 `docs/disco-acp-facade.md`）。旧 DAP（JSONL over Unix Domain Socket）已在 Rust 与 Swift 两侧全部删除
 
 项目的长期目标是支持完整的 coding agent 能力，包括 computer use（虚拟键鼠 + 屏幕捕获）和 browser use（headless Chrome）。
 
 ## 文档索引
 
-- `docs/disco-agent-protocol.md`：Disco Agent Protocol (DAP) 协议规范
+- `docs/disco-agent-protocol.md`：Disco Agent Protocol (DAP) 协议规范（已废弃，仅存档）
+- `docs/disco-acp-facade.md`：ACP stdio facade 与扩展方法
 - 迁移方案：`~/.qoder-cn/plans/quiet-vista-carp.md`（本地文件，分阶段迁移路线）
 
 ## 技术栈
@@ -28,18 +29,19 @@
 - **持久化**：rusqlite（SQLite，WAL 模式）
 - **日志**：tracing + tracing-subscriber
 - **Crate 结构**：
-  - `disco-protocol`：协议 DTO + JSONL 编解码
+  - `disco-protocol`：共享 DTO（Provider 配置、审批、用量等领域类型）
   - `disco-core`：agent loop + 会话管理 + 上下文压缩 + 审批流
-  - `disco-providers`：模型服务商适配（OpenAI Responses API、Chat Completions）
+  - `disco-providers`：迁移期模型服务商与 Codex app-server 适配
+  - `disco-backends`：Codex、ACP、Rig 三类 AgentBackend adapter
   - `disco-tools`：工具执行器（shell、file_edit、search）
   - `disco-persist`：SQLite 持久化
-  - `disco-daemon`：可执行文件入口、Unix socket listener、请求路由
+  - `disco-daemon`：可执行文件入口、ACP stdio facade、共享 service 层
 
 ### SwiftUI 客户端
 
 - **语言/平台**：Swift（Swift 6 并发模型，`default-isolation = MainActor`），macOS only
 - **UI**：SwiftUI + AppKit；`NavigationSplitView` 侧栏 + 聊天主视图
-- **网络**：POSIX Unix Domain Socket + DispatchSource 异步读取
+- **网络**：daemon 子进程 stdin/stdout（agent-client-protocol JSON-RPC line transport）
 - **序列化**：Foundation JSONEncoder/JSONDecoder（`.convertToSnakeCase` / `.convertFromSnakeCase`）
 - **SwiftPM 依赖**：`MarkdownView`（Markdown 渲染），间接依赖 Highlightr、swift-cmark、swift-collections、Litext、SwiftMath
 
@@ -56,8 +58,8 @@ cargo build
 # 运行全部测试
 cargo test
 
-# 运行 daemon
-cargo run -p disco-daemon
+# 运行 daemon（只支持 ACP v1 stdio 模式）
+cargo run -p disco-daemon -- --stdio
 ```
 
 ### SwiftUI 客户端
@@ -82,12 +84,13 @@ xcodebuild test \
 disco-daemon/
 ├── Cargo.toml
 ├── crates/
-│   ├── disco-protocol/      # 协议 DTO + JSONL 编解码
+│   ├── disco-protocol/      # 共享 DTO（Provider 配置、审批、用量等）
 │   ├── disco-core/           # Agent loop + 会话管理 + 上下文压缩 + 审批
-│   ├── disco-providers/      # 模型服务商适配
+│   ├── disco-providers/      # 迁移期模型服务商适配
+│   ├── disco-backends/       # Codex、ACP、Rig backend adapter
 │   ├── disco-tools/          # 工具执行器（shell、file_edit、search）
 │   ├── disco-persist/        # SQLite 持久化
-│   └── disco-daemon/         # 可执行文件入口 + socket listener + 路由
+│   └── disco-daemon/         # 可执行文件入口 + ACP stdio facade + 共享 service 层
 
 disco/
 ├── App/                      # SwiftUI 界面与应用状态
@@ -97,9 +100,10 @@ disco/
 │   ├── SettingsView.swift    # 设置页：服务商配置
 │   └── ...
 ├── Daemon/                   # daemon 通信层
-│   ├── DaemonClient.swift    # Unix socket 连接 + JSONL 收发
-│   ├── DaemonProtocol.swift  # 协议 DTO（与 Rust disco-protocol 对应）
-│   └── DaemonProcessManager.swift  # daemon 进程管理
+│   ├── ACPDaemonClient.swift # ACP v1 stdio transport client
+│   ├── ACPDaemonClientAdapter.swift # DiscoDaemonClient 协议 + ACP update/permission 到 DaemonEvent 的适配
+│   ├── DaemonProtocol.swift  # DaemonEvent 与事件 DTO（daemon/UI 共享词汇）
+│   └── DaemonProcessManager.swift  # daemon 二进制定位 + 旧版 socket 残留进程清理
 ├── AgentDomain/              # 领域模型（ChatMessage、RuntimeContract 等）
 └── Assets.xcassets/
 ```
@@ -108,13 +112,9 @@ disco/
 
 ### 协议层
 
-- **JSONL 帧格式**：每行一个完整 JSON 对象，`\n` 分隔
-- **三种消息类型**：
-  - Request（`{id, method, params}`）：客户端 → daemon，需要响应
-  - Response（`{id, result}` 或 `{id, error}`）：daemon → 客户端
-  - Event（`{event, data}`）：daemon → 客户端，流式通知
-- **字段命名**：协议使用 snake_case（Rust 默认），Swift 端通过 `.convertToSnakeCase` / `.convertFromSnakeCase` 自动转换
-- **终止事件保证**：一次 run 恰好发射一个终止事件（`run.completed` / `run.failed` / `run.cancelled`）
+- **ACP stdio**：daemon 唯一 transport，使用 agent-client-protocol 的 JSON-RPC line transport；Disco 产品操作（provider 配置/列表/models、session 消息、压缩）走 `disco/*` extension 方法，见 `docs/disco-acp-facade.md`
+- **字段命名**：ACP wire 格式为 camelCase；daemon 内部共享 DTO 使用 snake_case
+- **终止语义**：一次 prompt 恰好以一个终止状态收尾（EndTurn / Cancelled / 错误）
 
 ### Daemon 侧
 
@@ -126,10 +126,9 @@ disco/
 
 ### 客户端侧
 
-- **DaemonClient**：`@MainActor` 隔离，POSIX socket + DispatchSource 异步读取
-- **事件路由**：`ConversationStore.handleDaemonEvent()` 将 daemon 事件翻译为 UI 状态变更
-- **JSON 编解码**：`DaemonJSONValue.decoded()` 用于动态 JSON → 具体类型的二次解码
-- **Sendable 安全**：`DaemonClient` 标记 `@unchecked Sendable`，`eventStream` 在 init 时创建后不可变
+- **ACPDaemonClient**：管理 daemon 子进程生命周期与 ACP JSON-RPC 收发
+- **事件路由**：`ConversationStore.handleDaemonNotification()` 将 daemon 事件翻译为 UI 状态变更
+- **Sendable 安全**：跨边界类型标注 `Sendable`，状态类标注 `@MainActor`
 
 ## 代码风格
 

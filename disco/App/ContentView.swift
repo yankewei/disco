@@ -407,11 +407,11 @@ private struct ConversationRow: View {
 
                     Spacer(minLength: 4)
 
-                    if store.firstPendingInteraction != nil {
+                    if store.pendingApproval != nil {
                         Circle()
                             .fill(DiscoTheme.accent)
                             .frame(width: 7, height: 7)
-                            .help("等待你的操作")
+                            .help("等待你的确认")
                     }
 
                     Text(conversation.updatedAt, style: .time)

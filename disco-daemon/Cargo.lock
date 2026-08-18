@@ -538,6 +538,7 @@ dependencies = [
 name = "disco-daemon"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "anyhow",
  "async-trait",
  "disco-backends",

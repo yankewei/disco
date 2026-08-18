@@ -1,6 +1,6 @@
 import Foundation
 
-// MARK: - Daemon 协议 DTO（对应 Rust disco-protocol crate）
+// MARK: - Daemon 协议共享 DTO
 
 /// 动态 JSON 值，用于协议中不确定 schema 的字段。
 /// 复用 CodexJSONValue 的模式，不依赖第三方库。
@@ -77,8 +77,6 @@ enum DaemonJSONValue: Codable, Sendable, Equatable {
     }
 
     /// 将动态 JSON 解码为具体类型。
-    /// 注意：此方法使用无 key 策略的 encoder/decoder，因为 DaemonJSONValue
-    /// 的 object key 已在外层解码时由 .convertFromSnakeCase 转换过。
     func decoded<T: Decodable>(as type: T.Type = T.self) throws -> T {
         let data = try JSONEncoder().encode(self)
         return try JSONDecoder().decode(T.self, from: data)
@@ -91,6 +89,16 @@ enum DaemonJSONValue: Codable, Sendable, Equatable {
 
     var stringValue: String? {
         guard case let .string(value) = self else { return nil }
+        return value
+    }
+
+    var numberValue: Double? {
+        guard case let .number(value) = self else { return nil }
+        return value
+    }
+
+    var boolValue: Bool? {
+        guard case let .boolean(value) = self else { return nil }
         return value
     }
 }
@@ -106,177 +114,6 @@ private struct DaemonDynamicCodingKey: CodingKey {
     init?(intValue: Int) {
         return nil
     }
-}
-
-// MARK: - RPC 信封
-
-/// 请求信封（客户端 → 守护进程）。
-/// 对应 Rust `Request { id, method, params }`。
-struct DaemonRPCRequest<Params: Encodable>: Encodable, Sendable {
-    let id: Int
-    let method: String
-    let params: Params?
-}
-
-/// 响应信封（守护进程 → 客户端）。
-/// 对应 Rust `Response { id, result?, error? }`。
-struct DaemonRPCResponse: Decodable, Sendable {
-    let id: Int
-    let result: DaemonJSONValue?
-    let error: DaemonRPCError?
-}
-
-/// 事件信封（守护进程 → 客户端）。
-/// 对应 Rust `Event { event, data }`。
-struct DaemonEventEnvelope: Decodable, Sendable {
-    let event: String
-    let data: DaemonJSONValue
-}
-
-/// 服务端错误载荷。
-struct DaemonRPCError: Codable, Sendable, Equatable {
-    let code: Int
-    let message: String
-}
-
-// MARK: - 初始化
-
-struct DaemonClientInfo: Encodable, Sendable {
-    let name: String
-    let version: String
-}
-
-struct DaemonInitializeParams: Encodable, Sendable {
-    let clientInfo: DaemonClientInfo
-    let protocolVersion: String
-}
-
-struct DaemonInitializeResult: Decodable, Sendable {
-    let daemonVersion: String?
-    let protocolVersion: String?
-}
-
-// MARK: - 运行（Phase 1 最小集）
-
-struct DaemonRunStartParams: Encodable, Sendable {
-    let sessionId: String
-    let text: String
-}
-
-struct DaemonRunStartResult: Decodable, Sendable {
-    let runId: String
-}
-
-struct DaemonRunCancelParams: Encodable, Sendable {
-    let runId: String
-}
-
-struct DaemonRunCancelResult: Decodable, Sendable {}
-
-// MARK: - 服务商配置（Phase 2）
-
-/// 配置一个服务商（API Key、Base URL、模型等）。
-struct DaemonProviderConfigureParams: Codable, Sendable {
-    let providerId: String
-    let vendor: String
-    let baseUrl: String
-    let apiKey: String
-    let model: String
-    let thinkingEnabled: Bool
-}
-
-/// 守护进程返回的服务商条目（不含 API Key 明文）。
-struct DaemonProviderEntry: Codable, Sendable {
-    let providerId: String
-    let vendor: String
-    let baseUrl: String
-    let model: String
-    let thinkingEnabled: Bool
-}
-
-/// `provider/list` 返回结果。
-struct DaemonProviderListResult: Codable, Sendable {
-    let providers: [DaemonProviderEntry]
-}
-
-// MARK: - 会话管理
-
-struct DaemonSessionCreateParams: Codable, Sendable {
-    let sessionId: String
-    let projectId: String
-    let providerId: String
-    let vendor: String
-    let model: String
-}
-
-struct DaemonSession: Codable, Sendable {
-    let id: String
-    let projectId: String
-    let providerId: String
-    let vendor: String
-    let model: String
-    let createdAt: String
-    let updatedAt: String
-    let title: String?
-}
-
-struct DaemonSessionCreateResult: Codable, Sendable {
-    let session: DaemonSession
-}
-
-/// `session/list` 返回结果。
-struct DaemonSessionListParams: Codable, Sendable {
-    let projectId: String
-}
-
-struct DaemonSessionListResult: Codable, Sendable {
-    let sessions: [DaemonSession]
-}
-
-/// `session/messages` 返回的会话消息（daemon 权威历史）。
-struct DaemonSessionMessage: Codable, Sendable {
-    let id: String
-    let role: String
-    let text: String
-    let createdAt: String
-}
-
-/// `session/messages` 参数与结果。
-struct DaemonSessionMessagesParams: Codable, Sendable {
-    let sessionId: String
-}
-
-struct DaemonSessionMessagesResult: Codable, Sendable {
-    let messages: [DaemonSessionMessage]
-}
-
-/// `session/delete` 参数。
-struct DaemonSessionDeleteParams: Codable, Sendable {
-    let sessionId: String
-}
-
-// MARK: - 项目管理
-
-struct DaemonProjectCreateParams: Codable, Sendable {
-    let projectId: String
-    let name: String
-    let path: String
-}
-
-struct DaemonProject: Codable, Sendable {
-    let id: String
-    let name: String
-    let path: String
-    let createdAt: String
-}
-
-struct DaemonProjectCreateResult: Codable, Sendable {
-    let project: DaemonProject
-}
-
-/// `project/list` 返回结果。
-struct DaemonProjectListResult: Codable, Sendable {
-    let projects: [DaemonProject]
 }
 
 // MARK: - 事件数据类型
@@ -351,7 +188,7 @@ struct DaemonRunFailedData: Codable, Sendable {
     let error: DaemonRunError
 }
 
-/// `run.failed` 中的错误码，对应 Rust `ErrorCode` 枚举。
+/// `run.failed` 中的错误码。
 enum DaemonRunErrorCode: String, Codable, Sendable, Equatable {
     case generic
     case noTextOutput = "no_text_output"
@@ -370,13 +207,6 @@ struct DaemonRunError: Codable, Sendable {
 /// `run.cancelled` 事件数据。
 struct DaemonRunCancelledData: Codable, Sendable {
     let runId: String
-    let sessionId: String
-}
-
-// MARK: - 上下文压缩（Phase 2）
-
-/// `run/compact` 参数。
-struct DaemonRunCompactParams: Codable, Sendable {
     let sessionId: String
 }
 
@@ -443,22 +273,6 @@ struct DaemonApprovalResolvedData: Codable, Sendable {
     let decision: String
 }
 
-// MARK: - 审批请求
-
-/// `run/approve` 参数：响应用户审批决定。
-struct DaemonRunApproveParams: Codable, Sendable {
-    let approvalId: String
-    let decision: String  // "approve_once", "approve_for_session", "decline"
-}
-
-struct DaemonRunApproveResult: Decodable, Sendable {}
-
-// MARK: - 关闭
-
-struct DaemonShutdownParams: Encodable, Sendable {}
-
-struct DaemonShutdownResult: Decodable, Sendable {}
-
 // MARK: - 守护进程事件
 
 /// 守护进程推送的事件（通知），按 `eventName` 区分类型。
@@ -492,39 +306,18 @@ struct DaemonEvent: Sendable, Equatable {
 // MARK: - 错误
 
 enum DaemonError: LocalizedError, Equatable, Sendable {
-    case socketCreationFailed
-    case connectionFailed(String)
     case notConnected
-    case disconnected
-    case requestFailed(String)
-    case rpcError(code: Int, message: String)
     case invalidResponse(String)
-    case requestTimedOut(String)
-    case daemonNotFound
-    case daemonLaunchFailed(String)
+    case rpcError(code: Int, message: String)
 
     var errorDescription: String? {
         switch self {
-        case .socketCreationFailed:
-            return "无法创建 Unix 域套接字。"
-        case let .connectionFailed(message):
-            return "无法连接到守护进程：\(message)"
         case .notConnected:
             return "尚未连接到守护进程。"
-        case .disconnected:
-            return "守护进程连接已断开。"
-        case let .requestFailed(message):
-            return "守护进程请求失败：\(message)"
-        case let .rpcError(code, message):
-            return "守护进程返回错误（\(code)）：\(message)"
         case let .invalidResponse(description):
             return "守护进程响应格式不符合预期：\(description)"
-        case let .requestTimedOut(method):
-            return "守护进程请求超时：\(method)"
-        case .daemonNotFound:
-            return "找不到 disco-daemon 可执行文件。"
-        case let .daemonLaunchFailed(message):
-            return "无法启动守护进程：\(message)"
+        case let .rpcError(code, message):
+            return "守护进程返回错误（\(code)）：\(message)"
         }
     }
 }
