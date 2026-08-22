@@ -1,15 +1,6 @@
 import Combine
 import Foundation
 
-/// 工具执行在 UI 时间线中的展示模型。
-struct ToolExecutionDisplay: Identifiable, Equatable {
-    let id: String  // toolCallId
-    let toolName: String
-    let arguments: String
-    var output: String?
-    var isCompleted: Bool = false
-}
-
 @MainActor
 final class ConversationStore: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
@@ -24,9 +15,6 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var activeCompaction: ContextCompactionSnapshot?
     /// 当前待处理的守护进程审批请求；nil 表示无审批等待。
     @Published var pendingApproval: DaemonApprovalRequestedData?
-    /// 当前运行中活跃/已完成的工具执行记录。
-    @Published private(set) var toolExecutions: [ToolExecutionDisplay] = []
-
     /// daemon 运行边界；所有会话都由 daemon 托管，注册 session 后启用。
     private var daemonClient: (any DiscoDaemonClient)?
     private var daemonSessionID: UUID?
@@ -139,8 +127,7 @@ final class ConversationStore: ObservableObject {
         notifyMessagesChanged()
     }
 
-    /// 从 daemon 恢复权威消息。
-    /// 调用前需已 enableDaemonRuns，这样本地只保留会话元数据，不重复落盘消息。
+    /// 从 daemon 恢复权威消息，同时更新本地 rich transcript 缓存。
     func restoreMessages(_ restored: [ChatMessage]) {
         messages = restored
         notifyMessagesChanged()
@@ -318,29 +305,40 @@ final class ConversationStore: ObservableObject {
 
         case "tool.started":
             guard let data = try? event.decoded(as: DaemonToolStartedData.self) else { return }
-            let execution = ToolExecutionDisplay(
-                id: data.toolCallId,
-                toolName: data.toolName,
-                arguments: data.arguments
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            messages[index].upsertToolCall(
+                ChatMessage.ToolCallSnapshot(
+                    id: data.toolCallId,
+                    name: data.toolName,
+                    arguments: data.arguments,
+                    kind: data.kind
+                )
             )
-            toolExecutions.append(execution)
+            schedulePersistence()
 
         case "tool.completed":
             guard let data = try? event.decoded(as: DaemonToolCompletedData.self) else { return }
-            if let index = toolExecutions.firstIndex(where: { $0.id == data.toolCallId }) {
-                toolExecutions[index].output = data.output
-                toolExecutions[index].isCompleted = true
+            guard let index = messages.firstIndex(where: { $0.id == assistantID }) else { return }
+            let completedCall = ChatMessage.ToolCallSnapshot(
+                id: data.toolCallId,
+                name: data.toolName,
+                arguments: "",
+                kind: data.kind,
+                status: .completed,
+                output: data.output
+            )
+            if let callIndex = messages[index].parts.firstIndex(where: { part in
+                guard case let .toolCall(call) = part else { return false }
+                return call.id == data.toolCallId
+            }), case var .toolCall(updatedCall) = messages[index].parts[callIndex] {
+                updatedCall.status = .completed
+                updatedCall.output = data.output
+                messages[index].parts[callIndex] = .toolCall(updatedCall)
             } else {
-                // 可能错过了 started 事件，直接添加已完成记录
-                let execution = ToolExecutionDisplay(
-                    id: data.toolCallId,
-                    toolName: data.toolName,
-                    arguments: "",
-                    output: data.output,
-                    isCompleted: true
-                )
-                toolExecutions.append(execution)
+                // 可能错过了 started 事件，直接添加已完成调用，保证时间线仍然可见。
+                messages[index].upsertToolCall(completedCall)
             }
+            schedulePersistence()
 
         // MARK: - 审批事件
 
@@ -424,7 +422,6 @@ final class ConversationStore: ObservableObject {
         daemonCancelSent = false
         clearAfterDaemonRun = false
         requestTask = nil
-        toolExecutions.removeAll()
         if shouldClear, let sessionIDToClear {
             clearDaemonSessionAndLocalHistory(sessionIDToClear)
         }
@@ -469,7 +466,6 @@ final class ConversationStore: ObservableObject {
         lastSuccessfulCompaction = nil
         activeCompaction = nil
         pendingApproval = nil
-        toolExecutions.removeAll()
         runState = .idle
         persistImmediately()
     }
@@ -604,11 +600,10 @@ final class ConversationStore: ObservableObject {
         notifyMessagesChanged()
     }
 
-    /// 持久化回调：daemon 托管会话由 daemon 保存权威历史，本地不再写消息副本，
-    /// 只保留 threadID 与上下文状态等 daemon 没有的元数据。
+    /// 持久化回调：daemon session 仍保留本地 rich transcript 作为离线缓存和恢复兜底。
     private func notifyMessagesChanged() {
         onMessagesChanged(
-            daemonSessionID == nil ? messages : [],
+            messages,
             threadID,
             contextState
         )

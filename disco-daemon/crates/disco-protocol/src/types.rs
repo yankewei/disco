@@ -13,6 +13,9 @@ pub enum Vendor {
     KimiCode,
     Glm,
     Codex,
+    /// 本地 opencode CLI（`opencode acp`），经 ACP 接入。
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 /// 用户选择的 Provider profile 稳定标识。
@@ -25,6 +28,7 @@ pub struct ProviderId(String);
 impl ProviderId {
     pub const CODEX_APP_SERVER: &'static str = "codex_app_server";
     pub const CODEX_API: &'static str = "codex_api";
+    pub const OPENCODE_APP_SERVER: &'static str = "opencode_app_server";
 
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -38,12 +42,24 @@ impl ProviderId {
             Vendor::KimiCode => "kimi_code_api",
             Vendor::Glm => "glm_api",
             Vendor::Codex => Self::CODEX_APP_SERVER,
+            Vendor::OpenCode => Self::OPENCODE_APP_SERVER,
         };
         Self::new(value)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// 返回 Provider 对应的运行时类别。
+    ///
+    /// Provider ID 是会话的稳定路由依据；Vendor 只保留作兼容和展示信息。
+    pub fn runtime_kind(&self) -> &'static str {
+        match self.as_str() {
+            Self::CODEX_APP_SERVER => "codex_app_server",
+            Self::OPENCODE_APP_SERVER => "acp",
+            _ => "rig",
+        }
     }
 }
 

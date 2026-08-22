@@ -6,7 +6,7 @@
 
 **disco** 是一款 macOS 原生 AI coding agent 应用，采用 **Rust daemon + SwiftUI 薄客户端** 架构。
 
-- **Rust daemon**（`disco-daemon/`）：agent loop、工具执行（shell/file/search）、多模型服务商适配、上下文压缩、SQLite 持久化
+- **Rust daemon**（`disco-daemon/`）：运行协调与审批、工具执行（shell/file/search）、多后端适配（Codex/ACP/Rig）、上下文压缩、SQLite 持久化
 - **SwiftUI 客户端**（`disco/`）：UI 渲染、用户交互、通过 stdio 子进程与 daemon 通信
 - **通信协议**：ACP v1 over stdio（daemon 唯一 transport，见 `docs/disco-acp-facade.md`）。旧 DAP（JSONL over Unix Domain Socket）已在 Rust 与 Swift 两侧全部删除
 
@@ -30,9 +30,9 @@
 - **日志**：tracing + tracing-subscriber
 - **Crate 结构**：
   - `disco-protocol`：共享 DTO（Provider 配置、审批、用量等领域类型）
-  - `disco-core`：agent loop + 会话管理 + 上下文压缩 + 审批流
+  - `disco-core`：AgentBackend seam + 运行协调（RunCoordinator）+ 上下文压缩 + 审批流
   - `disco-providers`：迁移期模型服务商与 Codex app-server 适配
-  - `disco-backends`：Codex、ACP、Rig 三类 AgentBackend adapter
+  - `disco-backends`：Codex、ACP、Rig 三类 AgentBackend adapter（agent loop 由各后端或 Rig 持有）
   - `disco-tools`：工具执行器（shell、file_edit、search）
   - `disco-persist`：SQLite 持久化
   - `disco-daemon`：可执行文件入口、ACP stdio facade、共享 service 层
@@ -85,9 +85,9 @@ disco-daemon/
 ├── Cargo.toml
 ├── crates/
 │   ├── disco-protocol/      # 共享 DTO（Provider 配置、审批、用量等）
-│   ├── disco-core/           # Agent loop + 会话管理 + 上下文压缩 + 审批
+│   ├── disco-core/           # AgentBackend seam + 运行协调 + 上下文压缩 + 审批
 │   ├── disco-providers/      # 迁移期模型服务商适配
-│   ├── disco-backends/       # Codex、ACP、Rig backend adapter
+│   ├── disco-backends/       # Codex、ACP、Rig backend adapter（各自持有 agent loop）
 │   ├── disco-tools/          # 工具执行器（shell、file_edit、search）
 │   ├── disco-persist/        # SQLite 持久化
 │   └── disco-daemon/         # 可执行文件入口 + ACP stdio facade + 共享 service 层

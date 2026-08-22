@@ -46,6 +46,43 @@ final class ChatMessageTests: XCTestCase {
         ])
     }
 
+    func testToolCallLifecycleUpdatesInPlaceAndKeepsOrder() {
+        var message = ChatMessage(role: .assistant)
+        message.appendReasoning("先分析")
+        message.upsertToolCall(
+            .init(id: "1", name: "shell", arguments: #"{"command":"pwd"}"#)
+        )
+        XCTAssertTrue(message.hasRunningToolCall)
+        message.appendReasoning("再整理")
+        message.upsertToolCall(
+            .init(
+                id: "1",
+                name: "shell",
+                arguments: #"{"command":"pwd"}"#,
+                status: .completed,
+                output: "/tmp/disco"
+            )
+        )
+        XCTAssertFalse(message.hasRunningToolCall)
+        message.appendText("完成")
+
+        XCTAssertEqual(message.parts.map { part in
+            switch part {
+            case .reasoning: return "reasoning"
+            case .toolCall: return "toolCall"
+            case .text: return "text"
+            case .hostedTool: return "hostedTool"
+            }
+        }, ["reasoning", "toolCall", "reasoning", "text"])
+        XCTAssertEqual(
+            message.parts.compactMap { part -> ChatMessage.ToolCallSnapshot? in
+                guard case let .toolCall(call) = part else { return nil }
+                return call
+            }.first?.output,
+            "/tmp/disco"
+        )
+    }
+
     func testEmptyPlaceholderHasNoParts() {
         let placeholder = ChatMessage(id: UUID(), role: .assistant)
 

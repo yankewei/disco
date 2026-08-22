@@ -4,7 +4,7 @@ use std::sync::Arc;
 use disco_backends::{deepseek_runtime, openai_chat_runtime, openai_responses_runtime};
 use disco_core::{AgentBackend, RunCoordinator};
 use disco_persist::Database;
-use disco_protocol::types::{ProviderId, Vendor};
+use disco_protocol::types::{ModelCatalogEntry, ProviderId, Vendor};
 use disco_providers::ModelProvider;
 use disco_tools::CompositeExecutor;
 use tokio::sync::Mutex;
@@ -33,6 +33,8 @@ pub fn api_key_provider_runtime(
         Vendor::MoonshotKimi | Vendor::KimiCode | Vendor::Glm => {
             openai_chat_runtime(base_url, api_key, model, executor)?
         }
+        // OpenCode 走外部 ACP agent（AcpAdapter），不会经过 API Key runtime。
+        Vendor::OpenCode => anyhow::bail!("OpenCode 使用 ACP backend，不走 API Key runtime"),
     };
     Ok(ProviderRuntime {
         backend: runtime.backend,
@@ -45,6 +47,8 @@ pub struct AppState {
     pub db: Database,
     /// Provider 配置对应的运行时依赖，配置更新时原子替换。
     pub runtime_by_provider_id: Mutex<HashMap<ProviderId, ProviderRuntime>>,
+    /// OpenCode 模型目录缓存：来自 ACP agent session configOptions，首次请求时懒加载。
+    pub opencode_model_catalog: Mutex<Option<Vec<ModelCatalogEntry>>>,
     /// 活动运行、会话互斥、取消和审批路由。
     pub run_coordinator: RunCoordinator,
     /// Tool executor composite.

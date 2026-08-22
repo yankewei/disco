@@ -53,6 +53,18 @@ pub struct BackendRun {
 pub trait AgentBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
 
+    /// 恢复一个已经存在的原生会话。
+    ///
+    /// 没有原生持久化会话的后端（例如 Rig）可以使用默认实现；调用方仍然会从
+    /// Disco 自己保存的 transcript 恢复模型上下文。
+    async fn load_session(
+        &self,
+        _session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn start_run(&self, request: BackendRunRequest) -> Result<BackendRun>;
 
     /// 删除权威会话。Adapter 应在内部把“已经不存在”归一化为成功。

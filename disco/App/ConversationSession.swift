@@ -6,6 +6,8 @@ struct ConversationSession: Identifiable {
     let createdAt: Date
     var updatedAt: Date
     let projectID: UUID?
+    var providerID: String?
+    var runtimeKind: SessionRuntimeKind?
     let store: ConversationStore
 
     init(
@@ -13,6 +15,8 @@ struct ConversationSession: Identifiable {
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         projectID: UUID? = nil,
+        providerID: String? = nil,
+        runtimeKind: SessionRuntimeKind? = nil,
         messages: [ChatMessage] = [],
         threadID: String? = nil,
         contextState: ConversationContextState = ConversationContextState(),
@@ -22,6 +26,8 @@ struct ConversationSession: Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.projectID = projectID
+        self.providerID = providerID
+        self.runtimeKind = runtimeKind
         store = ConversationStore(
             messages: messages,
             threadID: threadID,

@@ -137,6 +137,26 @@ final class ACPTransportTests: XCTestCase {
         XCTAssertTrue(approvalData.allowsSessionApproval)
         XCTAssertEqual(approvalData.kind, "command")
 
+        // 外部 ACP agent 不一定使用 UUID 作为 toolCallId；不能因为 ID 格式不同
+        // 就静默丢弃审批请求，否则 UI 永远不会出现审批弹窗。
+        let nonUUIDPermission = ACPPermissionRequest(
+            requestID: .number(8),
+            sessionID: sessionID,
+            toolCall: .object([
+                "toolCallId": .string("tool-1"),
+                "title": .string("执行命令")
+            ]),
+            options: [],
+            metadata: nil
+        )
+        let mappedNonUUID = try XCTUnwrap(
+            ACPDaemonEventMapper.approvalEvent(nonUUIDPermission, runID: runID)
+        )
+        XCTAssertEqual(
+            try mappedNonUUID.event.decoded(as: DaemonApprovalRequestedData.self).approvalId,
+            mappedNonUUID.approvalID.uuidString
+        )
+
         let usageUpdate = ACPSessionUpdate(
             sessionID: sessionID,
             update: .object([
@@ -173,6 +193,74 @@ final class ACPTransportTests: XCTestCase {
         XCTAssertEqual(usageData.current.input, 100)
         XCTAssertEqual(usageData.current.total, 150)
         XCTAssertEqual(usageData.source, "provider")
+
+        let standardUsageUpdate = ACPSessionUpdate(
+            sessionID: sessionID,
+            update: .object([
+                "sessionUpdate": .string("usage_update"),
+                "used": .number(53_000),
+                "size": .number(200_000)
+            ])
+        )
+        let standardUsageEvents = ACPDaemonEventMapper.sessionUpdateEvents(
+            standardUsageUpdate,
+            runID: runID,
+            shouldEmitRunningState: false
+        )
+        XCTAssertEqual(standardUsageEvents.map(\.eventName), ["context.usage"])
+        let standardUsageData = try standardUsageEvents[0].decoded(
+            as: DaemonContextUsageData.self
+        )
+        XCTAssertEqual(standardUsageData.current.total, 53_000)
+        XCTAssertEqual(standardUsageData.contextWindow, 200_000)
+        XCTAssertNil(standardUsageData.accumulated)
+    }
+
+    func testACPEventMapperTranslatesToolCallLifecycle() throws {
+        let sessionID = UUID().uuidString
+        let runID = UUID()
+        let toolCallID = "tool-1"
+        let started = ACPSessionUpdate(
+            sessionID: sessionID,
+            update: .object([
+                "sessionUpdate": .string("tool_call"),
+                "toolCallId": .string(toolCallID),
+                "title": .string("shell"),
+                "kind": .string("execute"),
+                "status": .string("in_progress"),
+                "rawInput": .object(["command": .string("pwd")]),
+            ])
+        )
+        let startedEvents = ACPDaemonEventMapper.sessionUpdateEvents(
+            started,
+            runID: runID,
+            shouldEmitRunningState: false
+        )
+        XCTAssertEqual(startedEvents.map(\.eventName), ["tool.started"])
+        let startedData = try startedEvents[0].decoded(as: DaemonToolStartedData.self)
+        XCTAssertEqual(startedData.toolCallId, toolCallID)
+        XCTAssertEqual(startedData.toolName, "shell")
+        XCTAssertEqual(startedData.kind, "execute")
+        XCTAssertEqual(startedData.arguments, #"{"command":"pwd"}"#)
+
+        let completed = ACPSessionUpdate(
+            sessionID: sessionID,
+            update: .object([
+                "sessionUpdate": .string("tool_call_update"),
+                "toolCallId": .string(toolCallID),
+                "status": .string("completed"),
+                "rawOutput": .string("/tmp/disco"),
+            ])
+        )
+        let completedEvents = ACPDaemonEventMapper.sessionUpdateEvents(
+            completed,
+            runID: runID,
+            shouldEmitRunningState: false
+        )
+        XCTAssertEqual(completedEvents.map(\.eventName), ["tool.completed"])
+        let completedData = try completedEvents[0].decoded(as: DaemonToolCompletedData.self)
+        XCTAssertEqual(completedData.toolCallId, toolCallID)
+        XCTAssertEqual(completedData.output, "/tmp/disco")
     }
 
     func testDaemonRespondsToACPInitializeOverStdio() throws {

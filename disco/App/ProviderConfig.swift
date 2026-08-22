@@ -10,6 +10,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     case kimiCode
     case zhipu
     case chatgpt
+    case opencode
     case anthropic
     case gemini
 
@@ -24,6 +25,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "kimi_code"
         case .zhipu: "glm"
         case .chatgpt: "codex"
+        case .opencode: "opencode"
         case .anthropic: "anthropic"
         case .gemini: "gemini"
         }
@@ -34,6 +36,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         switch self {
         case .openai: "codex_api"
         case .chatgpt: "codex_app_server"
+        case .opencode: "opencode_app_server"
         default: "\(daemonVendor)_api"
         }
     }
@@ -46,6 +49,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "Kimi Code"
         case .zhipu: "智谱 GLM"
         case .chatgpt: "Codex (OpenAI)"
+        case .opencode: "OpenCode"
         case .anthropic: "Anthropic Claude"
         case .gemini: "Google Gemini"
         }
@@ -59,6 +63,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "Kimi Code 订阅 API，使用 Chat Completions 接口"
         case .zhipu: "智谱清言 GLM API，兼容 OpenAI 接口"
         case .chatgpt: "使用 Codex (OpenAI) 订阅额度（codex app-server）"
+        case .opencode: "本地 opencode CLI，经 ACP 驱动（模型由 opencode 自身管理）"
         case .anthropic: "Anthropic 官方 Claude API"
         case .gemini: "Google Gemini API"
         }
@@ -72,6 +77,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "chevron.left.forwardslash.chevron.right"
         case .zhipu: "brain.head.profile"
         case .chatgpt: "bubble.left.and.bubble.right.fill"
+        case .opencode: "terminal"
         case .anthropic: "rays"
         case .gemini: "sparkles"
         }
@@ -83,6 +89,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: "brand.deepseek"
         case .kimiCode: "brand.kimiCode"
         case .chatgpt: "brand.codex"
+        case .opencode: "brand.opencode"
         default: nil
         }
     }
@@ -96,6 +103,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "https://api.kimi.com/coding/v1"
         case .zhipu: "https://open.bigmodel.cn/api/paas/v4"
         case .chatgpt: ""
+        case .opencode: ""
         case .anthropic: ""
         case .gemini: ""
         }
@@ -103,9 +111,10 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
 
     /// 是否需要 API Key。false 表示订阅登录类服务商（ChatGPT/Codex），
     /// 登录态由 codex CLI 管理（ADR-003：应用不读取 ~/.codex/auth.json）。
+    /// OpenCode 同理：认证由 opencode CLI 自身管理（`opencode auth login`）。
     var requiresAPIKey: Bool {
         switch self {
-        case .chatgpt: false
+        case .chatgpt, .opencode: false
         default: true
         }
     }
@@ -113,7 +122,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     /// 当前是否已实现接入（OpenAI 兼容接口与 ChatGPT 订阅已可用，其余待实现）
     var isAvailable: Bool {
         switch self {
-        case .deepseek, .openai, .moonshot, .kimiCode, .zhipu, .chatgpt: true
+        case .deepseek, .openai, .moonshot, .kimiCode, .zhipu, .chatgpt, .opencode: true
         case .anthropic, .gemini: false
         }
     }
@@ -124,6 +133,8 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: ["none", "low", "high", "max"]
         case .kimiCode: ["none", "low", "high", "max"]
         case .openai, .moonshot, .zhipu: ["none", "high"]
+        // OpenCode 的 effort 能力按模型从 ACP configOptions 获取，不能用供应商级静态列表兜底。
+        case .opencode: []
         default: []
         }
     }

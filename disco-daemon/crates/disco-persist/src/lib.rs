@@ -40,10 +40,6 @@ impl Database {
         debug!("Opening database at {}", db_path.display());
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open SQLite at {}", db_path.display()))?;
-        // 与客户端 auth.json（0600）的凭据权限约定保持一致。
-        #[cfg(unix)]
-        std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set database permissions {}", db_path.display()))?;
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")
@@ -54,6 +50,13 @@ impl Database {
             path: db_path.to_path_buf(),
         };
         db.init_tables()?;
+
+        // 与客户端 auth.json（0600）的凭据权限约定保持一致。
+        // WAL/SHM 伴随文件在 init_tables 的首次写事务中创建，同样包含未 checkpoint
+        // 的明文数据，必须一并收紧权限（也覆盖历史遗留文件）。
+        // 新进程后续重建伴随文件时，权限由 daemon 启动时设置的 umask（0o077）保证。
+        #[cfg(unix)]
+        restrict_private_file_permissions(db_path)?;
         Ok(db)
     }
 
@@ -85,6 +88,10 @@ impl Database {
                 session_id TEXT NOT NULL REFERENCES sessions(id),
                 role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
                 text TEXT NOT NULL,
+                reasoning TEXT NOT NULL DEFAULT '',
+                tool_calls_json TEXT,
+                tool_call_id TEXT,
+                tool_name TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -104,6 +111,7 @@ impl Database {
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL,
                 thinking_enabled INTEGER NOT NULL DEFAULT 0,
+                reasoning_effort TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -162,6 +170,59 @@ impl Database {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN backend_handle TEXT;")
                 .context("Failed to migrate sessions backend_handle")?;
         }
+
+        let message_columns = {
+            let mut statement = conn
+                .prepare("PRAGMA table_info(messages)")
+                .context("Failed to inspect messages schema")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("Failed to list messages columns")?;
+            let mut names = Vec::new();
+            for column in columns {
+                names.push(column.context("Failed to read messages column")?);
+            }
+            names
+        };
+        if !message_columns.iter().any(|name| name == "reasoning") {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT '';",
+            )
+            .context("Failed to migrate messages reasoning")?;
+        }
+        if !message_columns.iter().any(|name| name == "tool_calls_json") {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT;")
+                .context("Failed to migrate messages tool calls")?;
+        }
+        if !message_columns.iter().any(|name| name == "tool_call_id") {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN tool_call_id TEXT;")
+                .context("Failed to migrate messages tool call id")?;
+        }
+        if !message_columns.iter().any(|name| name == "tool_name") {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN tool_name TEXT;")
+                .context("Failed to migrate messages tool name")?;
+        }
+
+        let profile_columns = {
+            let mut statement = conn
+                .prepare("PRAGMA table_info(provider_profiles)")
+                .context("Failed to inspect provider_profiles schema")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .context("Failed to list provider_profiles columns")?;
+            let mut names = Vec::new();
+            for column in columns {
+                names.push(column.context("Failed to read provider_profiles column")?);
+            }
+            names
+        };
+        if !profile_columns
+            .iter()
+            .any(|name| name == "reasoning_effort")
+        {
+            conn.execute_batch("ALTER TABLE provider_profiles ADD COLUMN reasoning_effort TEXT;")
+                .context("Failed to migrate provider_profiles reasoning_effort")?;
+        }
         Ok(())
     }
 
@@ -174,6 +235,23 @@ impl Database {
             .as_secs()
             .to_string()
     }
+}
+
+/// 把数据库文件及其 SQLite 伴随文件（-wal/-shm）的权限收紧为仅当前用户可读写。
+#[cfg(unix)]
+fn restrict_private_file_permissions(db_path: &Path) -> Result<()> {
+    for path in [
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ] {
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_context(
+                || format!("Failed to set database permissions {}", path.display()),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Return the default database path: ~/Library/Application Support/disco/disco.db
@@ -262,5 +340,23 @@ mod tests {
             configs[0].provider_id.as_str(),
             disco_protocol::types::ProviderId::CODEX_APP_SERVER
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn database_and_wal_shm_sidecars_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("disco-test-{}", uuid::Uuid::new_v4()));
+        let db_path = dir.join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let _ = &db;
+
+        // init_tables 已触发首次写事务：主库与 WAL/SHM 伴随文件都应存在且为 0600。
+        for path in [&db_path, &dir.join("test.db-wal"), &dir.join("test.db-shm")] {
+            assert!(path.exists(), "{} 应存在", path.display());
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} 权限应为 0600", path.display());
+        }
     }
 }

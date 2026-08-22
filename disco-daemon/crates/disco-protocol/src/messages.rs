@@ -15,6 +15,8 @@ pub struct ProviderConfigureParams {
     pub model: String,
     #[serde(default)]
     pub thinking_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,6 +39,11 @@ pub struct ProviderModelsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<ProviderId>,
     pub vendor: Vendor,
+    /// API Key 类服务商实时查询模型列表所需凭据；缺省时回退内置目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 // MARK: - 审批（run service 产生的协议无关审批请求）
@@ -111,6 +118,7 @@ mod tests {
             api_key: "sk-xxx".into(),
             model: "deepseek-chat".into(),
             thinking_enabled: false,
+            reasoning_effort: None,
         };
         round_trip(&params);
     }

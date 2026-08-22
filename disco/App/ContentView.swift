@@ -12,11 +12,18 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var expandedProjectIDs: Set<UUID> = []
     @State private var projectError: ProjectUIError?
+    @State private var projectPendingDeletion: ProjectSnapshot?
+    @State private var isProjectDeletionConfirmationPresented = false
 
     var body: some View {
         NavigationSplitView {
             ConversationSidebar(
                 expandedProjectIDs: $expandedProjectIDs,
+                openProject: openProjectFromPicker,
+                requestDeleteProject: {
+                    projectPendingDeletion = $0
+                    isProjectDeletionConfirmationPresented = true
+                },
                 reconnectProject: reconnectProject
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
@@ -32,7 +39,7 @@ struct ContentView: View {
                 ContentUnavailableView(
                     "选择一段对话",
                     systemImage: "bubble.left.and.bubble.right",
-                    description: Text("从左侧选择会话，或创建一段新的临时对话。")
+                    description: Text("从左侧选择会话，或点击右上角的「新建对话」。")
                 )
             }
         }
@@ -57,6 +64,23 @@ struct ContentView: View {
                 dismissButton: .default(Text("好"))
             )
         }
+        .confirmationDialog(
+            "删除项目？",
+            isPresented: $isProjectDeletionConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("删除项目", role: .destructive) {
+                guard let project = projectPendingDeletion else { return }
+                projectPendingDeletion = nil
+                appState.deleteProject(id: project.id)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(
+                "将从 Disco 移除“\(projectPendingDeletion?.name ?? "此项目")”及其项目会话，"
+                    + "但不会删除磁盘上的项目目录。"
+            )
+        }
     }
 
     private func expandSelectedProject() {
@@ -70,7 +94,7 @@ struct ContentView: View {
             let projectID = try appState.openProject(at: url)
             expandedProjectIDs.insert(projectID)
         } catch {
-            showProjectError(title: "无法打开项目", error: error)
+            showProjectError(title: "无法添加项目", error: error)
         }
     }
 
@@ -100,6 +124,8 @@ struct ContentView: View {
 private struct ConversationSidebar: View {
     @EnvironmentObject private var appState: AppState
     @Binding var expandedProjectIDs: Set<UUID>
+    let openProject: () -> Void
+    let requestDeleteProject: (ProjectSnapshot) -> Void
     let reconnectProject: (UUID) -> Void
 
     /// 当前服务商已保存 Key 但从未验证过连接时，提示用户去设置页验证
@@ -124,38 +150,67 @@ private struct ConversationSidebar: View {
         }
     }
 
+    private var currentProject: ProjectSnapshot? {
+        guard let projectID = appState.selectedConversation?.projectID else { return nil }
+        return appState.projects.first { $0.id == projectID }
+    }
+
+    private var projectChoices: [ProjectSnapshot] {
+        appState.projects.filter { $0.id != currentProject?.id }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sidebarHeader
 
-            List {
-                ForEach(appState.projects) { project in
-                    ProjectConversationSection(
-                        project: project,
-                        conversations: appState.conversations.filter { $0.projectID == project.id },
-                        isExpanded: expandedProjectIDs.contains(project.id),
-                        toggle: { toggleProject(project.id) },
-                        createConversation: {
-                            expandedProjectIDs.insert(project.id)
-                            appState.createConversation(projectID: project.id)
-                        },
-                        showFinder: {
-                            NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
-                        },
-                        reconnect: { reconnectProject(project.id) }
-                    )
-                }
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(appState.projects) { project in
+                        ProjectConversationSection(
+                            project: project,
+                            conversations: appState.conversations.filter { $0.projectID == project.id },
+                            isExpanded: expandedProjectIDs.contains(project.id),
+                            toggle: { toggleProject(project.id) },
+                            selectProject: {
+                                expandedProjectIDs.insert(project.id)
+                                appState.selectProject(id: project.id)
+                            },
+                            showFinder: {
+                                NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
+                            },
+                            deleteProject: { requestDeleteProject(project) },
+                            reconnect: { reconnectProject(project.id) }
+                        )
+                        .id(project.id)
+                    }
 
-                if !visibleTemporaryConversations.isEmpty {
-                    Section("临时对话") {
+                    // 注意：Section body 必须始终是同一类型的 ForEach。
+                    // 在这里用 if/else 在占位 Text 与行列表之间切换，
+                    // 会触发 macOS List（NSTableView 桥接）的行渲染丢失：
+                    // 数据从空变为非空时新行不出现，表现为“点了没反应”。
+                    Section {
                         ForEach(visibleTemporaryConversations) { conversation in
                             ConversationListRow(conversation: conversation)
                         }
+                    } header: {
+                        HStack {
+                            Text("临时对话")
+                        }
+                        .textCase(nil)
                     }
                 }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .onAppear {
+                    revealSelectedProject(using: proxy)
+                }
+                .onChange(of: appState.selectedConversationID) { _, _ in
+                    revealSelectedProject(using: proxy)
+                }
+                .onChange(of: appState.projects) { _, _ in
+                    revealSelectedProject(using: proxy)
+                }
             }
-            .listStyle(.sidebar)
-            .scrollContentBackground(.hidden)
 
             if let storageError = appState.storageError {
                 Label(storageError, systemImage: "externaldrive.badge.exclamationmark")
@@ -167,6 +222,23 @@ private struct ConversationSidebar: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .help(storageError)
             }
+
+            Button(action: openProject) {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder.badge.plus")
+                        .frame(width: 20)
+
+                    Text("添加项目")
+                        .font(.callout.weight(.medium))
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            .help("把一个文件夹作为项目加入 Disco（⌘O）")
 
             Divider()
 
@@ -215,35 +287,67 @@ private struct ConversationSidebar: View {
                     .foregroundStyle(.secondary)
             }
 
-            Spacer()
+            Spacer(minLength: 12)
 
             Menu {
-                Button("新建对话") {
-                    appState.createConversationInCurrentContext()
-                }
-                .keyboardShortcut("n", modifiers: .command)
+                if let currentProject {
+                    Button {
+                        expandedProjectIDs.insert(currentProject.id)
+                        appState.createConversation(projectID: currentProject.id)
+                    } label: {
+                        Label("在“\(currentProject.name)”中新建对话", systemImage: "plus.bubble")
+                    }
 
-                Button("打开项目…") {
-                    NotificationCenter.default.post(name: .discoRequestOpenProject, object: nil)
+                    Divider()
                 }
-                .keyboardShortcut("o", modifiers: .command)
+
+                Button {
+                    appState.createConversation(projectID: nil)
+                } label: {
+                    Label("新建临时对话", systemImage: "bubble.left")
+                }
+
+                if !projectChoices.isEmpty {
+                    Divider()
+
+                    Menu(currentProject == nil ? "新建项目对话" : "新建到其他项目") {
+                        ForEach(projectChoices) { project in
+                            Button {
+                                expandedProjectIDs.insert(project.id)
+                                appState.createConversation(projectID: project.id)
+                            } label: {
+                                Label(project.name, systemImage: "folder")
+                            }
+                        }
+                    }
+                }
 
                 Divider()
 
-                Button("新建临时对话") {
-                    appState.createConversation(projectID: nil)
+                Button {
+                    openProject()
+                } label: {
+                    Label("添加项目…", systemImage: "folder.badge.plus")
                 }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
             } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 32, height: 32)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+                HStack(spacing: 5) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("新建对话")
+                        .font(.callout.weight(.medium))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.primary.opacity(0.07), in: Capsule())
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .buttonStyle(DiscoPressButtonStyle())
-            .accessibilityLabel("新建或打开")
-            .help("新建或打开（⌘N）")
+            .accessibilityLabel("新建对话")
+            .help("选择新对话的创建位置（⌘N）")
         }
         .padding(.horizontal, 14)
         .padding(.top, 13)
@@ -255,6 +359,17 @@ private struct ConversationSidebar: View {
             expandedProjectIDs.remove(id)
         } else {
             expandedProjectIDs.insert(id)
+        }
+    }
+
+    private func revealSelectedProject(using proxy: ScrollViewProxy) {
+        guard let projectID = appState.selectedConversation?.projectID else { return }
+        expandedProjectIDs.insert(projectID)
+        Task { @MainActor in
+            await Task.yield()
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(projectID, anchor: .top)
+            }
         }
     }
 }
@@ -294,8 +409,9 @@ private struct ProjectConversationSection: View {
     let conversations: [ConversationSession]
     let isExpanded: Bool
     let toggle: () -> Void
-    let createConversation: () -> Void
+    let selectProject: () -> Void
     let showFinder: () -> Void
+    let deleteProject: () -> Void
     let reconnect: () -> Void
 
     private var unavailable: Bool {
@@ -308,18 +424,9 @@ private struct ProjectConversationSection: View {
         Section {
             if isExpanded {
                 if conversations.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("尚无对话")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        Button(action: createConversation) {
-                            Label("新建对话", systemImage: "plus")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    Text("尚无对话，可使用顶部“新建对话”创建")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                     .padding(.leading, 42)
                     .padding(.vertical, 4)
                 } else {
@@ -331,10 +438,16 @@ private struct ProjectConversationSection: View {
         } header: {
             HStack(spacing: 2) {
                 Button(action: toggle) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 24, height: 40)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目 \(project.name)")
+                .help(isExpanded ? "收起项目" : "展开项目")
+
+                Button(action: selectProject) {
                     HStack(spacing: 6) {
-                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 10, weight: .bold))
-                            .frame(width: 18, height: 40)
                         Image(systemName: unavailable ? "folder.badge.questionmark" : "folder")
                             .foregroundStyle(unavailable ? .orange : DiscoTheme.accent)
                         Text(project.name)
@@ -345,26 +458,21 @@ private struct ProjectConversationSection: View {
                 }
                 .buttonStyle(.plain)
                 .frame(minHeight: 40)
-                .accessibilityLabel("\(isExpanded ? "收起" : "展开")项目 \(project.name)")
-                .help(isExpanded ? "收起项目" : "展开项目")
-
-                Button(action: createConversation) {
-                    Image(systemName: "plus")
-                        .frame(width: 40, height: 40)
-                }
-                .buttonStyle(DiscoPressButtonStyle())
-                .accessibilityLabel("新建项目对话")
-                .help("新建项目对话")
+                .accessibilityLabel("打开项目 \(project.name)")
+                .help("打开项目")
 
                 Menu {
                     Button("在 Finder 中显示", action: showFinder)
                         .disabled(unavailable)
                     Button("重新关联目录…", action: reconnect)
+                    Divider()
+                    Button("删除项目…", role: .destructive, action: deleteProject)
                 } label: {
                     Image(systemName: "ellipsis")
                         .frame(width: 40, height: 40)
                 }
                 .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
                 .buttonStyle(DiscoPressButtonStyle())
                 .accessibilityLabel("项目操作")
                 .help("项目操作")

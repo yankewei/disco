@@ -8,7 +8,7 @@ enum ProjectDirectoryPicker {
 
         var prompt: String {
             switch self {
-            case .openProject: return "打开项目"
+            case .openProject: return "添加项目"
             case .reconnect: return "重新关联"
             }
         }

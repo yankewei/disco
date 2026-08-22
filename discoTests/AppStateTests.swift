@@ -363,6 +363,53 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(restored.config(for: .deepseek)?.models, models)
     }
 
+    func testSwitchingToModelWithDifferentReasoningCapabilitiesClearsInvalidEffort() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let catalog = [
+            ModelCatalogEntry(
+                id: "deepseek-reasoner",
+                supportedReasoningEfforts: ["none", "high"],
+                defaultReasoningEffort: "high"
+            ),
+            ModelCatalogEntry(
+                id: "deepseek-chat",
+                supportedReasoningEfforts: ["none"],
+                defaultReasoningEffort: "none"
+            ),
+        ]
+        defaults.set(
+            try JSONEncoder().encode(catalog),
+            forKey: ProviderVendor.deepseek.modelCatalogDefaultsKey
+        )
+        defaults.set(
+            ProviderVendor.deepseek.defaultBaseURL,
+            forKey: ProviderVendor.deepseek.baseURLDefaultsKey
+        )
+        let appState = try makeAppState(defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "deepseek-key",
+            model: "deepseek-reasoner",
+            models: catalog.map(\.id)
+        )
+        appState.setReasoningEffort("high", for: .deepseek)
+
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "",
+            model: "deepseek-chat",
+            models: catalog.map(\.id)
+        )
+
+        XCTAssertNil(appState.config(for: .deepseek)?.reasoningEffort)
+        XCTAssertNil(defaults.string(forKey: ProviderVendor.deepseek.reasoningEffortDefaultsKey))
+    }
+
     func testLegacyGlobalThinkingEnabledMigratesToProviders() throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

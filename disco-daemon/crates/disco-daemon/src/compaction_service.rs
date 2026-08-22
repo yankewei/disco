@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use disco_core::ContextCompactor;
-use disco_protocol::types::CompactionStatus;
+use disco_protocol::types::{CompactionStatus, Vendor};
 use disco_providers::openai_responses::ChatMessage;
 use uuid::Uuid;
 
@@ -75,7 +75,8 @@ pub async fn compact_session(
             )
         })?;
 
-    let compactor = ContextCompactor::new(128000);
+    let context_window = context_window_for(app, &session).await;
+    let compactor = ContextCompactor::new(context_window);
     let result = compactor.compact(&chat_messages, &provider).await;
 
     Ok(CompactionOutcome {
@@ -85,6 +86,28 @@ pub async fn compact_session(
         after_tokens: result.after_tokens,
         error_message: result.error_message.clone(),
     })
+}
+
+/// 解析会话模型的上下文窗口。
+///
+/// API Key 服务商优先使用内置模型目录的 context_window；OpenCode 的目录来自
+/// ACP agent 的 session configOptions 缓存。模型未收录时回退到默认窗口，
+/// 阈值偏保守，不影响正确性。
+async fn context_window_for(app: &Arc<AppState>, session: &disco_protocol::types::Session) -> i64 {
+    let entries = if session.vendor == Vendor::OpenCode {
+        app.opencode_model_catalog
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_default()
+    } else {
+        crate::provider_service::get_default_models(session.vendor)
+    };
+    entries
+        .into_iter()
+        .find(|entry| entry.id == session.model)
+        .and_then(|entry| entry.context_window)
+        .unwrap_or(disco_core::DEFAULT_CONTEXT_WINDOW)
 }
 
 #[cfg(test)]

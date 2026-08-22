@@ -17,6 +17,42 @@ use futures_core::Stream;
 
 use disco_tools::ToolDefinition;
 
+/// 在 PATH 与常见安装位置中查找 opencode CLI 可执行文件。
+///
+/// 从 app bundle 启动的 daemon 继承的 PATH 很精简（不含 `~/.opencode/bin`），
+/// 因此不能依赖裸命令名解析。
+pub fn find_opencode() -> String {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = format!("{dir}/opencode");
+            if std::path::Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_candidates = [
+            format!("{home}/.opencode/bin/opencode"),
+            format!("{home}/.local/bin/opencode"),
+        ];
+        for candidate in &home_candidates {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.clone();
+            }
+        }
+    }
+
+    let system_candidates = ["/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"];
+    for candidate in system_candidates {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+
+    "opencode".to_string()
+}
+
 /// 统一模型服务商接口。
 ///
 /// OpenAI 兼容 API（`OpenAIResponsesProvider`）与 Codex app-server
@@ -36,4 +72,32 @@ pub trait ModelProvider: Send + Sync {
         messages: &'a [ChatMessage],
         tools: Option<&'a [ToolDefinition]>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + Send + 'a>>>;
+}
+
+/// 占位 ModelProvider：用于没有模型 API 能力的后端（如外部 ACP agent）。
+///
+/// 任何调用都会返回明确错误，避免压缩等依赖模型调用的功能静默失败。
+pub struct UnavailableModelProvider {
+    reason: &'static str,
+}
+
+impl UnavailableModelProvider {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for UnavailableModelProvider {
+    fn vendor_name(&self) -> &'static str {
+        "unavailable"
+    }
+
+    async fn stream<'a>(
+        &'a self,
+        _messages: &'a [ChatMessage],
+        _tools: Option<&'a [ToolDefinition]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + Send + 'a>>> {
+        anyhow::bail!("{}", self.reason)
+    }
 }

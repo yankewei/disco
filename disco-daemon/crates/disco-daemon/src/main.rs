@@ -8,12 +8,13 @@ mod session_service;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agent_client_protocol::AcpAgentConfig;
 use daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
-use disco_backends::CodexAdapter;
+use disco_backends::{AcpAdapter, CodexAdapter};
 use disco_core::RunCoordinator;
 use disco_persist::{Database, default_db_path};
 use disco_protocol::types::{ProviderId, Vendor};
-use disco_providers::CodexProvider;
+use disco_providers::{CodexProvider, UnavailableModelProvider};
 use disco_tools::CompositeExecutor;
 use disco_tools::file_edit::FileEditExecutor;
 use disco_tools::search::SearchExecutor;
@@ -32,6 +33,13 @@ async fn main() {
         .init();
 
     info!("disco-daemon starting...");
+
+    // SQLite 的 WAL/SHM 伴随文件在首次写入时按进程 umask 创建。
+    // 数据库内含明文 Provider 凭据，收紧 umask 确保所有伴随文件默认 0600。
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
 
     // Initialize database
     let db_path = default_db_path();
@@ -93,15 +101,41 @@ async fn main() {
             for config in configs {
                 let runtime = if config.provider_id.as_str() == ProviderId::CODEX_APP_SERVER {
                     let executable = CodexProvider::find_codex();
+                    let reasoning_effort = config.reasoning_effort.clone();
                     ProviderRuntime {
                         compaction_provider: Arc::new(CodexProvider::new(
                             executable.clone(),
                             config.model,
-                            None,
+                            reasoning_effort.clone(),
                             None,
                             None,
                         )),
-                        backend: Arc::new(CodexAdapter::new(executable, None)),
+                        backend: Arc::new(CodexAdapter::new(executable, reasoning_effort)),
+                    }
+                } else if config.provider_id.as_str() == ProviderId::OPENCODE_APP_SERVER {
+                    let options = provider_service::opencode_session_config_options(
+                        &config.model,
+                        config.reasoning_effort.as_deref(),
+                    );
+                    match AcpAdapter::connect_with_session_config(
+                        AcpAgentConfig::new(disco_providers::find_opencode()).arg("acp"),
+                        options,
+                    )
+                    .await
+                    {
+                        Ok(adapter) => ProviderRuntime {
+                            backend: Arc::new(adapter),
+                            compaction_provider: Arc::new(UnavailableModelProvider::new(
+                                "OpenCode provider 不支持上下文压缩",
+                            )),
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                "Failed to connect OpenCode ACP agent {}: {error}",
+                                config.provider_id
+                            );
+                            continue;
+                        }
                     }
                 } else {
                     match api_key_provider_runtime(
@@ -140,6 +174,7 @@ async fn main() {
     let app = Arc::new(AppState {
         db,
         runtime_by_provider_id: Mutex::new(runtime_by_provider_id),
+        opencode_model_catalog: Mutex::new(None),
         run_coordinator: RunCoordinator::new(),
         executor,
         shutdown: shutdown.clone(),

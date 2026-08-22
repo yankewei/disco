@@ -29,22 +29,15 @@ struct SettingsView: View {
     @State private var selectedVendor: ProviderVendor?
     /// 各服务商未保存的输入草稿，切换服务商时不丢失
     @State private var drafts: [ProviderVendor: VendorDraft] = [:]
-    @State private var isAddingVendor = false
 
-    /// 服务商页列出的服务商：已配置过，或本次会话中手动添加待配置的
+    /// 服务商页直接列出全部已可用的服务商，选中即可配置
     private var listedVendors: [ProviderVendor] {
-        ProviderVendor.allCases.filter { vendor in
-            vendor.isAvailable && (appState.config(for: vendor) != nil || appState.pendingVendors.contains(vendor))
-        }
+        ProviderVendor.allCases.filter(\.isAvailable)
     }
 
-    private var addableVendors: [ProviderVendor] {
-        ProviderVendor.allCases.filter { $0.isAvailable && !listedVendors.contains($0) }
-    }
-
-    /// 尚未开放的服务商（“添加服务商”面板中置灰展示“即将推出”，保留规划可见性）
+    /// 尚未开放的服务商（列表底部置灰展示“即将推出”，保留规划可见性）
     private var upcomingVendors: [ProviderVendor] {
-        ProviderVendor.allCases.filter { !$0.isAvailable && !listedVendors.contains($0) }
+        ProviderVendor.allCases.filter { !$0.isAvailable }
     }
 
     var body: some View {
@@ -63,16 +56,6 @@ struct SettingsView: View {
                 selectedVendor = listedVendors.contains(appState.activeVendor)
                     ? appState.activeVendor
                     : listedVendors.first
-            }
-        }
-        .onChange(of: appState.providerConfigs) { _, _ in
-            // 验证保存完成后，从“待配置”中移除
-            // 延迟到下一个 run loop 发布，避免在视图更新事务内修改
-            // 同一个被观察对象的状态（SwiftUI 运行时警告）。
-            Task { @MainActor in
-                appState.pendingVendors = appState.pendingVendors.filter {
-                    !$0.isConfigured(appState.config(for: $0))
-                }
             }
         }
     }
@@ -134,14 +117,8 @@ struct SettingsView: View {
     // MARK: 服务商页：服务商列表
 
     private var vendorListColumn: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if listedVendors.isEmpty {
-                Text("还没有连接任何服务商")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 14)
-            } else {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
                 VStack(spacing: 2) {
                     ForEach(listedVendors) { vendor in
                         VendorListRow(
@@ -156,30 +133,20 @@ struct SettingsView: View {
                 }
                 .padding(.horizontal, 8)
                 .padding(.top, 12)
-            }
 
-            Spacer()
+                if !upcomingVendors.isEmpty {
+                    Divider()
+                        .opacity(0.65)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
 
-            Button {
-                isAddingVendor = true
-            } label: {
-                Label("添加服务商", systemImage: "plus")
-                    .font(.callout.weight(.medium))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(addableVendors.isEmpty ? Color.secondary.opacity(0.5) : DiscoTheme.accent)
-            .disabled(addableVendors.isEmpty)
-            .padding(.horizontal, 8)
-            .padding(.bottom, 12)
-            .popover(isPresented: $isAddingVendor, arrowEdge: .trailing) {
-                AddVendorPanel(vendors: addableVendors, upcoming: upcomingVendors) { vendor in
-                    appState.pendingVendors = appState.pendingVendors.union([vendor])
-                    selectedVendor = vendor
-                    isAddingVendor = false
+                    VStack(spacing: 2) {
+                        ForEach(upcomingVendors) { vendor in
+                            UpcomingVendorRow(vendor: vendor)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 12)
                 }
             }
         }
@@ -202,30 +169,17 @@ struct SettingsView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             DiscoMark(size: 46)
 
             VStack(spacing: 6) {
-                Text("连接一个模型服务商")
+                Text("选择一个服务商")
                     .font(.system(size: 17, weight: .semibold, design: .rounded))
-                Text("选择一个服务商，粘贴 API Key，验证通过后即可开始对话。")
+                Text("在左侧列表中选择一个服务商进行配置。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
-
-            Button {
-                isAddingVendor = true
-            } label: {
-                Text("添加服务商")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 9)
-                    .background(DiscoTheme.accent, in: Capsule())
-            }
-            .buttonStyle(DiscoPressButtonStyle())
-            .disabled(addableVendors.isEmpty)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -412,64 +366,30 @@ private struct VendorListRow: View {
     }
 }
 
-// MARK: - 添加服务商面板
+// MARK: - 左栏“即将推出”服务商行（不可点击）
 
-private struct AddVendorPanel: View {
-    let vendors: [ProviderVendor]
-    /// 尚未开放的服务商（置灰展示“即将推出”）
-    let upcoming: [ProviderVendor]
-    let pick: (ProviderVendor) -> Void
+private struct UpcomingVendorRow: View {
+    let vendor: ProviderVendor
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("选择服务商")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
-                .padding(.bottom, 4)
-
-            ForEach(vendors) { vendor in
-                Button {
-                    pick(vendor)
-                } label: {
-                    vendorRow(vendor, caption: vendor.subtitle, emphasized: true)
-                }
-                .buttonStyle(.plain)
-            }
-
-            if !upcoming.isEmpty {
-                Divider()
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-
-                ForEach(upcoming) { vendor in
-                    vendorRow(vendor, caption: "即将推出", emphasized: false)
-                        .opacity(0.55)
-                }
-            }
-        }
-        .padding(.bottom, 10)
-        .frame(width: 300)
-    }
-
-    private func vendorRow(_ vendor: ProviderVendor, caption: String, emphasized: Bool) -> some View {
         HStack(spacing: 10) {
-            VendorBrandIcon(vendor: vendor, tileSize: 24, isActive: emphasized)
+            VendorBrandIcon(vendor: vendor, tileSize: 26, isActive: false)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(vendor.title)
-                    .font(.callout.weight(.medium))
+                    .font(.callout)
                     .foregroundStyle(.primary)
-                Text(caption)
+                    .lineLimit(1)
+                Text("即将推出")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
-            Spacer()
+
+            Spacer(minLength: 4)
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .contentShape(Rectangle())
+        .opacity(0.55)
     }
 }
 
@@ -552,6 +472,9 @@ private struct VendorDetailPanel: View {
     private var verifyState: VerifyState {
         if isVerifying { return .verifying }
         if let verifyError { return .failed(verifyError) }
+        if let syncError = appState.providerSyncError, syncError.vendor == vendor {
+            return .failed(syncError.message)
+        }
         if showSavedFeedback { return .saved }
         if config == nil {
             // 全新服务商：验证通过且模型已就绪，即可选择模型
@@ -616,7 +539,14 @@ private struct VendorDetailPanel: View {
             }
 
             do {
-                let loadedModels = try await appState.availableModels(vendor: vendor)
+                let apiKey = trimmedAPIKey.isEmpty
+                    ? appState.revealAPIKey(for: vendor)
+                    : trimmedAPIKey
+                let loadedModels = try await appState.availableModels(
+                    vendor: vendor,
+                    baseURL: trimmedBaseURL.isEmpty ? nil : trimmedBaseURL,
+                    apiKey: apiKey
+                )
                 guard !Task.isCancelled else { return }
                 draft.models = loadedModels
                 draft.modelSearch = ""
@@ -722,10 +652,12 @@ private struct VendorDetailPanel: View {
                 .background(DiscoTheme.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: DiscoRadius.small))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("使用 Codex (OpenAI) 登录")
+                Text(vendor == .opencode ? "使用本机 OpenCode CLI" : "使用 Codex (OpenAI) 登录")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
+                Text(vendor == .opencode
+                    ? "无需 API Key：认证与模型由 opencode CLI 管理（opencode auth login）。"
+                    : "无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -12,3 +12,5 @@ disco-daemon/target/
 
 # 旧架构 Xcode 构建产物
 macos/build/
+.alma-snapshots
+scripts/acp_dump.txt

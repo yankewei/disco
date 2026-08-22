@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, DeleteSessionRequest, ErrorCode, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PermissionOption, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
+    CancelNotification, CloseSessionRequest, ContentBlock, DeleteSessionRequest, ErrorCode,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{
@@ -39,6 +41,16 @@ pub struct AcpAdapter {
     loaded_sessions: Mutex<HashSet<SessionId>>,
     shutdown: CancellationToken,
     connection_alive: Arc<AtomicBool>,
+    session_config_options: Vec<SessionConfigSelection>,
+}
+
+/// 每次创建/恢复 session 后下发给 ACP agent 的配置项（`session/set_config_option`）。
+///
+/// 例如 opencode 的模型（config_id `model`）与思考级别（config_id `effort`）。
+#[derive(Debug, Clone)]
+pub struct SessionConfigSelection {
+    pub config_id: String,
+    pub value: String,
 }
 
 type ActiveRunMap = Arc<Mutex<HashMap<SessionId, AcpRunContext>>>;
@@ -55,10 +67,21 @@ struct AcpRunContext {
 impl AcpAdapter {
     /// 启动外部 ACP agent 并完成协议初始化。
     pub async fn connect(config: AcpAgentConfig) -> Result<Self> {
-        Self::connect_transport(AcpAgent::new(config)).await
+        Self::connect_with_session_config(config, Vec::new()).await
     }
 
-    async fn connect_transport(transport: impl ConnectTo<Client>) -> Result<Self> {
+    /// 启动外部 ACP agent 并完成协议初始化；session 创建/恢复后按序下发配置项。
+    pub async fn connect_with_session_config(
+        config: AcpAgentConfig,
+        session_config_options: Vec<SessionConfigSelection>,
+    ) -> Result<Self> {
+        Self::connect_transport(AcpAgent::new(config), session_config_options).await
+    }
+
+    async fn connect_transport(
+        transport: impl ConnectTo<Client>,
+        session_config_options: Vec<SessionConfigSelection>,
+    ) -> Result<Self> {
         let active_run_by_session = ActiveRunMap::default();
         let shutdown = CancellationToken::new();
         let connection_alive = Arc::new(AtomicBool::new(false));
@@ -144,11 +167,16 @@ impl AcpAdapter {
             loaded_sessions: Mutex::new(HashSet::new()),
             shutdown,
             connection_alive,
+            session_config_options,
         })
     }
 
-    async fn ensure_session_for_run(&self, request: &BackendRunRequest) -> Result<SessionId> {
-        let workspace = match request.workspace_path.as_deref() {
+    async fn ensure_session(
+        &self,
+        session: &BackendSession,
+        workspace_path: Option<&str>,
+    ) -> Result<SessionId> {
+        let workspace = match workspace_path {
             Some(path) => PathBuf::from(path),
             None => std::env::current_dir().context("无法确定 ACP session 的工作目录")?,
         };
@@ -159,7 +187,7 @@ impl AcpAdapter {
             );
         }
 
-        if let Some(handle) = request.session.backend_handle.as_deref() {
+        if let Some(handle) = session.backend_handle.as_deref() {
             let session_id = SessionId::new(handle);
             if self.loaded_sessions.lock().await.contains(&session_id) {
                 return Ok(session_id);
@@ -172,6 +200,8 @@ impl AcpAdapter {
                 .block_task()
                 .await
                 .with_context(|| format!("无法恢复 ACP session {handle}"))?;
+            // session/load 返回的是历史 session 的配置。不要把当前 Provider profile
+            // 的配置重新下发，否则切换模型后加载旧会话会改变它的运行语义。
             self.loaded_sessions.lock().await.insert(session_id.clone());
             return Ok(session_id);
         }
@@ -182,11 +212,171 @@ impl AcpAdapter {
             .block_task()
             .await
             .context("无法创建 ACP session")?;
+        self.apply_session_config_options(&response.session_id, response.config_options)
+            .await?;
         self.loaded_sessions
             .lock()
             .await
             .insert(response.session_id.clone());
         Ok(response.session_id)
+    }
+
+    /// 按序下发 session 配置项；依据 agent 返回的最新 configOptions 校验取值，
+    /// 不可用或下发失败时返回错误，避免用户选择的模型/推理档位被静默忽略。
+    async fn apply_session_config_options(
+        &self,
+        session_id: &SessionId,
+        initial_options: Option<Vec<SessionConfigOption>>,
+    ) -> Result<()> {
+        let mut latest_options = initial_options;
+        for selection in &self.session_config_options {
+            if let Some(options) = &latest_options {
+                match find_select_option(options, &selection.config_id, &selection.value) {
+                    SelectionCheck::Supported => {}
+                    SelectionCheck::UnknownOption => {
+                        bail!(
+                            "ACP agent 未提供请求的 session 配置项 {}={}",
+                            selection.config_id,
+                            selection.value
+                        );
+                    }
+                    SelectionCheck::UnsupportedValue => {
+                        bail!(
+                            "当前模型不支持请求的 session 配置取值 {}={}",
+                            selection.config_id,
+                            selection.value
+                        );
+                    }
+                }
+            }
+            let request = SetSessionConfigOptionRequest::new(
+                session_id.clone(),
+                SessionConfigId::new(selection.config_id.clone()),
+                SessionConfigOptionValue::value_id(selection.value.clone()),
+            );
+            match self.connection.send_request(request).block_task().await {
+                Ok(response) => {
+                    tracing::debug!(
+                        config_id = %selection.config_id,
+                        value = %selection.value,
+                        "已下发 ACP session 配置项"
+                    );
+                    latest_options = Some(response.config_options);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "无法下发 ACP session 配置项 {}={}",
+                            selection.config_id, selection.value
+                        )
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 创建临时 session 读取 agent 的 session configOptions，读完后关闭该 session。
+    ///
+    /// 用于在真实会话之前获取 agent 的模型/配置目录（如下拉列表数据源）。
+    pub async fn fetch_session_config_options(&self) -> Result<Vec<SessionConfigOption>> {
+        let workspace = std::env::current_dir().context("无法确定临时 ACP session 的工作目录")?;
+        let response = self
+            .connection
+            .send_request(NewSessionRequest::new(workspace))
+            .block_task()
+            .await
+            .context("无法创建临时 ACP session")?;
+        let options = response.config_options.unwrap_or_default();
+        if let Err(error) = self
+            .connection
+            .send_request(CloseSessionRequest::new(response.session_id.clone()))
+            .block_task()
+            .await
+        {
+            tracing::warn!(session_id = %response.session_id, %error, "无法关闭临时 ACP session");
+        }
+        Ok(options)
+    }
+
+    /// 将临时 session 的模型切换到指定值，并读取该模型生效后的配置能力。
+    ///
+    /// OpenCode 会在模型变化后刷新 effort 等 model config 选项，因此不能只读取
+    /// session/new 的初始快照。
+    pub async fn fetch_session_config_options_for_model(
+        &self,
+        model: &str,
+    ) -> Result<Vec<SessionConfigOption>> {
+        let workspace = std::env::current_dir().context("无法确定临时 ACP session 的工作目录")?;
+        let response = self
+            .connection
+            .send_request(NewSessionRequest::new(workspace))
+            .block_task()
+            .await
+            .context("无法创建模型能力探测 ACP session")?;
+        let session_id = response.session_id.clone();
+        let result = async {
+            let response = self
+                .connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    SessionConfigId::new("model"),
+                    SessionConfigOptionValue::value_id(model.to_string()),
+                ))
+                .block_task()
+                .await
+                .with_context(|| format!("无法切换 ACP 模型 {model}"))?;
+            Ok(response.config_options)
+        }
+        .await;
+        if let Err(error) = self
+            .connection
+            .send_request(CloseSessionRequest::new(session_id.clone()))
+            .block_task()
+            .await
+        {
+            tracing::warn!(session_id = %session_id, %error, "无法关闭模型能力探测 ACP session");
+        }
+        result
+    }
+}
+
+enum SelectionCheck {
+    Supported,
+    UnknownOption,
+    UnsupportedValue,
+}
+
+/// 在 agent 返回的 configOptions 中校验某个配置取值是否可用。
+fn find_select_option(
+    options: &[SessionConfigOption],
+    config_id: &str,
+    value: &str,
+) -> SelectionCheck {
+    let Some(option) = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == config_id)
+    else {
+        return SelectionCheck::UnknownOption;
+    };
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return SelectionCheck::Supported;
+    };
+    let values: Vec<&str> = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(entries) => {
+            entries.iter().map(|entry| entry.value.0.as_ref()).collect()
+        }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|entry| entry.value.0.as_ref())
+            .collect(),
+        _ => return SelectionCheck::Supported,
+    };
+    if values.iter().any(|entry| *entry == value) {
+        SelectionCheck::Supported
+    } else {
+        SelectionCheck::UnsupportedValue
     }
 }
 
@@ -202,6 +392,19 @@ impl AgentBackend for AcpAdapter {
         self.capabilities
     }
 
+    async fn load_session(
+        &self,
+        session: &BackendSession,
+        workspace_path: Option<String>,
+    ) -> Result<()> {
+        if session.backend_handle.is_none() {
+            return Ok(());
+        }
+        self.ensure_session(session, workspace_path.as_deref())
+            .await?;
+        Ok(())
+    }
+
     async fn start_run(&self, request: BackendRunRequest) -> Result<BackendRun> {
         if !self.connection_alive.load(Ordering::Acquire) {
             bail!("ACP agent 连接不可用");
@@ -212,7 +415,9 @@ impl AgentBackend for AcpAdapter {
             .map(|message| message.text.clone())
             .filter(|text| !text.is_empty())
             .ok_or_else(|| anyhow!("ACP run 缺少用户 prompt"))?;
-        let session_id = self.ensure_session_for_run(&request).await?;
+        let session_id = self
+            .ensure_session(&request.session, request.workspace_path.as_deref())
+            .await?;
         let backend_handle = session_id.to_string();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         if request.cancellation.is_cancelled() {
@@ -395,6 +600,10 @@ fn outputs_for_session_update(
         SessionUpdate::ToolCallUpdate(tool_call) => {
             outputs_for_tool_update(tool_call, tool_title_by_id)
         }
+        SessionUpdate::UsageUpdate(usage) => vec![AgentOutput::ContextUsage {
+            used: i64::try_from(usage.used).unwrap_or(i64::MAX),
+            size: i64::try_from(usage.size).unwrap_or(i64::MAX),
+        }],
         _ => Vec::new(),
     }
 }
@@ -591,7 +800,7 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AgentCapabilities, ContentChunk, DeleteSessionResponse, InitializeResponse,
         LoadSessionResponse, NewSessionResponse, PromptResponse, SessionCapabilities,
-        SessionDeleteCapabilities, TextContent, ToolCallUpdateFields,
+        SessionDeleteCapabilities, TextContent, ToolCallUpdateFields, UsageUpdate,
     };
     use disco_providers::ChatMessage;
     use tokio::sync::Notify;
@@ -642,6 +851,22 @@ mod tests {
             cancellation,
             approval_manager,
         }
+    }
+
+    #[test]
+    fn acp_usage_update_preserves_context_window() {
+        let outputs = outputs_for_session_update(
+            SessionUpdate::UsageUpdate(UsageUpdate::new(53_000, 200_000)),
+            &StdMutex::new(HashMap::new()),
+        );
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [AgentOutput::ContextUsage {
+                used: 53_000,
+                size: 200_000
+            }]
+        ));
     }
 
     fn fake_agent(state: Arc<FakeAgentState>) -> impl ConnectTo<Client> {
@@ -803,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn acp_adapter_maps_runs_permissions_sessions_and_deletion() {
         let state = Arc::new(FakeAgentState::new());
-        let backend = AcpAdapter::connect_transport(fake_agent(state.clone()))
+        let backend = AcpAdapter::connect_transport(fake_agent(state.clone()), Vec::new())
             .await
             .unwrap();
         assert_eq!(
@@ -997,7 +1222,9 @@ mod tests {
                 },
                 agent_client_protocol::on_receive_notification!(),
             );
-        let backend = AcpAdapter::connect_transport(agent).await.unwrap();
+        let backend = AcpAdapter::connect_transport(agent, Vec::new())
+            .await
+            .unwrap();
         let cancellation = CancellationToken::new();
         let run = backend
             .start_run(backend_request(
@@ -1075,7 +1302,9 @@ mod tests {
                 },
                 agent_client_protocol::on_receive_notification!(),
             );
-        let backend = AcpAdapter::connect_transport(agent).await.unwrap();
+        let backend = AcpAdapter::connect_transport(agent, Vec::new())
+            .await
+            .unwrap();
         let cancellation = CancellationToken::new();
         let mut run = backend
             .start_run(backend_request(

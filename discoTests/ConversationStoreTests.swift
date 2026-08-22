@@ -78,6 +78,59 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.errorMessage)
     }
 
+    func testToolExecutionsRemainVisibleAfterDaemonRunCompletes() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "执行工具"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        store.handleDaemonNotification(daemonEvent(
+            "tool.started",
+            runID: runID,
+            sessionID: sessionID,
+            fields: [
+                "toolCallId": .string("tool-1"),
+                "toolName": .string("shell"),
+                "kind": .string("execute"),
+                "arguments": .string(#"{"command":"pwd"}"#),
+            ]
+        ))
+        store.handleDaemonNotification(daemonEvent(
+            "tool.completed",
+            runID: runID,
+            sessionID: sessionID,
+            fields: [
+                "toolCallId": .string("tool-1"),
+                "toolName": .string("shell"),
+                "output": .string("/tmp/disco"),
+            ]
+        ))
+        store.handleDaemonNotification(daemonEvent(
+            "run.completed",
+            runID: runID,
+            sessionID: sessionID
+        ))
+
+        let toolCall = try XCTUnwrap(
+            store.messages.last?.parts.compactMap { part -> ChatMessage.ToolCallSnapshot? in
+                guard case let .toolCall(call) = part else { return nil }
+                return call
+            }.first
+        )
+        XCTAssertEqual(toolCall.name, "shell")
+        XCTAssertEqual(toolCall.kind, "execute")
+        XCTAssertEqual(toolCall.output, "/tmp/disco")
+        XCTAssertTrue(toolCall.isCompleted)
+    }
+
     func testFailedDaemonRunStartRemovesPlaceholderAndCanRetry() async throws {
         let sessionID = UUID()
         let client = RecordingDiscoDaemonClient(runID: UUID())
@@ -305,8 +358,8 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.threadID)
     }
 
-    /// daemon 托管会话：消息由 daemon 保存，本地持久化回调不再收到消息副本。
-    func testDaemonOwnedConversationSkipsLocalMessageCopies() {
+    /// daemon 托管会话仍保留本地 rich transcript，作为离线缓存和恢复兜底。
+    func testDaemonOwnedConversationRetainsLocalMessageCopies() {
         let probe = PersistenceProbe()
         let store = ConversationStore(
             messages: [ChatMessage(role: .user, text: "旧消息")],
@@ -319,7 +372,7 @@ final class ConversationStoreTests: XCTestCase {
         store.restoreMessages([ChatMessage(role: .user, text: "daemon 历史")])
 
         XCTAssertEqual(store.messages.map(\.text), ["daemon 历史"])
-        XCTAssertTrue(probe.messages.isEmpty, "daemon 托管会话不应落盘消息副本")
+        XCTAssertEqual(probe.messages.map(\.text), ["daemon 历史"])
     }
 
     /// 撤销 daemon 注册后，会话退回未托管状态并恢复本地落盘。
@@ -334,7 +387,7 @@ final class ConversationStoreTests: XCTestCase {
 
         store.enableDaemonRuns(sessionID: UUID())
         store.restoreMessages([ChatMessage(role: .user, text: "daemon 历史")])
-        XCTAssertTrue(probe.messages.isEmpty)
+        XCTAssertEqual(probe.messages.map(\.text), ["daemon 历史"])
 
         store.revertDaemonRegistration()
         XCTAssertFalse(store.hasDaemonSession)
@@ -354,6 +407,7 @@ final class RecordingDiscoDaemonClient: DiscoDaemonClient {
     private(set) var startedRuns: [StartedRun] = []
     private(set) var cancelledRunIDs: [UUID] = []
     private(set) var approvals: [(UUID, String)] = []
+    private(set) var closedSessionIDs: [UUID] = []
     private(set) var deletedSessionIDs: [UUID] = []
     private(set) var compactedSessionIDs: [UUID] = []
 
@@ -377,6 +431,10 @@ final class RecordingDiscoDaemonClient: DiscoDaemonClient {
 
     func approve(approvalID: UUID, decision: String) async throws {
         approvals.append((approvalID, decision))
+    }
+
+    func closeSession(sessionID: UUID) async throws {
+        closedSessionIDs.append(sessionID)
     }
 
     func deleteSession(sessionID: UUID) async throws {

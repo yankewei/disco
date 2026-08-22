@@ -199,4 +199,26 @@ final class ConversationPersistenceTests: XCTestCase {
         let reloaded = try XCTUnwrap(persistence.loadConversations().first)
         XCTAssertEqual(reloaded.threadID, "thr_def456")
     }
+
+    func testSessionRuntimeMetadataPersistsAcrossSaveAndLoad() throws {
+        let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
+        let conversationID = UUID()
+
+        try persistence.saveConversation(
+            ConversationSnapshot(
+                id: conversationID,
+                createdAt: .now,
+                updatedAt: .now,
+                messages: [ChatMessage(role: .user, text: "保留来源")],
+                threadID: nil,
+                projectID: UUID(),
+                providerID: "opencode_app_server",
+                runtimeKind: .acp
+            )
+        )
+
+        let restored = try XCTUnwrap(persistence.loadConversations().first)
+        XCTAssertEqual(restored.providerID, "opencode_app_server")
+        XCTAssertEqual(restored.runtimeKind, .acp)
+    }
 }

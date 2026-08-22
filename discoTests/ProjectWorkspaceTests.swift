@@ -92,6 +92,55 @@ final class ProjectWorkspaceTests: XCTestCase {
         XCTAssertEqual(state.createConversationInCurrentContext(), projectConversationID)
     }
 
+    func testSelectingProjectSelectsItsMostRecentConversation() throws {
+        let workspace = try makeWorkspace(named: "Disco")
+        let state = try makeState(
+            storeURL: temporaryDirectory.appendingPathComponent("store")
+        )
+
+        let projectID = try state.openProject(at: workspace)
+        let firstConversation = try XCTUnwrap(state.selectedConversation)
+        firstConversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "旧项目会话")
+        ])
+        let recentConversationID = state.createConversation(projectID: projectID)
+        _ = state.createConversation(projectID: nil)
+
+        XCTAssertEqual(state.selectProject(id: projectID), recentConversationID)
+        XCTAssertEqual(state.selectedConversationID, recentConversationID)
+    }
+
+    func testSelectingProjectCreatesConversationWhenItHasNone() throws {
+        let workspace = try makeWorkspace(named: "Disco")
+        let state = try makeState(
+            storeURL: temporaryDirectory.appendingPathComponent("store")
+        )
+
+        let projectID = try state.openProject(at: workspace)
+        let projectConversationID = try XCTUnwrap(state.selectedConversation?.id)
+        state.deleteConversation(id: projectConversationID)
+
+        let selectedID = try XCTUnwrap(state.selectProject(id: projectID))
+        XCTAssertEqual(state.selectedConversationID, selectedID)
+        XCTAssertEqual(state.selectedConversation?.projectID, projectID)
+    }
+
+    func testDeletingProjectRemovesItsConversationsButKeepsWorkspaceDirectory() throws {
+        let workspace = try makeWorkspace(named: "Disco")
+        let storeURL = temporaryDirectory.appendingPathComponent("store")
+        let state = try makeState(storeURL: storeURL)
+
+        let projectID = try state.openProject(at: workspace)
+        let projectConversationID = try XCTUnwrap(state.selectedConversation?.id)
+        state.deleteProject(id: projectID)
+
+        XCTAssertTrue(state.projects.isEmpty)
+        XCTAssertFalse(state.conversations.contains { $0.id == projectConversationID })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.path))
+        XCTAssertTrue(try ConversationPersistence(storeURL: storeURL).loadProjects().isEmpty)
+        XCTAssertTrue(try ConversationPersistence(storeURL: storeURL).loadConversations().isEmpty)
+    }
+
     func testNormalConversationDoesNotReuseProjectConversation() throws {
         let workspace = try makeWorkspace(named: "Disco")
         let state = try makeState(

@@ -1,67 +1,104 @@
 import SwiftUI
 
-/// 守护进程路径的审批横幅（Phase 3）。
-/// 固定在聊天窗口顶部，当 Agent 需要执行敏感操作时展示影响范围并等待用户确认。
-struct ApprovalBannerView: View {
+/// 固定在输入框上方的审批卡片。
+/// 当 Agent 需要执行敏感操作时展示影响范围并等待用户确认。
+struct ApprovalPromptView: View {
     let approval: DaemonApprovalRequestedData
     let onApprove: () -> Void
     let onApproveForSession: () -> Void
     let onDecline: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
                 Image(systemName: "shield.checkered")
-                    .font(.title3.weight(.semibold))
-                    .foregroundColor(.orange)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.orange)
+                    .frame(width: 28, height: 28)
+                    .background(.orange.opacity(0.13), in: Circle())
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(approval.title)
-                        .font(.headline)
+                    HStack(spacing: 6) {
+                        Text("需要确认")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.orange)
 
-                    // 原因说明（如有）
-                    if let reason = approval.reason {
-                        Text(reason)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                        Text(impactLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+
+                    Text(approval.title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
                 }
+                .layoutPriority(1)
 
-                Spacer(minLength: 12)
+                Spacer(minLength: 8)
 
-                // 操作按钮：始终提供三个选项
-                HStack(spacing: 8) {
-                    Button("拒绝", role: .destructive, action: onDecline)
-                        .keyboardShortcut(.cancelAction)
+                Text("等待你的决定")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
 
-                    Button("本次会话始终允许", action: onApproveForSession)
-                        .buttonStyle(.bordered)
-
-                    Button("允许一次", action: onApprove)
-                        .keyboardShortcut(.defaultAction)
-                        .buttonStyle(.borderedProminent)
-                }
+                approvalActions
             }
 
-            // 影响范围详情
-            impactView
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(
-                    cornerRadius: DiscoRadius.small,
-                    style: .continuous
-                ))
+            if let reason = approval.reason {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            ScrollView(.vertical) {
+                impactView
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 92)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(
+                cornerRadius: DiscoRadius.small,
+                style: .continuous
+            ))
+            .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous))
         }
-        .padding(16)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(DiscoTheme.elevatedSurface)
         .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
         }
-        .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+        .overlay(alignment: .leading) {
+            Capsule()
+                .fill(.orange)
+                .frame(width: 3)
+                .padding(.vertical, 8)
+        }
+        .shadow(color: .black.opacity(0.12), radius: 10, y: 3)
+    }
+
+    private var approvalActions: some View {
+        HStack(spacing: 6) {
+            Button("拒绝", role: .destructive, action: onDecline)
+                .keyboardShortcut(.cancelAction)
+                .controlSize(.small)
+
+            if approval.allowsSessionApproval {
+                Button("本次会话允许", action: onApproveForSession)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+
+            Button("允许一次", action: onApprove)
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// 根据影响类型展示不同的详情视图。
@@ -194,10 +231,19 @@ struct ApprovalBannerView: View {
         let arguments = approval.impact.arguments?.joined(separator: " ") ?? ""
         return arguments.isEmpty ? executable : "\(executable) \(arguments)"
     }
+
+    private var impactLabel: String {
+        switch approval.kind {
+        case "command": return "命令"
+        case "file_change": return "文件变更"
+        case "network": return "网络请求"
+        default: return "权限请求"
+        }
+    }
 }
 
 #Preview("命令审批") {
-    ApprovalBannerView(
+    ApprovalPromptView(
         approval: DaemonApprovalRequestedData(
             runId: "run-1",
             sessionId: "session-1",
@@ -231,7 +277,7 @@ struct ApprovalBannerView: View {
 }
 
 #Preview("文件变更审批") {
-    ApprovalBannerView(
+    ApprovalPromptView(
         approval: DaemonApprovalRequestedData(
             runId: "run-1",
             sessionId: "session-1",

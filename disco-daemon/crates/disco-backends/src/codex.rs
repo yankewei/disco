@@ -69,6 +69,19 @@ impl AgentBackend for CodexAdapter {
         }
     }
 
+    async fn load_session(
+        &self,
+        session: &BackendSession,
+        workspace_path: Option<String>,
+    ) -> Result<()> {
+        if session.backend_handle.is_none() {
+            return Ok(());
+        }
+        let provider = self.provider_for(session, workspace_path).await;
+        provider.ensure_session().await?;
+        Ok(())
+    }
+
     async fn start_run(&self, request: BackendRunRequest) -> Result<BackendRun> {
         let provider = self
             .provider_for(&request.session, request.workspace_path.clone())

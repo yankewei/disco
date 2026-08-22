@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError};
+use disco_persist::messages::StoredToolCall;
 use disco_protocol::types::TokenUsage;
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
 use tokio::sync::mpsc;
@@ -86,7 +87,7 @@ pub async fn start_run(
     };
     let chat_messages = stored_messages
         .iter()
-        .filter_map(stored_message_to_chat_message)
+        .map(stored_message_to_chat_message)
         .collect::<Vec<_>>();
 
     let backend_handle = match app.db.get_session_backend_handle(session_id) {
@@ -139,13 +140,52 @@ pub async fn start_run(
 
         let mut events = backend_run.events;
         let mut full_response = String::new();
+        let mut reasoning = String::new();
+        let mut tool_calls: Vec<StoredToolCall> = Vec::new();
         while let Some(output) = events.next().await {
-            if let AgentOutput::TextDelta(delta) = &output {
-                full_response.push_str(delta);
+            match &output {
+                AgentOutput::TextDelta(delta) => full_response.push_str(delta),
+                AgentOutput::ReasoningDelta(delta) => reasoning.push_str(delta),
+                AgentOutput::ToolStarted {
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                } => {
+                    if !tool_calls.iter().any(|call| call.id == *tool_call_id) {
+                        tool_calls.push(StoredToolCall {
+                            id: tool_call_id.clone(),
+                            name: tool_name.clone(),
+                            arguments: arguments.clone(),
+                            status: "running".to_string(),
+                            output: None,
+                        });
+                    }
+                }
+                AgentOutput::ToolCompleted {
+                    tool_call_id,
+                    tool_name,
+                    output,
+                } => {
+                    if let Some(call) = tool_calls.iter_mut().find(|call| call.id == *tool_call_id)
+                    {
+                        call.status = "completed".to_string();
+                        call.output = Some(output.clone());
+                    } else {
+                        tool_calls.push(StoredToolCall {
+                            id: tool_call_id.clone(),
+                            name: tool_name.clone(),
+                            arguments: String::new(),
+                            status: "completed".to_string(),
+                            output: Some(output.clone()),
+                        });
+                    }
+                }
+                _ => {}
             }
             let terminal = is_terminal(&output);
             if terminal {
-                save_assistant_message(&app, session_id, &full_response).await;
+                save_run_transcript(&app, session_id, &full_response, &reasoning, &tool_calls)
+                    .await;
                 let _ = event_tx.send(output).await;
                 app.run_coordinator.finish_run(run_id).await;
                 return;
@@ -156,7 +196,7 @@ pub async fn start_run(
             }
         }
 
-        save_assistant_message(&app, session_id, &full_response).await;
+        save_run_transcript(&app, session_id, &full_response, &reasoning, &tool_calls).await;
         let _ = event_tx.send(AgentOutput::Completed).await;
         app.run_coordinator.finish_run(run_id).await;
     });
@@ -167,35 +207,27 @@ pub async fn start_run(
     })
 }
 
-fn stored_message_to_chat_message(
-    message: &disco_persist::messages::StoredMessage,
-) -> Option<ChatMessage> {
-    if message.role == "tool_call" {
-        return serde_json::from_str::<ToolCallInfo>(&message.text)
-            .ok()
-            .map(|tool_call| ChatMessage {
-                role: "assistant".to_string(),
-                text: String::new(),
-                tool_calls: Some(vec![tool_call]),
-                ..Default::default()
-            });
-    }
-    if message.role == "tool_result" {
-        return serde_json::from_str::<serde_json::Value>(&message.text)
-            .ok()
-            .map(|info| ChatMessage {
-                role: "user".to_string(),
-                text: info["output"].as_str().unwrap_or("").to_string(),
-                tool_call_id: info["call_id"].as_str().map(String::from),
-                tool_name: info["name"].as_str().map(String::from),
-                ..Default::default()
-            });
-    }
-    Some(ChatMessage {
+/// 将持久化的消息转换为模型历史。
+fn stored_message_to_chat_message(message: &disco_persist::messages::StoredMessage) -> ChatMessage {
+    ChatMessage {
         role: message.role.clone(),
         text: message.text.clone(),
+        reasoning_content: (!message.reasoning.is_empty()).then(|| message.reasoning.clone()),
+        tool_calls: (!message.tool_calls.is_empty()).then(|| {
+            message
+                .tool_calls
+                .iter()
+                .map(|call| ToolCallInfo {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect()
+        }),
+        tool_call_id: message.tool_call_id.clone(),
+        tool_name: message.tool_name.clone(),
         ..Default::default()
-    })
+    }
 }
 
 fn is_terminal(output: &AgentOutput) -> bool {
@@ -205,12 +237,32 @@ fn is_terminal(output: &AgentOutput) -> bool {
     )
 }
 
-async fn save_assistant_message(app: &AppState, session_id: Uuid, text: &str) {
-    if text.is_empty() {
+async fn save_run_transcript(
+    app: &AppState,
+    session_id: Uuid,
+    text: &str,
+    reasoning: &str,
+    tool_calls: &[StoredToolCall],
+) {
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
         return;
     }
-    if let Err(error) = app.db.add_message(session_id, "assistant", text) {
+    if let Err(error) = app
+        .db
+        .add_assistant_message(session_id, text, reasoning, tool_calls)
+    {
         tracing::error!(%error, "保存 assistant 消息失败");
+    }
+    for call in tool_calls {
+        let Some(output) = call.output.as_deref() else {
+            continue;
+        };
+        if let Err(error) = app
+            .db
+            .add_tool_result_message(session_id, &call.id, &call.name, output)
+        {
+            tracing::error!(%error, call_id = %call.id, "保存 tool result 失败");
+        }
     }
 }
 
@@ -350,6 +402,7 @@ pub(crate) mod test_support {
                 api_key: String::new(),
                 model: "test-model".to_string(),
                 thinking_enabled: false,
+                reasoning_effort: None,
                 updated_at: String::new(),
             })
             .unwrap();
@@ -363,6 +416,7 @@ pub(crate) mod test_support {
         let app = Arc::new(AppState {
             db: database,
             runtime_by_provider_id: Mutex::new(runtimes),
+            opencode_model_catalog: Mutex::new(None),
             run_coordinator: disco_core::RunCoordinator::new(),
             executor,
             shutdown: CancellationToken::new(),
@@ -452,9 +506,13 @@ mod tests {
             session_id: Uuid::new_v4(),
             role: "user".to_string(),
             text: "hello".to_string(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: None,
             created_at: "1".to_string(),
         };
-        let converted = stored_message_to_chat_message(&message).unwrap();
+        let converted = stored_message_to_chat_message(&message);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.text, "hello");
     }

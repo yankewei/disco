@@ -7,6 +7,7 @@ protocol DiscoDaemonClient: AnyObject {
     func startRun(sessionID: UUID, text: String) async throws -> UUID
     func cancelRun(runID: UUID) async throws
     func approve(approvalID: UUID, decision: String) async throws
+    func closeSession(sessionID: UUID) async throws
     func deleteSession(sessionID: UUID) async throws
     func compactContext(sessionID: UUID) async throws
 }
@@ -74,6 +75,7 @@ enum ACPDaemonEventMapper {
                     sessionId: update.sessionID,
                     toolCallId: toolCallID,
                     toolName: toolName,
+                    kind: fields["kind"]?.stringValue,
                     arguments: arguments
                 )
             ) {
@@ -120,11 +122,17 @@ enum ACPDaemonEventMapper {
         runID: UUID,
         sessionID: String
     ) -> DaemonEvent? {
-        guard let usageMeta = fields["_meta"]?.objectValue?["disco/usage"]?.objectValue,
-              let current = tokenUsage(from: usageMeta["current"]),
-              let accumulated = tokenUsage(from: usageMeta["accumulated"]) else {
+        let usageMeta = fields["_meta"]?.objectValue?["disco/usage"]?.objectValue
+        let current = usageMeta
+            .flatMap { tokenUsage(from: $0["current"]) }
+            ?? tokenUsage(fromStandardUsed: fields["used"])
+        guard let current else {
             return nil
         }
+        let accumulated = usageMeta.flatMap { tokenUsage(from: $0["accumulated"]) }
+        let contextWindow = fields["size"]?.numberValue
+            .map(Int.init)
+            .flatMap { $0 > 0 ? $0 : nil }
         return makeEvent(
             "context.usage",
             DaemonContextUsageData(
@@ -132,7 +140,7 @@ enum ACPDaemonEventMapper {
                 sessionId: sessionID,
                 current: current,
                 accumulated: accumulated,
-                contextWindow: nil,
+                contextWindow: contextWindow,
                 source: "provider"
             )
         )
@@ -154,6 +162,18 @@ enum ACPDaemonEventMapper {
         )
     }
 
+    private static func tokenUsage(fromStandardUsed value: DaemonJSONValue?) -> DaemonTokenUsage? {
+        guard let used = value?.numberValue else { return nil }
+        let tokens = Int(used)
+        return DaemonTokenUsage(
+            input: tokens,
+            output: 0,
+            total: tokens,
+            cachedInput: nil,
+            reasoningOutput: nil
+        )
+    }
+
     static func approvalEvent(
         _ request: ACPPermissionRequest,
         runID: UUID
@@ -163,7 +183,7 @@ enum ACPDaemonEventMapper {
             .flatMap { $0.objectValue?["disco/approvalId"]?.stringValue }
             .flatMap(UUID.init(uuidString:))
             ?? toolCallFields["toolCallId"]?.stringValue.flatMap(UUID.init(uuidString:))
-        guard let approvalID else { return nil }
+            ?? UUID()
 
         let metadata = request.metadata?.objectValue
         let scope = metadata?["disco/approvalScope"]?.stringValue
@@ -296,6 +316,7 @@ enum ACPDaemonEventMapper {
                 sessionId: sessionID,
                 toolCallId: toolCallID,
                 toolName: fields["title"]?.stringValue ?? fallbackToolName,
+                kind: fields["kind"]?.stringValue,
                 output: jsonText(fields["rawOutput"] ?? .string(""))
             )
         )
@@ -460,6 +481,10 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
         approvalRoutes[approvalID] = nil
     }
 
+    func closeSession(sessionID: UUID) async throws {
+        try await client.closeSession(sessionID: sessionID.uuidString)
+    }
+
     func deleteSession(sessionID: UUID) async throws {
         try await client.deleteSession(sessionID: sessionID.uuidString)
     }
@@ -570,4 +595,3 @@ private extension ACPDaemonEventMapper {
         ) ?? DaemonEvent(eventName: "run.state", data: .object([:]))
     }
 }
-

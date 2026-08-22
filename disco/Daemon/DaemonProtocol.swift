@@ -218,6 +218,7 @@ struct DaemonToolStartedData: Codable, Sendable {
     let sessionId: String
     let toolCallId: String
     let toolName: String
+    let kind: String?
     let arguments: String  // JSON 字符串
 }
 
@@ -227,13 +228,14 @@ struct DaemonToolCompletedData: Codable, Sendable {
     let sessionId: String
     let toolCallId: String
     let toolName: String
+    let kind: String?
     let output: String
 }
 
 // MARK: - 审批事件
 
 /// `approval.requested` 事件数据：Agent 需要用户确认后才能执行工具。
-struct DaemonApprovalRequestedData: Codable, Sendable {
+struct DaemonApprovalRequestedData: Codable, Sendable, Identifiable {
     let runId: String
     let sessionId: String
     let approvalId: String
@@ -243,6 +245,8 @@ struct DaemonApprovalRequestedData: Codable, Sendable {
     let impact: DaemonApprovalImpact
     let fingerprint: String
     let allowsSessionApproval: Bool
+
+    var id: String { approvalId }
 }
 
 /// 审批请求的影响范围详情。

@@ -1,9 +1,10 @@
 # Disco 目标架构
 
-> 状态：目标架构基线。
+> 状态：目标架构基线 + 现状标注。
 >
-> 本文描述迁移完成后的系统形态。DAP、Swift 本地运行时和手写 Provider 等迁移期实现
-> 已全部删除；尚未完成的部分见各章节标注与 `docs/disco-acp-facade.md`。
+> 本文描述目标系统形态；各章节按迁移进度标注“现状”，与代码不一致处以此为准。
+> DAP 已全部删除；尚未完成或采用简化实现的部分见各章节标注与
+> `docs/disco-acp-facade.md`，完整迁移状态见第 15 节。
 
 ## 1. 需求与约束
 
@@ -315,6 +316,10 @@ Provider 可以复用同一个 Adapter，但仍然拥有独立的配置、账户
 `codex_app_server` 和 `codex_api` 是两个不同 Provider。API Key 方式只复用模型能力，
 不自动获得 app-server 的 thread、approval、sandbox、plugin 或 compact 语义。
 
+> 现状：上下文压缩仍走迁移期 `compaction_provider`——RigBackend 复用共享 ModelProvider，
+> Codex 后端使用本地汇总而非原生 compact，OpenCode 后端用 `UnavailableModelProvider`
+> 明确降级。压缩窗口从模型目录的 `context_window` 解析，未收录时回退 128k。
+
 ## 8. 会话与持久化
 
 ### 8.1 状态所有权
@@ -372,6 +377,10 @@ mirror_messages
 - 摘要是可删除、可重建的派生数据，不取代原始镜像。
 - 后端句柄失效时，session 进入 mirror-only 状态，禁止假装可以继续原会话。
 
+> 现状：`mirror_events` 尚未实现。当前 `messages` 表持久化 user/assistant 文本、
+> reasoning、tool call 元数据及关联的 tool result 记录；Swift 恢复时将这些记录
+> 合并为包含 thinking/tool_call 的聊天历史。后续仍可按本节设计补充独立事件表。
+
 ### 8.4 删除语义
 
 “删除会话”表示同时删除 Disco 本地注册表与镜像，并删除 Codex/OpenCode
@@ -425,6 +434,14 @@ Adapter 保留后端原始选项的语义；无法等价转换时通过 capabili
 - MVP 使用文件存储时，目录权限为 `0700`，文件权限为 `0600`，并采用原子写入。
 - 未来切换 macOS Keychain 只替换 ConfigStore 内部 Adapter，不改变 App interface。
 - 配置变更返回明确结果；不依赖 App 猜测文件监听是否成功。
+
+> 现状：迁移尚未收敛为单一 ConfigStore。Swift 客户端仍维护设置页配置，并将 API Key
+> 写入 `~/Library/Application Support/disco/config/auth.json`（文件权限 `0600`），
+> 将非敏感配置和模型目录缓存写入 UserDefaults；daemon 的 `provider_service` + SQLite
+> `provider_profiles` 负责运行时校验、backend 装配和运行时配置副本。客户端同步配置时，
+> daemon 也会保存收到的 API Key 到 SQLite 明文；数据库及其 WAL/SHM 伴随文件均为 `0600`
+> （daemon 启动时将进程 umask 设为 `0o077`）。因此当前存在双份凭据存储，尚未接入
+> macOS Keychain，后续应明确单一权威存储并消除重复副本。
 
 ## 11. 工具与安全
 
@@ -493,6 +510,11 @@ daemon
 协议 facade 不包含业务分支；Backend Adapter 不直接更新 Swift 状态；Swift 不直接访问
 daemon 数据库。
 
+> 现状：`SessionRegistry` 由 `RunCoordinator` + `sessions` 表承担；
+> `PermissionBroker` 由 `ApprovalManager` + `RunCoordinator::respond_approval` 承担；
+> `ConfigStore` 由 `provider_service` + `provider_profiles` 表承担，均为务实子集而非
+> 同名独立模块。
+
 ## 14. 被否决的方案
 
 ### Swift 直接消费 Codex app-server
@@ -530,11 +552,15 @@ capability 和 namespaced extension 表达。
 - 定义 `disco/*` 命名空间和 capability。
 - 定义 AgentBackend、RunOutcome 和运行不变量。
 
+状态：已完成。
+
 ### Phase 1：建立新协议 facade
 
 - daemon 增加 stdio ACP-compatible transport。
 - 保留 DAP，两个 facade 暂时调用同一 RunCoordinator。
 - 建立 Swift ↔ daemon 端到端测试。
+
+状态：已完成。stdio ACP facade 是唯一 transport，DAP 已删除，无双协议并存。
 
 ### Phase 2：建立三个 Backend Adapter
 
@@ -542,11 +568,16 @@ capability 和 namespaced extension 表达。
 - CodexAdapter：补全 approval、item、thread 生命周期和 Disco 扩展。
 - RigBackend：替换手写 Provider 和自研通用流式解析。
 
+状态：已完成（三个 Adapter 均落地并有契约测试）。
+
 ### Phase 3：迁移状态所有权
 
 - daemon 注册表成为会话列表唯一来源。
 - 增加 mirror_events 和派生 message view。
 - Provider 配置和凭据迁移到 ConfigStore。
+
+状态：部分完成。注册表已是会话列表唯一来源，ConfigStore 由 provider_service +
+provider_profiles 承担；`mirror_events`/`mirror_messages` 尚未实现（见 §8.3 现状）。
 
 ### Phase 4：切换 Swift 主流程
 
@@ -554,11 +585,18 @@ capability 和 namespaced extension 表达。
 - ConversationStore 只消费公共运行状态和 capability。
 - 删除 Swift 中的 Provider、GenericAgentRuntime 和 Codex transport。
 
+状态：部分完成。Swift 主流程已走 DiscoClient，不再保留 Codex transport；
+Swift 仍保留 SwiftData 会话/项目快照，作为离线回退缓存（daemon 可用时以 daemon
+为权威并刷新缓存）。
+
 ### Phase 5：退役旧路径
 
 - 删除 DAP router、DaemonProtocol.swift 和旧协议文档。
 - 删除 Rust 手写的通用 Provider/SSE 层中已被 Rig 替代的部分。
 - 更新 AGENTS.md、构建脚本和 CI。
+
+状态：部分完成。DAP 与自研 `AgentLoop` 已删除；手写 Provider（openai_responses /
+chat_completions）仅保留给上下文压缩使用，未再承担主运行路径。
 
 每个 Phase 完成条件是新路径测试通过且旧路径已有等价替代，而不是代码已经创建。
 

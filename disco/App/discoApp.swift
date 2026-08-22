@@ -34,13 +34,13 @@ struct DiscoApp: App {
         .defaultSize(width: 1120, height: 760)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
-            CommandGroup(after: .newItem) {
+            // replacing .newItem：移除 WindowGroup 自带的「新建窗口 ⌘N」，避免 ⌘N 另开新窗口
+            CommandGroup(replacing: .newItem) {
                 Button("新建对话") {
                     appState.createConversationInCurrentContext()
                 }
-                .keyboardShortcut("n", modifiers: .command)
 
-                Button("打开项目…") {
+                Button("添加项目…") {
                     NotificationCenter.default.post(name: .discoRequestOpenProject, object: nil)
                 }
                 .keyboardShortcut("o", modifiers: .command)

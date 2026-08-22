@@ -7,26 +7,28 @@ enum ACPDaemonError: Error, LocalizedError, Equatable {
     case daemonLaunchFailed(String)
     case disconnected
     case requestTimedOut(String)
-    case rpcError(code: Int, message: String)
+    case rpcError(code: Int, message: String, detail: String?)
     case invalidResponse(String)
     case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .notConnected:
-            "ACP daemon 尚未连接。"
+            return "ACP daemon 尚未连接。"
         case let .daemonLaunchFailed(message):
-            "无法启动 ACP daemon：\(message)"
+            return "无法启动 ACP daemon：\(message)"
         case .disconnected:
-            "ACP daemon 连接已断开。"
+            return "ACP daemon 连接已断开。"
         case let .requestTimedOut(method):
-            "ACP 请求超时：\(method)"
-        case let .rpcError(code, message):
-            "ACP RPC 错误（\(code)）：\(message)"
+            return "ACP 请求超时：\(method)"
+        case let .rpcError(code, message, detail):
+            return detail.map {
+                "ACP RPC 错误（\(code)）：\(message)（\($0)）"
+            } ?? "ACP RPC 错误（\(code)）：\(message)"
         case let .invalidResponse(message):
-            "ACP 响应无效：\(message)"
+            return "ACP 响应无效：\(message)"
         case let .writeFailed(message):
-            "ACP 写入失败：\(message)"
+            return "ACP 写入失败：\(message)"
         }
     }
 }
@@ -142,7 +144,19 @@ struct ACPSessionMessage: Decodable, Sendable {
     let id: String
     let role: String
     let text: String
+    let reasoning: String?
+    let toolCalls: [ACPSessionToolCall]?
+    let toolCallId: String?
+    let toolName: String?
     let createdAt: String
+}
+
+struct ACPSessionToolCall: Decodable, Sendable {
+    let id: String
+    let name: String
+    let arguments: String
+    let status: String
+    let output: String?
 }
 
 struct ACPSessionInfo: Decodable, Sendable {
@@ -150,6 +164,31 @@ struct ACPSessionInfo: Decodable, Sendable {
     let cwd: String
     let title: String?
     let updatedAt: String?
+    let meta: DaemonJSONValue?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId
+        case cwd
+        case title
+        case updatedAt
+        case meta = "_meta"
+    }
+
+    var providerID: String? {
+        meta?.objectValue?["disco/providerId"]?.stringValue
+    }
+
+    var projectID: UUID? {
+        guard let value = meta?.objectValue?["disco/projectId"]?.stringValue else { return nil }
+        return UUID(uuidString: value)
+    }
+
+    var runtimeKind: SessionRuntimeKind? {
+        if let value = meta?.objectValue?["disco/runtimeKind"]?.stringValue {
+            return SessionRuntimeKind(rawValue: value)
+        }
+        return SessionRuntimeKind.from(providerID: providerID)
+    }
 }
 
 struct ACPDeleteSessionResult: Decodable, Sendable {}
@@ -254,14 +293,25 @@ private struct ACPProviderConfigureParams: Encodable, Sendable {
     let apiKey: String
     let model: String
     let thinkingEnabled: Bool
+    let reasoningEffort: String?
 }
 
 private struct ACPProviderModelsParams: Encodable, Sendable {
     let providerId: String?
     let vendor: String
+    let baseUrl: String?
+    let apiKey: String?
 }
 
+/// `session/request_permission` 响应的 outcome 字段：服务端按 ACP schema
+/// 解析为 internally tagged enum，必须是嵌套结构
+/// （`{"outcome": {"outcome": "selected", "optionId": ...}}`），
+/// 扁平写法会让服务端解析失败并按拒绝处理。
 private struct ACPPermissionResponse: Encodable, Sendable {
+    let outcome: ACPPermissionOutcome
+}
+
+private struct ACPPermissionOutcome: Encodable, Sendable {
     let outcome: String
     let optionId: String?
 }
@@ -338,7 +388,7 @@ final class ACPDaemonClient {
     private var nextRequestID = 1
     private var pendingRequests: [Int: CheckedContinuation<ACPWireResponse, Error>] = [:]
     private var timeoutTasks: [Int: Task<Void, Never>] = [:]
-    private let requestTimeout: Duration = .seconds(30)
+    private let defaultRequestTimeout: Duration = .seconds(30)
 
     private var writeQueue: [Data] = []
     private var isWriting = false
@@ -537,7 +587,8 @@ final class ACPDaemonClient {
         baseURL: String,
         apiKey: String,
         model: String,
-        thinkingEnabled: Bool
+        thinkingEnabled: Bool,
+        reasoningEffort: String? = nil
     ) async throws -> ACPProviderConfigureResult {
         try await request(
             "_disco/provider/configure",
@@ -547,7 +598,8 @@ final class ACPDaemonClient {
                 baseUrl: baseURL,
                 apiKey: apiKey,
                 model: model,
-                thinkingEnabled: thinkingEnabled
+                thinkingEnabled: thinkingEnabled,
+                reasoningEffort: reasoningEffort
             ),
             as: ACPProviderConfigureResult.self
         )
@@ -564,11 +616,18 @@ final class ACPDaemonClient {
 
     func listProviderModels(
         providerID: String?,
-        vendor: String
+        vendor: String,
+        baseURL: String? = nil,
+        apiKey: String? = nil
     ) async throws -> [ACPModelCatalogEntry] {
         let result = try await request(
             "_disco/provider/models",
-            params: ACPProviderModelsParams(providerId: providerID, vendor: vendor),
+            params: ACPProviderModelsParams(
+                providerId: providerID,
+                vendor: vendor,
+                baseUrl: baseURL,
+                apiKey: apiKey
+            ),
             as: ACPProviderModelsResult.self
         )
         return result.models
@@ -577,12 +636,10 @@ final class ACPDaemonClient {
     // MARK: - Permission response
 
     func respondToPermission(requestID: ACPRequestID, optionID: String?) throws {
-        let response: ACPPermissionResponse
-        if let optionID {
-            response = ACPPermissionResponse(outcome: "selected", optionId: optionID)
-        } else {
-            response = ACPPermissionResponse(outcome: "cancelled", optionId: nil)
-        }
+        let response = ACPPermissionResponse(outcome: ACPPermissionOutcome(
+            outcome: optionID == nil ? "cancelled" : "selected",
+            optionId: optionID
+        ))
         let result = try encodeJSONValue(response)
         try sendResponse(
             id: requestID,
@@ -615,19 +672,25 @@ final class ACPDaemonClient {
         let response = try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<ACPWireResponse, Error>) in
             pendingRequests[requestID] = continuation
-            timeoutTasks[requestID] = Task { @MainActor [weak self] in
-                do {
-                    try await Task.sleep(for: self?.requestTimeout ?? .seconds(30))
-                } catch {
-                    return
+            if let timeout = timeoutDuration(for: method) {
+                timeoutTasks[requestID] = Task { @MainActor [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    self?.timeoutRequest(id: requestID, method: method)
                 }
-                self?.timeoutRequest(id: requestID, method: method)
             }
             enqueueWrite(payload)
         }
 
         if let error = response.error {
-            throw ACPDaemonError.rpcError(code: error.code, message: error.message)
+            throw ACPDaemonError.rpcError(
+                code: error.code,
+                message: error.message,
+                detail: error.data?.stringValue
+            )
         }
         guard let result = response.result else {
             throw ACPDaemonError.invalidResponse("\(method) 响应缺少 result。")
@@ -915,6 +978,13 @@ final class ACPDaemonClient {
         guard let continuation = pendingRequests.removeValue(forKey: id) else { return }
         timeoutTasks.removeValue(forKey: id)
         continuation.resume(throwing: ACPDaemonError.requestTimedOut(method))
+    }
+
+    /// `session/prompt` 会在整个模型运行期间保持 pending，终止由 ACP prompt response、
+    /// session/cancel 或 daemon 断开负责；普通控制请求仍使用有限超时避免永久等待。
+    private func timeoutDuration(for method: String) -> Duration? {
+        guard method != "session/prompt" else { return nil }
+        return defaultRequestTimeout
     }
 }
 

@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 disco-protocol = { path = "../disco-protocol" }
 disco-providers = { path = "../disco-providers" }
-disco-tools = { path = "../disco-tools" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

@@ -16,18 +16,28 @@ enum AppStateProjectError: Error, LocalizedError {
     }
 }
 
+/// 推送到 daemon 失败的 Provider 配置同步错误。
+struct ProviderSyncError: Equatable {
+    let vendor: ProviderVendor
+    let message: String
+}
+
 extension Notification.Name {
     /// 菜单栏“对话 > 清空当前对话”发出的请求，由 ChatView 弹出确认
     static let discoRequestClearConversation = Notification.Name("discoRequestClearConversation")
-    /// 菜单栏“打开项目”发出的请求，由 ContentView 展示目录选择器
+    /// 菜单栏“添加项目”发出的请求，由 ContentView 展示目录选择器
     static let discoRequestOpenProject = Notification.Name("discoRequestOpenProject")
 }
 
 @MainActor
 final class AppState: ObservableObject {
+    private static let deletedRemoteSessionIDsKey = "deletedRemoteSessionIDs"
+
     @Published private(set) var activeVendor: ProviderVendor
     @Published private(set) var providerConfigs: [ProviderVendor: ProviderConfig]
     @Published private(set) var authError: String?
+    /// 最近一次保存/同步到 daemon 失败的 Provider 配置错误；成功同步后清除。
+    @Published private(set) var providerSyncError: ProviderSyncError?
     @Published private(set) var storageError: String?
     @Published private(set) var isRefreshingCodexModelCatalog = false
     @Published private(set) var codexModelCatalogError: String?
@@ -43,9 +53,6 @@ final class AppState: ObservableObject {
             }
         }
     }
-
-    /// 设置页中已添加但尚未完成配置的服务商（仅内存态，不持久化；保存配置后由设置页移出）
-    @Published var pendingVendors: Set<ProviderVendor> = []
 
     /// 当前使用（active）服务商的配置，供聊天界面读取
     var baseURL: String { providerConfigs[activeVendor]?.baseURL ?? "" }
@@ -74,6 +81,15 @@ final class AppState: ObservableObject {
     /// 用户按模型填写的上下文窗口覆盖值，不随模型目录刷新删除。
     private var contextWindowOverrides: [ProviderVendor: [String: Int]] = [:]
     private var daemonEventTask: Task<Void, Never>?
+
+    /// 用户已删除但远端 backend 暂不支持 session/delete 的会话。
+    /// 这些 ID 不能再次被 session/list 导入，否则删除操作会在下次启动后失效。
+    private var deletedRemoteSessionIDs: Set<UUID> {
+        Set(
+            (defaults.stringArray(forKey: Self.deletedRemoteSessionIDsKey) ?? [])
+                .compactMap(UUID.init(uuidString:))
+        )
+    }
 
     // MARK: - 守护进程（ACP stdio）
 
@@ -224,6 +240,8 @@ final class AppState: ObservableObject {
                     createdAt: $0.createdAt,
                     updatedAt: $0.updatedAt,
                     projectID: $0.projectID,
+                    providerID: $0.providerID,
+                    runtimeKind: $0.runtimeKind,
                     messages: $0.messages,
                     threadID: $0.threadID,
                     contextState: $0.contextState ?? ConversationContextState()
@@ -322,7 +340,15 @@ final class AppState: ObservableObject {
                 ?? existingByID[modelID]
                 ?? vendor.enrichingCatalogEntry(ModelCatalogEntry(id: modelID))
         }
-        let reasoningEffort = providerConfigs[vendor]?.reasoningEffort
+        let existingReasoningEffort = providerConfigs[vendor]?.reasoningEffort
+        let selectedModelEntry = modelCatalog.first { $0.id == trimmedModel }
+        let reasoningEffort: String?
+        if let supported = selectedModelEntry?.supportedReasoningEfforts {
+            reasoningEffort = existingReasoningEffort
+                .flatMap { supported.contains($0) ? $0 : nil }
+        } else {
+            reasoningEffort = existingReasoningEffort
+        }
         let verifiedAt = Date.now
         updated[vendor] = ProviderConfig(
             baseURL: providerBaseURL,
@@ -344,17 +370,29 @@ final class AppState: ObservableObject {
 
         // 守护进程可用时，同步服务商配置到守护进程
         if useDaemon {
+            let syncVendor = vendor
             Task { [weak self] in
                 guard let self else { return }
-                let resolvedKey = (try? self.resolvedAPIKey(vendor: vendor, apiKey: apiKey)) ?? ""
-                _ = try? await self.acpDaemonClient.configureProvider(
-                    providerID: vendor.daemonProviderID,
-                    vendor: vendor.daemonVendor,
-                    baseURL: providerBaseURL,
-                    apiKey: resolvedKey,
-                    model: trimmedModel,
-                    thinkingEnabled: thinkingEnabled
-                )
+                let resolvedKey = (try? self.resolvedAPIKey(vendor: syncVendor, apiKey: apiKey)) ?? ""
+                do {
+                    _ = try await self.acpDaemonClient.configureProvider(
+                        providerID: syncVendor.daemonProviderID,
+                        vendor: syncVendor.daemonVendor,
+                        baseURL: providerBaseURL,
+                        apiKey: resolvedKey,
+                        model: trimmedModel,
+                        thinkingEnabled: thinkingEnabled,
+                        reasoningEffort: reasoningEffort
+                    )
+                    if self.providerSyncError?.vendor == syncVendor {
+                        self.providerSyncError = nil
+                    }
+                } catch {
+                    self.providerSyncError = ProviderSyncError(
+                        vendor: syncVendor,
+                        message: "保存到后台失败：\(error.localizedDescription)"
+                    )
+                }
             }
         }
 
@@ -394,20 +432,29 @@ final class AppState: ObservableObject {
             refreshRuntimes(stopActiveStreams: true)
             syncLegacyKeys()
         }
+        if providerSyncError?.vendor == vendor {
+            providerSyncError = nil
+        }
         discoveredModelCatalogs[vendor] = nil
         contextWindowOverrides[vendor] = [:]
         authError = nil
     }
 
-    /// 模型目录来自 daemon 的 `_disco/provider/models` 扩展（内置默认目录，
-    /// 不做实时连通性验证）。
-    func availableModels(vendor: ProviderVendor) async throws -> [String] {
+    /// 模型目录来自 daemon 的 `_disco/provider/models` 扩展。
+    /// API Key 类服务商带凭据时由 daemon 实时查询，否则回退内置目录。
+    func availableModels(
+        vendor: ProviderVendor,
+        baseURL: String? = nil,
+        apiKey: String? = nil
+    ) async throws -> [String] {
         guard useDaemon else {
             throw DaemonError.notConnected
         }
         let entries = try await acpDaemonClient.listProviderModels(
             providerID: vendor.daemonProviderID,
-            vendor: vendor.daemonVendor
+            vendor: vendor.daemonVendor,
+            baseURL: baseURL,
+            apiKey: apiKey
         )
         let modelCatalog = entries.map { entry in
             vendor.enrichingCatalogEntry(ModelCatalogEntry(
@@ -543,16 +590,23 @@ final class AppState: ObservableObject {
     /// 当前推理档位；nil 表示 Codex 省略 effort，使用服务端默认值。
     func selectedReasoningEffort(for vendor: ProviderVendor) -> String? {
         guard let config = providerConfigs[vendor] else { return nil }
+        let efforts = reasoningEfforts(for: vendor)
         if vendor == .chatgpt {
             guard let effort = config.reasoningEffort,
-                  reasoningEfforts(for: vendor).contains(effort) else { return nil }
+                  efforts.contains(effort) else { return nil }
             return effort
         }
         if let effort = config.reasoningEffort,
-           reasoningEfforts(for: vendor).contains(effort) {
+           efforts.contains(effort) {
             return effort
         }
-        return config.thinkingEnabled ? "high" : "none"
+        if config.thinkingEnabled, efforts.contains("high") {
+            return "high"
+        }
+        if !config.thinkingEnabled, efforts.contains("none") {
+            return "none"
+        }
+        return nil
     }
 
     func contextWindow(for vendor: ProviderVendor, model: String) -> Int? {
@@ -686,6 +740,84 @@ final class AppState: ObservableObject {
         refreshProjectRuntimes()
     }
 
+    func deleteProject(id: ProjectSnapshot.ID) {
+        guard projects.contains(where: { $0.id == id }) else { return }
+
+        let projectConversations = conversations.filter { $0.projectID == id }
+        let daemonConversations = projectConversations.filter(\.store.hasDaemonSession)
+        guard daemonConversations.isEmpty else {
+            guard useDaemon, let daemonClient = activeDaemonClient else {
+                storageError = "daemon 当前不可用，无法删除项目会话；项目已保留。"
+                return
+            }
+
+            Task { [weak self] in
+                guard let self else { return }
+                var deletedConversationIDs: [ConversationSession.ID] = []
+                do {
+                    for conversation in daemonConversations {
+                        try await daemonClient.closeSession(sessionID: conversation.id)
+                    }
+                    for conversation in daemonConversations {
+                        try await daemonClient.deleteSession(sessionID: conversation.id)
+                        deletedConversationIDs.append(conversation.id)
+                    }
+                    removeProjectLocally(id: id)
+                } catch let error as ACPDaemonError {
+                    if isUnsupportedRemoteSessionDeletion(error) {
+                        // 部分 ACP 后端（例如 OpenCode）没有实现 session/delete；
+                        // 此时仍移除 Disco 本地项目记录，避免项目永久无法删除。
+                        for conversation in daemonConversations {
+                            markRemoteSessionAsDeleted(conversation.id)
+                        }
+                        removeProjectLocally(id: id)
+                        return
+                    }
+                    for conversationID in deletedConversationIDs {
+                        removeConversationLocally(id: conversationID)
+                    }
+                    storageError = "无法完整删除项目会话，项目已保留：\(error.localizedDescription)"
+                } catch {
+                    for conversationID in deletedConversationIDs {
+                        removeConversationLocally(id: conversationID)
+                    }
+                    storageError = "无法完整删除项目会话，项目已保留：\(error.localizedDescription)"
+                }
+            }
+            return
+        }
+
+        removeProjectLocally(id: id)
+    }
+
+    private func removeProjectLocally(id: ProjectSnapshot.ID) {
+        let removedConversationIDs = Set(
+            conversations.filter { $0.projectID == id }.map(\.id)
+        )
+        do {
+            try projectPersistence.deleteProject(id: id)
+        } catch {
+            storageError = "无法删除本地项目：\(error.localizedDescription)"
+            return
+        }
+
+        for conversation in conversations where removedConversationIDs.contains(conversation.id) {
+            conversation.store.stop()
+        }
+        conversations.removeAll { removedConversationIDs.contains($0.id) }
+        projects.removeAll { $0.id == id }
+        projectAvailability[id] = nil
+
+        if let selectedConversationID,
+           removedConversationIDs.contains(selectedConversationID) {
+            self.selectedConversationID = conversations.first?.id
+        }
+        if conversations.isEmpty {
+            conversations = [makeConversation()]
+        }
+        storageError = nil
+    }
+
     func refreshProjectAvailability(persistChanges: Bool = true) {
         for index in projects.indices {
             let project = projects[index]
@@ -745,6 +877,19 @@ final class AppState: ObservableObject {
         projects.sort { $0.lastOpenedAt > $1.lastOpenedAt }
     }
 
+    /// 打开项目最近的会话；项目尚无会话时创建一段新的项目会话。
+    @discardableResult
+    func selectProject(id: ProjectSnapshot.ID) -> ConversationSession.ID? {
+        guard projects.contains(where: { $0.id == id }) else { return nil }
+
+        if let conversation = conversations.first(where: { $0.projectID == id }) {
+            selectedConversationID = conversation.id
+            return conversation.id
+        }
+
+        return createConversation(projectID: id)
+    }
+
     // MARK: - 会话管理
 
     @discardableResult
@@ -789,8 +934,17 @@ final class AppState: ObservableObject {
             Task { [weak self] in
                 guard let self else { return }
                 do {
+                    try await daemonClient.closeSession(sessionID: id)
                     try await daemonClient.deleteSession(sessionID: id)
                     removeConversationLocally(id: id)
+                } catch let error as ACPDaemonError {
+                    if isUnsupportedRemoteSessionDeletion(error) {
+                        // 后端不支持删除时，仍允许用户移除 Disco 本地会话记录。
+                        markRemoteSessionAsDeleted(id)
+                        removeConversationLocally(id: id)
+                        return
+                    }
+                    storageError = "无法删除原始 Agent 会话，本地会话已保留：\(error.localizedDescription)"
                 } catch {
                     storageError = "无法删除原始 Agent 会话，本地会话已保留：\(error.localizedDescription)"
                 }
@@ -798,6 +952,17 @@ final class AppState: ObservableObject {
             return
         }
         removeConversationLocally(id: id)
+    }
+
+    private func isUnsupportedRemoteSessionDeletion(_ error: ACPDaemonError) -> Bool {
+        guard case let .rpcError(code, _, detail) = error else { return false }
+        return code == -32602 && detail?.contains("不支持删除") == true
+    }
+
+    private func markRemoteSessionAsDeleted(_ id: UUID) {
+        var deletedIDs = deletedRemoteSessionIDs
+        deletedIDs.insert(id)
+        defaults.set(deletedIDs.map(\.uuidString), forKey: Self.deletedRemoteSessionIDsKey)
     }
 
     /// 完成已确认不再有原始 Agent 状态的本地会话删除。
@@ -825,6 +990,8 @@ final class AppState: ObservableObject {
         createdAt: Date = .now,
         updatedAt: Date? = nil,
         projectID: UUID? = nil,
+        providerID: String? = nil,
+        runtimeKind: SessionRuntimeKind? = nil,
         messages: [ChatMessage] = [],
         threadID: String? = nil,
         contextState: ConversationContextState = ConversationContextState()
@@ -834,6 +1001,8 @@ final class AppState: ObservableObject {
             createdAt: createdAt,
             updatedAt: updatedAt,
             projectID: projectID,
+            providerID: providerID,
+            runtimeKind: runtimeKind,
             messages: messages,
             threadID: threadID,
             contextState: contextState
@@ -874,6 +1043,7 @@ final class AppState: ObservableObject {
     ) {
         let updatedAt = Date.now
         markConversationAsRecent(id: id, updatedAt: updatedAt)
+        let metadata = conversations.first { $0.id == id }
         do {
             if messages.isEmpty, projectID == nil {
                 try persistence.deleteConversation(id: id)
@@ -886,6 +1056,8 @@ final class AppState: ObservableObject {
                         messages: messages,
                         threadID: threadID,
                         projectID: projectID,
+                        providerID: metadata?.providerID,
+                        runtimeKind: metadata?.runtimeKind,
                         contextState: contextState
                     )
                 )
@@ -925,14 +1097,26 @@ final class AppState: ObservableObject {
             ? ((try? keyStores[vendor]?.load()) ?? "")
             : ""
         Task { [weak self] in
-            _ = try? await self?.acpDaemonClient.configureProvider(
-                providerID: vendor.daemonProviderID,
-                vendor: vendor.daemonVendor,
-                baseURL: config.baseURL,
-                apiKey: apiKey,
-                model: config.model,
-                thinkingEnabled: config.thinkingEnabled
-            )
+            guard let self else { return }
+            do {
+                _ = try await self.acpDaemonClient.configureProvider(
+                    providerID: vendor.daemonProviderID,
+                    vendor: vendor.daemonVendor,
+                    baseURL: config.baseURL,
+                    apiKey: apiKey,
+                    model: config.model,
+                    thinkingEnabled: config.thinkingEnabled,
+                    reasoningEffort: config.reasoningEffort
+                )
+                if self.providerSyncError?.vendor == vendor {
+                    self.providerSyncError = nil
+                }
+            } catch {
+                self.providerSyncError = ProviderSyncError(
+                    vendor: vendor,
+                    message: "同步到后台失败：\(error.localizedDescription)"
+                )
+            }
         }
     }
 
@@ -1061,8 +1245,15 @@ final class AppState: ObservableObject {
                     guard !Task.isCancelled, let self, let sessionID = event.sessionID else {
                         continue
                     }
-                    conversations.first { $0.id == sessionID }?
-                        .store.handleDaemonNotification(event)
+                    guard let conversation = conversations.first(where: { $0.id == sessionID }) else {
+                        continue
+                    }
+                    // 审批请求必须立即进入对应会话，否则用户停留在其他会话时，
+                    // 审批弹窗虽已写入状态，却完全不可见。
+                    if event.eventName == "approval.requested" {
+                        selectedConversationID = conversation.id
+                    }
+                    conversation.store.handleDaemonNotification(event)
                 }
                 guard !Task.isCancelled, let self else { return }
                 daemonConnectionState = .disconnected
@@ -1084,7 +1275,26 @@ final class AppState: ObservableObject {
     }
 
     private func synchronizeDaemonConversations() async {
-        // 所有会话都与 daemon 对齐：已有 daemon 会话的恢复权威历史，没有的新建会话。
+        // 先从 daemon 发现本地快照缺失的 session，避免 session/list 只被当成存在性检查。
+        if let serverSessions = try? await acpDaemonClient.listSessions().sessions {
+            for serverSession in serverSessions {
+                guard let sessionID = UUID(uuidString: serverSession.sessionId),
+                      let projectID = serverSession.projectID,
+                      projects.contains(where: { $0.id == projectID }),
+                      !deletedRemoteSessionIDs.contains(sessionID),
+                      !conversations.contains(where: { $0.id == sessionID }) else { continue }
+                conversations.append(
+                    makeConversation(
+                        id: sessionID,
+                        projectID: projectID,
+                        providerID: serverSession.providerID,
+                        runtimeKind: serverSession.runtimeKind
+                    )
+                )
+            }
+        }
+
+        // 所有本地会话都与 daemon 对齐：已有 daemon 会话恢复权威历史，没有的才新建。
         for conversation in conversations {
             await registerDaemonConversation(conversation)
         }
@@ -1092,10 +1302,11 @@ final class AppState: ObservableObject {
 
     /// 对齐会话与 daemon：注册缺失的会话，并把 daemon 的权威历史恢复到本地。
     ///
-    /// daemon 可用时会话消息由 daemon 保存（单写），本地只保留会话元数据。
+    /// daemon 是消息的权威来源；本地 SwiftData 快照只作为离线回退缓存
+    /// （注册成功后会以 daemon 恢复的内容为准刷新本地缓存）。
     /// 项目会话使用项目工作区；不挂在项目下的会话使用用户主目录作为工作区。
     private func registerDaemonConversation(_ conversation: ConversationSession) async {
-        guard useDaemon, providerConfigs[activeVendor] != nil else { return }
+        guard useDaemon else { return }
 
         let cwd: String
         if let projectID = conversation.projectID {
@@ -1105,26 +1316,19 @@ final class AppState: ObservableObject {
             cwd = FileManager.default.homeDirectoryForCurrentUser.path
         }
 
-        let vendor = activeVendor
-        guard let config = providerConfigs[vendor] else { return }
-        let apiKey = vendor.requiresAPIKey
-            ? ((try? keyStores[vendor]?.load()) ?? "")
-            : ""
         do {
-            _ = try await acpDaemonClient.configureProvider(
-                providerID: vendor.daemonProviderID,
-                vendor: vendor.daemonVendor,
-                baseURL: config.baseURL,
-                apiKey: apiKey,
-                model: config.model,
-                thinkingEnabled: config.thinkingEnabled
-            )
-
             let existingSessions = try await acpDaemonClient.listSessions(cwd: cwd).sessions
-            let hasACPSession = existingSessions.contains { info in
+            let existingSession = existingSessions.first { info in
                 UUID(uuidString: info.sessionId) == conversation.id
             }
-            if hasACPSession {
+            if let existingSession {
+                if let providerID = existingSession.providerID {
+                    setSessionMetadata(
+                        conversationID: conversation.id,
+                        providerID: providerID,
+                        runtimeKind: existingSession.runtimeKind
+                    )
+                }
                 _ = try await acpDaemonClient.loadSession(
                     sessionID: conversation.id.uuidString,
                     cwd: cwd
@@ -1135,6 +1339,20 @@ final class AppState: ObservableObject {
                     conversation.store.revertDaemonRegistration()
                     return
                 }
+                let vendor = activeVendor
+                guard let config = providerConfigs[vendor] else { return }
+                let apiKey = vendor.requiresAPIKey
+                    ? ((try? keyStores[vendor]?.load()) ?? "")
+                    : ""
+                _ = try await acpDaemonClient.configureProvider(
+                    providerID: vendor.daemonProviderID,
+                    vendor: vendor.daemonVendor,
+                    baseURL: config.baseURL,
+                    apiKey: apiKey,
+                    model: config.model,
+                    thinkingEnabled: config.thinkingEnabled,
+                    reasoningEffort: config.reasoningEffort
+                )
                 let created = try await acpDaemonClient.newSession(
                     cwd: cwd,
                     providerID: vendor.daemonProviderID,
@@ -1145,6 +1363,11 @@ final class AppState: ObservableObject {
                         "ACP session/new 未返回请求的 ConversationSession ID。"
                     )
                 }
+                setSessionMetadata(
+                    conversationID: conversation.id,
+                    providerID: vendor.daemonProviderID,
+                    runtimeKind: SessionRuntimeKind.from(providerID: vendor.daemonProviderID)
+                )
             }
 
             let storedMessages = try await acpDaemonClient.listMessages(
@@ -1156,17 +1379,76 @@ final class AppState: ObservableObject {
             }
             conversation.store.enableDaemonRuns(sessionID: conversation.id)
             if !storedMessages.isEmpty {
-                conversation.store.restoreMessages(storedMessages.map { message in
-                    ChatMessage(
-                        id: UUID(uuidString: message.id) ?? UUID(),
-                        role: message.role == "user" ? .user : .assistant,
-                        text: message.text
-                    )
-                })
+                conversation.store.restoreMessages(restoreDaemonMessages(storedMessages))
+            } else if conversation.store.messages.isEmpty {
+                // 让新建的空 session 也把 metadata 写入本地快照。
+                persistEmptyProjectConversation(conversation)
             }
         } catch {
             conversation.store.disableDaemonRuns()
         }
+    }
+
+    private func setSessionMetadata(
+        conversationID: UUID,
+        providerID: String,
+        runtimeKind: SessionRuntimeKind?
+    ) {
+        guard let index = conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+        conversations[index].providerID = providerID
+        conversations[index].runtimeKind = runtimeKind ?? SessionRuntimeKind.from(providerID: providerID)
+    }
+
+    private func restoreDaemonMessages(_ storedMessages: [ACPSessionMessage]) -> [ChatMessage] {
+        var messages: [ChatMessage] = []
+        for storedMessage in storedMessages {
+            if let toolCallID = storedMessage.toolCallId,
+               let assistantIndex = messages.lastIndex(where: { $0.role == .assistant }) {
+                guard let callIndex = messages[assistantIndex].parts.firstIndex(where: { part in
+                    guard case let .toolCall(call) = part else { return false }
+                    return call.id == toolCallID
+                }) else { continue }
+                guard case let .toolCall(existingCall) = messages[assistantIndex].parts[callIndex] else {
+                    continue
+                }
+                var updatedCall = existingCall
+                updatedCall.status = .completed
+                updatedCall.output = storedMessage.text
+                messages[assistantIndex].parts[callIndex] = .toolCall(updatedCall)
+                continue
+            }
+
+            guard let role = ChatMessage.Role(rawValue: storedMessage.role) else { continue }
+            var parts: [ChatMessage.Part] = []
+            if let reasoning = storedMessage.reasoning, !reasoning.isEmpty {
+                parts.append(.reasoning(reasoning))
+            }
+            for toolCall in storedMessage.toolCalls ?? [] {
+                parts.append(
+                    .toolCall(
+                        ChatMessage.ToolCallSnapshot(
+                            id: toolCall.id,
+                            name: toolCall.name,
+                            arguments: toolCall.arguments,
+                            status: toolCall.status == "running" ? .running : .completed,
+                            output: toolCall.output
+                        )
+                    )
+                )
+            }
+            if !storedMessage.text.isEmpty {
+                parts.append(.text(TextContent(text: storedMessage.text)))
+            }
+            guard !parts.isEmpty else { continue }
+            messages.append(
+                ChatMessage(
+                    id: UUID(uuidString: storedMessage.id) ?? UUID(),
+                    role: role,
+                    parts: parts
+                )
+            )
+        }
+        return messages
     }
 }
 

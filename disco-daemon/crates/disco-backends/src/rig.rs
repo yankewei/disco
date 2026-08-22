@@ -269,6 +269,58 @@ pub fn deepseek_runtime(
     ))
 }
 
+/// 通过 Rig DeepSeek client 实时获取模型列表（`GET /models`）。
+pub async fn list_models_deepseek(base_url: &str, api_key: &str) -> Result<Vec<ModelEntry>> {
+    use rig_core::client::ModelListingClient;
+    let client = rig_core::providers::deepseek::Client::builder()
+        .api_key(api_key)
+        .base_url(base_url)
+        .build()
+        .context("无法创建 Rig DeepSeek client")?;
+    let models = client
+        .list_models()
+        .await
+        .map_err(|error| anyhow!("DeepSeek 模型列表请求失败：{error}"))?;
+    Ok(to_model_entries(models))
+}
+
+/// 通过 Rig OpenAI 兼容 client 实时获取模型列表（`GET {base_url}/models`），
+/// 适用于 OpenAI 及兼容其接口的第三方服务商。
+pub async fn list_models_openai_compat(base_url: &str, api_key: &str) -> Result<Vec<ModelEntry>> {
+    use rig_core::client::ModelListingClient;
+    let client = rig_core::providers::openai::Client::builder()
+        .api_key(api_key)
+        .base_url(base_url)
+        .build()
+        .context("无法创建 Rig OpenAI client")?;
+    let models = client
+        .list_models()
+        .await
+        .map_err(|error| anyhow!("OpenAI 兼容模型列表请求失败：{error}"))?;
+    Ok(to_model_entries(models))
+}
+
+/// 模型条目：ID、显示名以及服务商声明的基础能力。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub model_type: Option<String>,
+    pub context_window: Option<i64>,
+}
+
+fn to_model_entries(models: rig_core::model::ModelList) -> Vec<ModelEntry> {
+    models
+        .iter()
+        .map(|model| ModelEntry {
+            id: model.id.clone(),
+            display_name: model.name.clone(),
+            model_type: model.r#type.clone(),
+            context_window: model.context_length.map(i64::from),
+        })
+        .collect()
+}
+
 fn build_runtime<M>(
     model: M,
     vendor_name: &'static str,

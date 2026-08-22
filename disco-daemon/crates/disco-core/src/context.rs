@@ -13,6 +13,9 @@ use tokio_stream::StreamExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// 模型目录未收录上下文窗口时的默认值（128k tokens）。
+pub const DEFAULT_CONTEXT_WINDOW: i64 = 128_000;
+
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
 pub struct CompactionResult {

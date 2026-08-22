@@ -15,6 +15,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub model: String,
     pub thinking_enabled: bool,
+    pub reasoning_effort: Option<String>,
     pub updated_at: String,
 }
 
@@ -30,8 +31,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO provider_profiles
-             (id, vendor, base_url, api_key, model, thinking_enabled, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, vendor, base_url, api_key, model, thinking_enabled, reasoning_effort, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 config.provider_id.as_str(),
                 vendor_str,
@@ -39,6 +40,7 @@ impl Database {
                 config.api_key,
                 config.model,
                 config.thinking_enabled as i32,
+                config.reasoning_effort,
                 &now,
             ],
         )
@@ -52,7 +54,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, updated_at
+                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, reasoning_effort, updated_at
                  FROM provider_profiles
                  WHERE id = ?1",
             )
@@ -70,7 +72,8 @@ impl Database {
                     api_key: row.get(3)?,
                     model: row.get(4)?,
                     thinking_enabled: row.get::<_, i32>(5)? != 0,
-                    updated_at: row.get(6)?,
+                    reasoning_effort: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })
             .optional()
@@ -84,7 +87,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, updated_at
+                "SELECT id, vendor, base_url, api_key, model, thinking_enabled, reasoning_effort, updated_at
                  FROM provider_profiles
                  ORDER BY id",
             )
@@ -101,7 +104,8 @@ impl Database {
                 api_key: row.get(3)?,
                 model: row.get(4)?,
                 thinking_enabled: row.get::<_, i32>(5)? != 0,
-                updated_at: row.get(6)?,
+                reasoning_effort: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
 
@@ -160,6 +164,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: "gpt-4".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         };
 
@@ -186,6 +191,7 @@ mod tests {
             api_key: "sk-old".to_string(),
             model: "deepseek-chat".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         };
 
@@ -196,6 +202,7 @@ mod tests {
             api_key: "sk-new".to_string(),
             model: "deepseek-reasoner".to_string(),
             thinking_enabled: true,
+            reasoning_effort: None,
             ..config
         };
         db.save_provider_config(&updated).unwrap();
@@ -220,6 +227,7 @@ mod tests {
             api_key: "sk-1".to_string(),
             model: "gpt-4".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();
@@ -231,6 +239,7 @@ mod tests {
             api_key: "sk-2".to_string(),
             model: "deepseek-chat".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();
@@ -250,6 +259,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: "gpt-4".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();
@@ -281,6 +291,7 @@ mod tests {
             api_key: "sk-kimi".to_string(),
             model: "kimi-latest".to_string(),
             thinking_enabled: true,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();
@@ -304,6 +315,7 @@ mod tests {
             api_key: String::new(),
             model: "o4-mini".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();
@@ -314,6 +326,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: "gpt-5-codex".to_string(),
             thinking_enabled: false,
+            reasoning_effort: None,
             updated_at: String::new(),
         })
         .unwrap();

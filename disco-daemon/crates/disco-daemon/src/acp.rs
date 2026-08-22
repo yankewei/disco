@@ -32,6 +32,10 @@ use crate::run_service::accumulate_usage;
 
 const META_PROVIDER_ID: &str = "disco/providerId";
 const META_SESSION_ID: &str = "disco/sessionId";
+const META_RUNTIME_KIND: &str = "disco/runtimeKind";
+const META_PROJECT_ID: &str = "disco/projectId";
+const META_VENDOR: &str = "disco/vendor";
+const META_MODEL: &str = "disco/model";
 const ACP_PROVIDER_CONFIGURE_METHOD: &str = "disco/provider/configure";
 const ACP_PROVIDER_LIST_METHOD: &str = "disco/provider/list";
 const ACP_PROVIDER_MODELS_METHOD: &str = "disco/provider/models";
@@ -120,7 +124,7 @@ where
                 async move |request: LoadSessionRequest,
                             responder: Responder<LoadSessionResponse>,
                             _connection: ConnectionTo<Client>| {
-                    let response = load_session(&app, &request)?;
+                    let response = load_session(&app, &request).await?;
                     responder.respond(response)
                 }
             },
@@ -246,6 +250,8 @@ struct AcpProviderConfigureParams {
     model: String,
     #[serde(default)]
     thinking_enabled: bool,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +283,10 @@ struct AcpProviderModelsParams {
     #[serde(default)]
     provider_id: Option<disco_protocol::ProviderId>,
     vendor: disco_protocol::Vendor,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -297,6 +307,12 @@ struct AcpSessionMessage {
     id: String,
     role: String,
     text: String,
+    reasoning: String,
+    tool_calls: Vec<disco_persist::messages::StoredToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
     created_at: String,
 }
 
@@ -361,6 +377,7 @@ async fn configure_provider(
             api_key: params.api_key,
             model: params.model,
             thinking_enabled: params.thinking_enabled,
+            reasoning_effort: params.reasoning_effort,
         },
     )
     .await
@@ -405,6 +422,10 @@ async fn list_session_messages(
             id: message.id.to_string(),
             role: message.role,
             text: message.text,
+            reasoning: message.reasoning,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            tool_name: message.tool_name,
             created_at: message.created_at,
         })
         .collect();
@@ -454,19 +475,24 @@ async fn compact_session(
 }
 
 async fn list_provider_models(
-    _app: &Arc<AppState>,
+    app: &Arc<AppState>,
     extension: &ExtRequest,
 ) -> agent_client_protocol::Result<serde_json::Value> {
     let params: AcpProviderModelsParams = decode_extension_params(extension)?;
-    let models =
-        crate::provider_service::list_provider_models(disco_protocol::ProviderModelsParams {
+    let models = crate::provider_service::list_provider_models(
+        app,
+        disco_protocol::ProviderModelsParams {
             provider_id: params.provider_id,
             vendor: params.vendor,
-        })
-        .map_err(crate::provider_service::ProviderError::into_acp_error)?
-        .into_iter()
-        .map(AcpModelCatalogEntry::from)
-        .collect();
+            base_url: params.base_url,
+            api_key: params.api_key,
+        },
+    )
+    .await
+    .map_err(crate::provider_service::ProviderError::into_acp_error)?
+    .into_iter()
+    .map(AcpModelCatalogEntry::from)
+    .collect();
     serde_json::to_value(AcpProviderModelsResult { models })
         .map_err(|error| internal_error(format!("无法编码 Provider models：{error}")))
 }
@@ -591,7 +617,7 @@ async fn select_provider_config(
     Ok(config)
 }
 
-fn load_session(
+async fn load_session(
     app: &Arc<AppState>,
     request: &LoadSessionRequest,
 ) -> agent_client_protocol::Result<LoadSessionResponse> {
@@ -617,6 +643,29 @@ fn load_session(
             cwd.display()
         )));
     }
+
+    let backend = app.get_backend(&session.provider_id).await.ok_or_else(|| {
+        internal_error(format!(
+            "Provider {} 当前没有可用的 Agent Backend。",
+            session.provider_id
+        ))
+    })?;
+    let backend_handle = app
+        .db
+        .get_session_backend_handle(session.id)
+        .map_err(|error| internal_error(format!("无法读取 session backend handle：{error}")))?;
+    backend
+        .load_session(
+            &disco_core::BackendSession {
+                id: session.id,
+                model: session.model.clone(),
+                backend_handle,
+            },
+            Some(project.path),
+        )
+        .await
+        .map_err(|error| internal_error(format!("无法恢复 session {session_id}：{error}")))?;
+
     Ok(LoadSessionResponse::new())
 }
 
@@ -647,9 +696,25 @@ fn list_sessions(
             .list_sessions(project.id)
             .map_err(|error| internal_error(format!("无法读取 session 列表：{error}")))?;
         sessions.extend(project_sessions.into_iter().map(|session| {
+            let mut meta = Meta::new();
+            meta.insert(
+                META_PROJECT_ID.to_string(),
+                serde_json::json!(session.project_id),
+            );
+            meta.insert(
+                META_PROVIDER_ID.to_string(),
+                serde_json::json!(session.provider_id.to_string()),
+            );
+            meta.insert(
+                META_RUNTIME_KIND.to_string(),
+                serde_json::json!(session.provider_id.runtime_kind()),
+            );
+            meta.insert(META_VENDOR.to_string(), serde_json::json!(session.vendor));
+            meta.insert(META_MODEL.to_string(), serde_json::json!(session.model));
             SessionInfo::new(session.id.to_string(), PathBuf::from(project.path.clone()))
                 .title(session.title)
                 .updated_at(Some(session.updated_at))
+                .meta(meta)
         }));
     }
 
@@ -728,6 +793,26 @@ async fn bridge_prompt(
                     session_id.clone(),
                     SessionUpdate::UsageUpdate(
                         UsageUpdate::new(usage.total.max(0) as u64, 0).meta(meta),
+                    ),
+                ))?;
+            }
+            AgentOutput::ContextUsage { used, size } => {
+                let usage = TokenUsage {
+                    input: used,
+                    output: 0,
+                    total: used,
+                    cached_input: None,
+                    reasoning_output: None,
+                };
+                let mut meta = Meta::new();
+                meta.insert(
+                    "disco/usage".to_string(),
+                    serde_json::json!({ "current": usage }),
+                );
+                connection.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::UsageUpdate(
+                        UsageUpdate::new(used.max(0) as u64, size.max(0) as u64).meta(meta),
                     ),
                 ))?;
             }
@@ -961,11 +1046,17 @@ fn parse_tool_json(arguments: &str) -> serde_json::Value {
 }
 
 fn tool_kind(tool_name: &str) -> ToolKind {
-    match tool_name {
-        "shell" => ToolKind::Execute,
-        "search" => ToolKind::Search,
-        "file_edit" | "file_write" => ToolKind::Edit,
-        "file_read" => ToolKind::Read,
+    let normalized = tool_name.to_ascii_lowercase();
+    match normalized.as_str() {
+        "shell" | "shell.execute" | "bash" | "command" | "exec" | "执行命令" => {
+            ToolKind::Execute
+        }
+        "search" | "grep" | "搜索代码" => ToolKind::Search,
+        "file_edit" | "file_write" | "edit_file" | "write_file" | "修改文件" | "写入文件" => {
+            ToolKind::Edit
+        }
+        "file_read" | "read_file" | "read" | "读取文件" => ToolKind::Read,
+        "fetch" | "读取网页" => ToolKind::Fetch,
         _ => ToolKind::Other,
     }
 }
@@ -1025,6 +1116,8 @@ mod tests {
     #[test]
     fn tool_mapping_preserves_json_arguments() {
         assert_eq!(tool_kind("shell"), ToolKind::Execute);
+        assert_eq!(tool_kind("执行命令"), ToolKind::Execute);
+        assert_eq!(tool_kind("读取文件"), ToolKind::Read);
         assert_eq!(parse_tool_json(r#"{"command":"pwd"}"#)["command"], "pwd");
         assert_eq!(parse_tool_json("not-json"), serde_json::json!("not-json"));
     }
@@ -1066,6 +1159,10 @@ mod tests {
                     cached_input: None,
                     reasoning_output: None,
                 }),
+                AgentOutput::ContextUsage {
+                    used: 53_000,
+                    size: 200_000,
+                },
                 AgentOutput::Completed,
             ],
             backend_handle: None,
@@ -1146,6 +1243,27 @@ mod tests {
                 assert!(disco_usage.is_some(), "UsageUpdate 应携带 disco/usage 明细");
             }
             other => panic!("期望 usage_update，收到 {other:?}"),
+        }
+
+        let context_usage_update = tokio::time::timeout(Duration::from_secs(1), updates_rx.recv())
+            .await
+            .expect("等待上下文 usage update 超时")
+            .expect("上下文 usage update 流意外结束");
+        match context_usage_update {
+            SessionUpdate::UsageUpdate(update) => {
+                assert_eq!(update.used, 53_000);
+                assert_eq!(update.size, 200_000);
+                let current = update
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("disco/usage"))
+                    .and_then(|usage| usage.get("current"));
+                assert_eq!(
+                    current.and_then(|usage| usage.get("total")),
+                    Some(&serde_json::json!(53_000))
+                );
+            }
+            other => panic!("期望上下文 usage_update，收到 {other:?}"),
         }
     }
 

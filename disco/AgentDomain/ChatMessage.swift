@@ -162,10 +162,58 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         case assistant
     }
 
+    enum ToolCallStatus: String, Codable, Sendable {
+        case running
+        case completed
+    }
+
     struct ToolCallSnapshot: Codable, Equatable, Sendable {
         let id: String
         let name: String
+        let kind: String?
         let arguments: String
+        var status: ToolCallStatus
+        var output: String?
+
+        init(
+            id: String,
+            name: String,
+            arguments: String,
+            kind: String? = nil,
+            status: ToolCallStatus = .running,
+            output: String? = nil
+        ) {
+            self.id = id
+            self.name = name
+            self.kind = kind
+            self.arguments = arguments
+            self.status = status
+            self.output = output
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case kind
+            case arguments
+            case status
+            case output
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            name = try container.decode(String.self, forKey: .name)
+            kind = try container.decodeIfPresent(String.self, forKey: .kind)
+            arguments = try container.decode(String.self, forKey: .arguments)
+            // 旧版只保存了调用参数，没有生命周期字段；历史记录视为已完成。
+            status = try container.decodeIfPresent(ToolCallStatus.self, forKey: .status) ?? .completed
+            output = try container.decodeIfPresent(String.self, forKey: .output)
+        }
+
+        var isCompleted: Bool {
+            status == .completed
+        }
     }
 
     enum Part: Equatable, Sendable {
@@ -233,6 +281,13 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         parts.isEmpty
     }
 
+    var hasRunningToolCall: Bool {
+        parts.contains { part in
+            guard case let .toolCall(call) = part else { return false }
+            return !call.isCompleted
+        }
+    }
+
     mutating func appendText(_ delta: String) {
         guard !parts.isEmpty else {
             parts.append(.text(TextContent(text: delta)))
@@ -271,6 +326,17 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
             parts[index] = .hostedTool(snapshot)
         } else {
             parts.append(.hostedTool(snapshot))
+        }
+    }
+
+    mutating func upsertToolCall(_ snapshot: ToolCallSnapshot) {
+        if let index = parts.firstIndex(where: {
+            if case let .toolCall(call) = $0 { return call.id == snapshot.id }
+            return false
+        }) {
+            parts[index] = .toolCall(snapshot)
+        } else {
+            parts.append(.toolCall(snapshot))
         }
     }
 

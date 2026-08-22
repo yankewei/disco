@@ -1,6 +1,22 @@
 import Foundation
 import SwiftData
 
+enum SessionRuntimeKind: String, Codable, Sendable {
+    case acp
+    case codexAppServer = "codex_app_server"
+    case rig
+    case unknown
+
+    static func from(providerID: String?) -> Self? {
+        switch providerID {
+        case "opencode_app_server": .acp
+        case "codex_app_server": .codexAppServer
+        case nil: nil
+        default: .rig
+        }
+    }
+}
+
 struct ConversationSnapshot {
     let id: UUID
     let createdAt: Date
@@ -11,6 +27,10 @@ struct ConversationSnapshot {
     let threadID: String?
     /// Project UUID；nil 表示普通对话。
     let projectID: UUID?
+    /// 创建该会话时绑定的 daemon Provider profile。
+    let providerID: String?
+    /// 该会话实际使用的 backend runtime；不跟随当前 active provider 改变。
+    let runtimeKind: SessionRuntimeKind?
     /// Generic 压缩 checkpoint 与最近压缩记录（派生缓存，消息才是事实来源）。
     var contextState: ConversationContextState? = nil
 
@@ -21,6 +41,8 @@ struct ConversationSnapshot {
         messages: [ChatMessage],
         threadID: String?,
         projectID: UUID? = nil,
+        providerID: String? = nil,
+        runtimeKind: SessionRuntimeKind? = nil,
         contextState: ConversationContextState? = nil
     ) {
         self.id = id
@@ -29,6 +51,8 @@ struct ConversationSnapshot {
         self.messages = messages
         self.threadID = threadID
         self.projectID = projectID
+        self.providerID = providerID
+        self.runtimeKind = runtimeKind
         self.contextState = contextState
     }
 }
@@ -44,6 +68,7 @@ protocol ConversationPersisting: AnyObject {
 protocol ProjectPersisting: AnyObject {
     func loadProjects() throws -> [ProjectSnapshot]
     func saveProject(_ project: ProjectSnapshot) throws
+    func deleteProject(id: UUID) throws
 }
 
 @MainActor
@@ -121,6 +146,8 @@ final class ConversationPersistence: ConversationPersisting, ProjectPersisting {
                 messages: messages,
                 threadID: conversation.threadID,
                 projectID: conversation.projectID,
+                providerID: conversation.providerID,
+                runtimeKind: conversation.runtimeKind.flatMap(SessionRuntimeKind.init(rawValue:)),
                 // 解码/版本/校验失败时丢弃 checkpoint，不删除消息（计划 §2）
                 contextState: PersistedConversationContextState.decode(conversation.contextStateData)
             )
@@ -169,6 +196,24 @@ final class ConversationPersistence: ConversationPersisting, ProjectPersisting {
         try context.save()
     }
 
+    func deleteProject(id: UUID) throws {
+        let projectID = id
+        let projectDescriptor = FetchDescriptor<PersistedProject>(
+            predicate: #Predicate { $0.id == projectID }
+        )
+        if let project = try context.fetch(projectDescriptor).first {
+            context.delete(project)
+        }
+
+        let conversationDescriptor = FetchDescriptor<PersistedConversation>(
+            predicate: #Predicate { $0.projectID == projectID }
+        )
+        for conversation in try context.fetch(conversationDescriptor) {
+            context.delete(conversation)
+        }
+        try context.save()
+    }
+
     func saveConversation(_ conversation: ConversationSnapshot) throws {
         let conversationID = conversation.id
         let descriptor = FetchDescriptor<PersistedConversation>(
@@ -189,6 +234,8 @@ final class ConversationPersistence: ConversationPersisting, ProjectPersisting {
         persistedConversation.updatedAt = conversation.updatedAt
         persistedConversation.threadID = conversation.threadID
         persistedConversation.projectID = conversation.projectID
+        persistedConversation.providerID = conversation.providerID
+        persistedConversation.runtimeKind = conversation.runtimeKind?.rawValue
         persistedConversation.contextStateData = try PersistedConversationContextState
             .encode(conversation.contextState)
 
@@ -275,6 +322,11 @@ final class VolatileConversationPersistence: ConversationPersisting, ProjectPers
     func saveProject(_ project: ProjectSnapshot) {
         projects[project.id] = project
     }
+
+    func deleteProject(id: UUID) {
+        projects[id] = nil
+        conversations = conversations.filter { $0.value.projectID != id }
+    }
 }
 
 @Model
@@ -286,6 +338,10 @@ private final class PersistedConversation {
     var threadID: String?
     /// Project UUID；nil 表示普通对话。
     var projectID: UUID?
+    /// daemon Provider profile；旧记录可能为空。
+    var providerID: String?
+    /// SessionRuntimeKind.rawValue；旧记录可能为空。
+    var runtimeKind: String?
     /// 版本化 JSON（PersistedConversationContextState）；旧库记录为 nil。
     var contextStateData: Data? = nil
     @Relationship(deleteRule: .cascade, inverse: \PersistedMessage.conversation)
@@ -296,13 +352,17 @@ private final class PersistedConversation {
         createdAt: Date,
         updatedAt: Date,
         threadID: String? = nil,
-        projectID: UUID? = nil
+        projectID: UUID? = nil,
+        providerID: String? = nil,
+        runtimeKind: String? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.threadID = threadID
         self.projectID = projectID
+        self.providerID = providerID
+        self.runtimeKind = runtimeKind
     }
 }
 
