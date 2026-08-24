@@ -48,6 +48,10 @@ ACP v1 将自定义方法限制为以下划线开头，因此 facade 的实际 w
 - `_disco/provider/models`
 - `_disco/session/messages`
 - `_disco/session/compact`
+- `_disco/state/snapshot`：返回 daemon revision、Provider、project 和 session 快照；Swift
+  侧以此作为重连后的权威状态入口。
+- `_disco/event/replay`：按 session 的 epoch 和 sequence 重放连接短暂中断期间的 session
+  update。事件仅保留在 daemon 进程内的有限窗口，完整历史仍从 SQLite 恢复。
 
 上下文压缩事件使用 ACP extension notification `_disco/session/compaction`。其 `update`
 payload 遵循 ACP v1 compaction RFD 的 `sessionUpdate: "compaction_update"` 结构；这是
@@ -78,6 +82,15 @@ extension（Disco App 设置页）写入；该选择规则是过渡行为，后�
 
 ACP 的 `AllowAlways` 选项在 Disco 中解释为“本会话允许相同 fingerprint”，不会变成全局
 永久授权。
+
+状态变更使用 daemon 进程内的单调 `revision` 标记。每条可重放的 `session/update` 和
+`_disco/session/compaction` notification 都会在顶层 `_meta` 携带：
+
+- `disco/eventEpoch`：daemon 启动时生成的 epoch；daemon 重启后改变；
+- `disco/eventSequence`：同一 session 内从 1 开始递增的序号。
+
+同一 session 的多个 `session/prompt` 请求进入 daemon FIFO mailbox，前一个 prompt 完成
+（包括取消或失败）后才开始下一个；`session/cancel` 和权限响应仍可在运行期间重入处理。
 
 ## 运行事件映射
 

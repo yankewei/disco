@@ -4,6 +4,7 @@
 //! 复用共享 run service 和 `RunCoordinator`，session/provider/compaction 等产品操作由
 //! 对应的 service 模块实现。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,10 +27,12 @@ use disco_core::{AgentOutput, CompactionUpdate};
 use disco_protocol::types::{CompactionStatus, TokenUsage};
 use disco_protocol::{ApprovalKind, ApprovalRequestedData};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::daemon::AppState;
+use crate::daemon::{AppState, EventReplayEntry};
 use crate::run_service::accumulate_usage;
 
 const META_PROVIDER_ID: &str = "disco/providerId";
@@ -44,9 +47,13 @@ const ACP_PROVIDER_LIST_METHOD: &str = "disco/provider/list";
 const ACP_PROVIDER_MODELS_METHOD: &str = "disco/provider/models";
 const ACP_SESSION_MESSAGES_METHOD: &str = "disco/session/messages";
 const ACP_SESSION_COMPACT_METHOD: &str = "disco/session/compact";
+const ACP_STATE_SNAPSHOT_METHOD: &str = "disco/state/snapshot";
+const ACP_EVENT_REPLAY_METHOD: &str = "disco/event/replay";
 const META_APPROVAL_ID: &str = "disco/approvalId";
 const META_APPROVAL_SCOPE: &str = "disco/approvalScope";
 const META_APPROVAL_FINGERPRINT: &str = "disco/approvalFingerprint";
+const META_EVENT_EPOCH: &str = "disco/eventEpoch";
+const META_EVENT_SEQUENCE: &str = "disco/eventSequence";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
 #[notification(method = "_disco/session/compaction")]
@@ -54,6 +61,152 @@ const META_APPROVAL_FINGERPRINT: &str = "disco/approvalFingerprint";
 struct CompactionNotification {
     session_id: SessionId,
     update: serde_json::Value,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<Meta>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpStateProject {
+    id: String,
+    name: String,
+    path: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpStateSnapshotResult {
+    revision: u64,
+    providers: Vec<AcpProviderEntry>,
+    projects: Vec<AcpStateProject>,
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpEventReplayParams {
+    session_id: String,
+    #[serde(default)]
+    epoch: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpEventReplayResult {
+    epoch: String,
+    events: Vec<EventReplayEntry>,
+}
+
+struct PromptJob {
+    app: Arc<AppState>,
+    connection: ConnectionTo<Client>,
+    responder: Responder<PromptResponse>,
+    session_uuid: Uuid,
+    session_id: SessionId,
+    prompt: String,
+}
+
+struct PromptMailboxEntry {
+    sender: mpsc::Sender<PromptJob>,
+    shutdown: CancellationToken,
+    generation: Uuid,
+}
+
+/// 每个 ACP session 一个 FIFO mailbox；worker 完成当前 prompt 后才取下一个。
+#[derive(Clone, Default)]
+struct SessionPromptMailbox {
+    senders: Arc<Mutex<HashMap<Uuid, Arc<PromptMailboxEntry>>>>,
+}
+
+impl SessionPromptMailbox {
+    async fn enqueue(&self, job: PromptJob) -> anyhow::Result<()> {
+        let session_uuid = job.session_uuid;
+        let sender = {
+            let mut senders = self.senders.lock().await;
+            if let Some(entry) = senders.get(&session_uuid) {
+                if entry.shutdown.is_cancelled() {
+                    return Err(anyhow::anyhow!("session mailbox 已关闭"));
+                }
+                entry.sender.clone()
+            } else {
+                let (sender, mut receiver) = mpsc::channel::<PromptJob>(32);
+                let generation = Uuid::new_v4();
+                let shutdown = CancellationToken::new();
+                let entry = Arc::new(PromptMailboxEntry {
+                    sender: sender.clone(),
+                    shutdown: shutdown.clone(),
+                    generation,
+                });
+                let senders_weak = Arc::downgrade(&self.senders);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {
+                                while let Ok(job) = receiver.try_recv() {
+                                    let _ = job.responder.respond_with_error(
+                                        invalid_params("session mailbox 已关闭"),
+                                    );
+                                }
+                                break;
+                            }
+                            job = receiver.recv() => {
+                                let Some(job) = job else { break };
+                                if shutdown.is_cancelled() {
+                                    let _ = job.responder.respond_with_error(
+                                        invalid_params("session mailbox 已关闭"),
+                                    );
+                                    continue;
+                                }
+                                if let Err(error) = bridge_prompt(
+                                    job.app,
+                                    job.connection,
+                                    job.responder,
+                                    job.session_uuid,
+                                    job.session_id,
+                                    job.prompt,
+                                )
+                                .await
+                                {
+                                    warn!(%error, "session mailbox prompt 处理失败");
+                                }
+                            }
+                        }
+                    }
+                    if let Some(senders) = senders_weak.upgrade() {
+                        let mut senders = senders.lock().await;
+                        if senders
+                            .get(&session_uuid)
+                            .is_some_and(|entry| entry.generation == generation)
+                        {
+                            senders.remove(&session_uuid);
+                        }
+                    }
+                });
+                senders.insert(session_uuid, entry);
+                sender
+            }
+        };
+        sender
+            .send(job)
+            .await
+            .map_err(|_| anyhow::anyhow!("session mailbox 已关闭"))
+    }
+
+    async fn close(&self, session_uuid: Uuid) {
+        if let Some(entry) = self.senders.lock().await.get(&session_uuid) {
+            entry.shutdown.cancel();
+        }
+    }
+
+    async fn shutdown(&self) {
+        let senders = self.senders.lock().await;
+        for entry in senders.values() {
+            entry.shutdown.cancel();
+        }
+    }
 }
 
 /// 通过 stdin/stdout 运行 ACP v1 server。
@@ -68,6 +221,7 @@ async fn run_acp_server<T>(app: Arc<AppState>, transport: T) -> anyhow::Result<(
 where
     T: ConnectTo<Agent> + 'static,
 {
+    let prompt_mailbox = SessionPromptMailbox::default();
     let mut capability_meta = Meta::new();
     capability_meta.insert(
         "disco/extensions".to_string(),
@@ -77,6 +231,8 @@ where
             "disco/provider/models",
             "disco/session/messages",
             "disco/session/compact",
+            "disco/state/snapshot",
+            "disco/event/replay",
         ]),
     );
     let capabilities = AgentCapabilities::new()
@@ -92,7 +248,7 @@ where
 
     info!("ACP stdio facade listening");
 
-    Agent
+    let result = Agent
         .builder()
         .name("disco-daemon")
         .on_receive_request(
@@ -156,10 +312,11 @@ where
         .on_receive_request(
             {
                 let app = app.clone();
+                let prompt_mailbox = prompt_mailbox.clone();
                 async move |request: DeleteSessionRequest,
                             responder: Responder<DeleteSessionResponse>,
                             _connection: ConnectionTo<Client>| {
-                    let response = delete_session(&app, &request).await?;
+                    let response = delete_session(&app, &prompt_mailbox, &request).await?;
                     responder.respond(response)
                 }
             },
@@ -168,10 +325,11 @@ where
         .on_receive_request(
             {
                 let app = app.clone();
+                let prompt_mailbox = prompt_mailbox.clone();
                 async move |request: CloseSessionRequest,
                             responder: Responder<CloseSessionResponse>,
                             _connection: ConnectionTo<Client>| {
-                    let response = close_session(&app, &request).await?;
+                    let response = close_session(&app, &prompt_mailbox, &request).await?;
                     responder.respond(response)
                 }
             },
@@ -180,28 +338,25 @@ where
         .on_receive_request(
             {
                 let app = app.clone();
+                let prompt_mailbox = prompt_mailbox.clone();
                 async move |request: PromptRequest,
                             responder: Responder<PromptResponse>,
                             connection: ConnectionTo<Client>| {
+                    let app = app.clone();
+                    let prompt_mailbox = prompt_mailbox.clone();
                     let session_uuid = parse_session_id(&request.session_id)?;
                     let prompt = extract_prompt_text(&request.prompt)?;
-                    let app = app.clone();
-                    let session_id = request.session_id.clone();
-
-                    // prompt 在 run 进入终止状态后才返回响应。将等待任务从 dispatch callback
-                    // 中分离，保证模型运行期间仍能重入处理 session/cancel 和 permission response。
-                    let task_connection = connection.clone();
-                    connection.spawn(async move {
-                        bridge_prompt(
+                    prompt_mailbox
+                        .enqueue(PromptJob {
                             app,
-                            task_connection,
+                            connection,
                             responder,
                             session_uuid,
-                            session_id,
+                            session_id: request.session_id.clone(),
                             prompt,
-                        )
+                        })
                         .await
-                    })?;
+                        .map_err(|error| internal_error(error.to_string()))?;
                     Ok(())
                 }
             },
@@ -244,9 +399,11 @@ where
         )
         .connect_to(transport)
         .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
 
+    prompt_mailbox.shutdown().await;
     app.shutdown.cancel();
+    result?;
     Ok(())
 }
 
@@ -370,6 +527,8 @@ async fn handle_disco_extension(
         ACP_PROVIDER_MODELS_METHOD => list_provider_models(app, extension).await,
         ACP_SESSION_MESSAGES_METHOD => list_session_messages(app, extension).await,
         ACP_SESSION_COMPACT_METHOD => compact_session(app, extension, connection).await,
+        ACP_STATE_SNAPSHOT_METHOD => state_snapshot(app).await,
+        ACP_EVENT_REPLAY_METHOD => replay_events(app, extension).await,
         method => Err(agent_client_protocol::Error::method_not_found()
             .data(format!("未知的 Disco ACP extension：{method}"))),
     }
@@ -445,6 +604,71 @@ async fn list_session_messages(
         .map_err(|error| internal_error(format!("无法编码 session 消息：{error}")))
 }
 
+async fn state_snapshot(app: &Arc<AppState>) -> agent_client_protocol::Result<serde_json::Value> {
+    let _state_guard = app.state_lock.lock().await;
+    let providers = crate::provider_service::list_providers(app)
+        .map_err(crate::provider_service::ProviderError::into_acp_error)?
+        .into_iter()
+        .map(|provider| AcpProviderEntry {
+            provider_id: provider.provider_id.to_string(),
+            vendor: provider.vendor,
+            base_url: provider.base_url,
+            model: provider.model,
+            thinking_enabled: provider.thinking_enabled,
+        })
+        .collect();
+    let projects = app
+        .db
+        .list_projects()
+        .map_err(|error| internal_error(format!("无法读取 workspace project：{error}")))?;
+    let mut sessions = Vec::new();
+    let project_snapshots = projects
+        .iter()
+        .map(|project| AcpStateProject {
+            id: project.id.to_string(),
+            name: project.name.clone(),
+            path: project.path.clone(),
+            created_at: project.created_at.clone(),
+        })
+        .collect();
+    for project in &projects {
+        let project_sessions = app
+            .db
+            .list_sessions(project.id)
+            .map_err(|error| internal_error(format!("无法读取 session 列表：{error}")))?;
+        sessions.extend(
+            project_sessions
+                .into_iter()
+                .map(|session| session_info(session, &project.path)),
+        );
+    }
+    serde_json::to_value(AcpStateSnapshotResult {
+        revision: app.state_revision(),
+        providers,
+        projects: project_snapshots,
+        sessions,
+    })
+    .map_err(|error| internal_error(format!("无法编码 daemon 状态快照：{error}")))
+}
+
+async fn replay_events(
+    app: &Arc<AppState>,
+    extension: &ExtRequest,
+) -> agent_client_protocol::Result<serde_json::Value> {
+    let params: AcpEventReplayParams = decode_extension_params(extension)?;
+    let session_id = Uuid::parse_str(&params.session_id)
+        .map_err(|_| invalid_params(format!("无效的 Disco session ID：{}", params.session_id)))?;
+    let events = app
+        .event_journal
+        .replay(session_id, params.epoch.as_deref(), params.after_sequence)
+        .await;
+    serde_json::to_value(AcpEventReplayResult {
+        epoch: app.event_journal.epoch().to_string(),
+        events,
+    })
+    .map_err(|error| internal_error(format!("无法编码事件 replay：{error}")))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AcpCompactionResult {
@@ -492,7 +716,9 @@ async fn compact_session(
     }
 
     let compaction_id = Uuid::new_v4().to_string();
-    connection.send_notification(compaction_notification(
+    send_compaction_update(
+        app,
+        connection,
         SessionId::new(session_id.to_string()),
         session.provider_id.runtime_kind(),
         &CompactionUpdate {
@@ -503,7 +729,8 @@ async fn compact_session(
             summary: None,
             error_message: None,
         },
-    ))?;
+    )
+    .await?;
 
     let outcome = match crate::compaction_service::compact_session_with_id(
         app,
@@ -518,7 +745,9 @@ async fn compact_session(
                 crate::compaction_service::CompactionError::InvalidParams(message)
                 | crate::compaction_service::CompactionError::Internal(message) => message.clone(),
             };
-            connection.send_notification(compaction_notification(
+            send_compaction_update(
+                app,
+                connection,
                 SessionId::new(session_id.to_string()),
                 session.provider_id.runtime_kind(),
                 &CompactionUpdate {
@@ -529,11 +758,14 @@ async fn compact_session(
                     summary: None,
                     error_message: Some(error_message),
                 },
-            ))?;
+            )
+            .await?;
             return Err(error.into_acp_error());
         }
     };
-    connection.send_notification(compaction_notification(
+    send_compaction_update(
+        app,
+        connection,
         SessionId::new(session_id.to_string()),
         session.provider_id.runtime_kind(),
         &CompactionUpdate {
@@ -544,7 +776,8 @@ async fn compact_session(
             summary: outcome.summary.clone(),
             error_message: outcome.error_message.clone(),
         },
-    ))?;
+    )
+    .await?;
     serde_json::to_value(AcpCompactionResult {
         compaction: AcpCompactionInfo {
             id: outcome.id,
@@ -600,7 +833,53 @@ fn compaction_notification(
     CompactionNotification {
         session_id,
         update: serde_json::Value::Object(payload),
+        meta: None,
     }
+}
+
+fn event_meta(entry: &EventReplayEntry) -> Meta {
+    let mut meta = Meta::new();
+    meta.insert(META_EVENT_EPOCH.to_string(), serde_json::json!(entry.epoch));
+    meta.insert(
+        META_EVENT_SEQUENCE.to_string(),
+        serde_json::json!(entry.sequence),
+    );
+    meta
+}
+
+async fn send_session_update(
+    app: &AppState,
+    connection: &ConnectionTo<Client>,
+    session_id: SessionId,
+    update: SessionUpdate,
+) -> agent_client_protocol::Result<()> {
+    let update_value = serde_json::to_value(&update)
+        .map_err(|error| internal_error(format!("无法编码 session update：{error}")))?;
+    let entry = app
+        .event_journal
+        .record(parse_session_id(&session_id)?, update_value)
+        .await;
+    connection
+        .send_notification(SessionNotification::new(session_id, update).meta(event_meta(&entry)))
+}
+
+async fn send_compaction_update(
+    app: &AppState,
+    connection: &ConnectionTo<Client>,
+    session_id: SessionId,
+    runtime_kind: &str,
+    update: &CompactionUpdate,
+) -> agent_client_protocol::Result<()> {
+    let mut notification = compaction_notification(session_id, runtime_kind, update);
+    let entry = app
+        .event_journal
+        .record(
+            parse_session_id(&notification.session_id)?,
+            notification.update.clone(),
+        )
+        .await;
+    notification.meta = Some(event_meta(&entry));
+    connection.send_notification(notification)
 }
 
 async fn list_provider_models(
@@ -661,13 +940,18 @@ async fn create_session(
         )));
     }
 
+    let _state_guard = app.state_lock.lock().await;
+    let mut project_created = false;
     let project = match app.db.get_project_by_path(&cwd_string(&cwd)) {
         Ok(Some(project)) => project,
         Ok(None) => {
             let name = project_name(&cwd);
-            app.db
-                .create_project(&name, &cwd_string(&cwd))
-                .or_else(|_| {
+            match app.db.create_project(&name, &cwd_string(&cwd)) {
+                Ok(project) => {
+                    project_created = true;
+                    project
+                }
+                Err(_) => {
                     // 查询和插入之间可能已有其他 client 注册同一 workspace；重新读取项目，
                     // 不把重复路径竞态暴露给协议调用方。
                     app.db
@@ -675,8 +959,11 @@ async fn create_session(
                         .and_then(|project| {
                             project.ok_or_else(|| anyhow::anyhow!("workspace project disappeared"))
                         })
-                })
-                .map_err(|error| internal_error(format!("无法创建 workspace project：{error}")))?
+                        .map_err(|error| {
+                            internal_error(format!("无法创建 workspace project：{error}"))
+                        })?
+                }
+            }
         }
         Err(error) => {
             return Err(internal_error(format!(
@@ -685,36 +972,57 @@ async fn create_session(
         }
     };
 
-    if let Some(session_id) = requested_session_id
-        && app
-            .db
-            .get_session(session_id)
-            .map_err(|error| internal_error(format!("无法检查 Disco session：{error}")))?
-            .is_some()
-    {
+    let existing_session = match requested_session_id {
+        Some(session_id) => match app.db.get_session(session_id) {
+            Ok(session) => session,
+            Err(error) => {
+                if project_created {
+                    app.bump_state_revision();
+                }
+                return Err(internal_error(format!("无法检查 Disco session：{error}")));
+            }
+        },
+        None => None,
+    };
+    if let (Some(session_id), Some(_)) = (requested_session_id, existing_session) {
+        if project_created {
+            app.bump_state_revision();
+        }
         return Err(invalid_params(format!(
             "Disco session {session_id} 已经存在。"
         )));
     }
 
-    let session = match requested_session_id {
-        Some(session_id) => app.db.create_session_with_id(
+    let session_result = if let Some(session_id) = requested_session_id {
+        app.db.create_session_with_id(
             session_id,
             project.id,
             provider_config.provider_id,
             provider_config.vendor,
             &provider_config.model,
             None,
-        ),
-        None => app.db.create_session(
+        )
+    } else {
+        app.db.create_session(
             project.id,
             provider_config.provider_id,
             provider_config.vendor,
             &provider_config.model,
             None,
-        ),
-    }
-    .map_err(|error| internal_error(format!("无法创建 Disco session：{error}")))?;
+        )
+    };
+    let session = match session_result {
+        Ok(session) => session,
+        Err(error) => {
+            if project_created {
+                app.bump_state_revision();
+            }
+            return Err(internal_error(format!("无法创建 Disco session：{error}")));
+        }
+    };
+
+    app.bump_state_revision();
+    app.event_journal.clear_session(session.id).await;
 
     Ok(NewSessionResponse::new(session.id.to_string()))
 }
@@ -824,46 +1132,54 @@ fn list_sessions(
             .db
             .list_sessions(project.id)
             .map_err(|error| internal_error(format!("无法读取 session 列表：{error}")))?;
-        sessions.extend(project_sessions.into_iter().map(|session| {
-            let mut meta = Meta::new();
-            meta.insert(
-                META_PROJECT_ID.to_string(),
-                serde_json::json!(session.project_id),
-            );
-            meta.insert(
-                META_PROVIDER_ID.to_string(),
-                serde_json::json!(session.provider_id.to_string()),
-            );
-            meta.insert(
-                META_RUNTIME_KIND.to_string(),
-                serde_json::json!(session.provider_id.runtime_kind()),
-            );
-            meta.insert(
-                META_COMPACTION_MODE.to_string(),
-                serde_json::json!(match session.provider_id.runtime_kind() {
-                    "rig" => "local",
-                    _ => "native",
-                }),
-            );
-            meta.insert(META_VENDOR.to_string(), serde_json::json!(session.vendor));
-            meta.insert(META_MODEL.to_string(), serde_json::json!(session.model));
-            SessionInfo::new(session.id.to_string(), PathBuf::from(project.path.clone()))
-                .title(session.title)
-                .updated_at(Some(session.updated_at))
-                .meta(meta)
-        }));
+        sessions.extend(
+            project_sessions
+                .into_iter()
+                .map(|session| session_info(session, &project.path)),
+        );
     }
 
     Ok(ListSessionsResponse::new(sessions))
 }
 
+fn session_info(session: disco_protocol::types::Session, project_path: &str) -> SessionInfo {
+    let mut meta = Meta::new();
+    meta.insert(
+        META_PROJECT_ID.to_string(),
+        serde_json::json!(session.project_id),
+    );
+    meta.insert(
+        META_PROVIDER_ID.to_string(),
+        serde_json::json!(session.provider_id.to_string()),
+    );
+    meta.insert(
+        META_RUNTIME_KIND.to_string(),
+        serde_json::json!(session.provider_id.runtime_kind()),
+    );
+    meta.insert(
+        META_COMPACTION_MODE.to_string(),
+        serde_json::json!(match session.provider_id.runtime_kind() {
+            "rig" => "local",
+            _ => "native",
+        }),
+    );
+    meta.insert(META_VENDOR.to_string(), serde_json::json!(session.vendor));
+    meta.insert(META_MODEL.to_string(), serde_json::json!(session.model));
+    SessionInfo::new(session.id.to_string(), PathBuf::from(project_path))
+        .title(session.title)
+        .updated_at(Some(session.updated_at))
+        .meta(meta)
+}
+
 async fn delete_session(
     app: &Arc<AppState>,
+    prompt_mailbox: &SessionPromptMailbox,
     request: &DeleteSessionRequest,
 ) -> agent_client_protocol::Result<DeleteSessionResponse> {
     let session_id = parse_session_id(&request.session_id)?;
     match crate::session_service::delete_session(app, session_id).await {
         Ok(()) | Err(crate::session_service::SessionDeleteError::NotFound) => {
+            prompt_mailbox.close(session_id).await;
             Ok(DeleteSessionResponse::new())
         }
         Err(error) => Err(error.into_acp_error()),
@@ -872,6 +1188,7 @@ async fn delete_session(
 
 async fn close_session(
     app: &Arc<AppState>,
+    prompt_mailbox: &SessionPromptMailbox,
     request: &CloseSessionRequest,
 ) -> agent_client_protocol::Result<CloseSessionResponse> {
     let session_id = parse_session_id(&request.session_id)?;
@@ -879,6 +1196,7 @@ async fn close_session(
         let outcome = app.run_coordinator.cancel_run(run_id).await;
         debug!(%session_id, %run_id, ?outcome, "ACP session closed");
     }
+    prompt_mailbox.close(session_id).await;
     Ok(CloseSessionResponse::new())
 }
 
@@ -917,10 +1235,13 @@ async fn bridge_prompt(
             AgentOutput::TextDelta(delta) => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta)))
                     .message_id(assistant_message_id.clone());
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::AgentMessageChunk(chunk),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::Usage(usage) => {
                 accumulated_usage = Some(accumulate_usage(&accumulated_usage, &usage));
@@ -932,12 +1253,15 @@ async fn bridge_prompt(
                         "accumulated": accumulated_usage.clone(),
                     }),
                 );
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::UsageUpdate(
                         UsageUpdate::new(usage.total.max(0) as u64, 0).meta(meta),
                     ),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::ContextUsage { used, size } => {
                 let usage = TokenUsage {
@@ -952,27 +1276,36 @@ async fn bridge_prompt(
                     "disco/usage".to_string(),
                     serde_json::json!({ "current": usage }),
                 );
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::UsageUpdate(
                         UsageUpdate::new(used.max(0) as u64, size.max(0) as u64).meta(meta),
                     ),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::CompactionUpdate(update) => {
-                connection.send_notification(compaction_notification(
+                send_compaction_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     &runtime_kind,
                     &update,
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::ReasoningDelta(delta) => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta)))
                     .message_id(MessageId::new(format!("reasoning-{}", managed_run.run_id)));
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::AgentThoughtChunk(chunk),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::ToolStarted {
                 tool_call_id,
@@ -983,10 +1316,13 @@ async fn bridge_prompt(
                     .kind(tool_kind(&tool_name))
                     .status(ToolCallStatus::InProgress)
                     .raw_input(parse_tool_json(&arguments));
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::ToolCall(tool),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::ToolCompleted {
                 tool_call_id,
@@ -996,10 +1332,13 @@ async fn bridge_prompt(
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .raw_output(serde_json::Value::String(output));
-                connection.send_notification(SessionNotification::new(
+                send_session_update(
+                    &app,
+                    &connection,
                     session_id.clone(),
                     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields)),
-                ))?;
+                )
+                .await?;
             }
             AgentOutput::ApprovalWaiting {
                 approval_id,
@@ -1228,7 +1567,56 @@ mod tests {
     use super::*;
     use agent_client_protocol::Channel;
     use agent_client_protocol::schema::{ProtocolVersion, v1::ErrorCode};
+    use async_trait::async_trait;
+    use disco_core::{
+        AgentBackend, BackendCapabilities, BackendRun, BackendRunRequest, CompactionMode,
+    };
     use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct GatedBackend {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentBackend for GatedBackend {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                has_persistent_sessions: false,
+                can_delete_session: true,
+                compaction: CompactionMode::Unsupported,
+            }
+        }
+
+        async fn start_run(&self, request: BackendRunRequest) -> anyhow::Result<BackendRun> {
+            let run_number = self.runs.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if run_number == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let text = request
+                .messages
+                .last()
+                .map(|message| message.text.clone())
+                .unwrap_or_default();
+            Ok(BackendRun {
+                events: Box::pin(tokio_stream::iter([
+                    AgentOutput::TextDelta(text),
+                    AgentOutput::Completed,
+                ])),
+                backend_handle: None,
+            })
+        }
+
+        async fn delete_session(
+            &self,
+            _session: &disco_core::BackendSession,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn extracts_text_content_blocks() {
@@ -1351,6 +1739,7 @@ mod tests {
         let server_task = tokio::spawn(run_acp_server(app, server_channel));
 
         let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel::<SessionUpdate>();
+        let (sequence_tx, mut sequence_rx) = tokio::sync::mpsc::unbounded_channel::<Option<Meta>>();
         let (compaction_tx, mut compaction_rx) =
             tokio::sync::mpsc::unbounded_channel::<CompactionNotification>();
         let client = Client
@@ -1358,8 +1747,10 @@ mod tests {
             .on_receive_notification(
                 {
                     let updates_tx = updates_tx.clone();
+                    let sequence_tx = sequence_tx.clone();
                     async move |notification: SessionNotification, _connection| {
                         let _ = updates_tx.send(notification.update);
+                        let _ = sequence_tx.send(notification.meta);
                         Ok(())
                     }
                 },
@@ -1417,6 +1808,17 @@ mod tests {
             other => panic!("期望 agent_message_chunk，收到 {other:?}"),
         }
 
+        let sequence_meta = tokio::time::timeout(Duration::from_secs(1), sequence_rx.recv())
+            .await
+            .expect("等待事件序号超时")
+            .expect("事件序号流意外结束")
+            .expect("session update 应携带事件元数据");
+        assert!(sequence_meta.get(META_EVENT_EPOCH).is_some());
+        assert_eq!(
+            sequence_meta.get(META_EVENT_SEQUENCE),
+            Some(&serde_json::json!(1))
+        );
+
         let usage_update = tokio::time::timeout(Duration::from_secs(1), updates_rx.recv())
             .await
             .expect("等待 usage update 超时")
@@ -1461,6 +1863,61 @@ mod tests {
         assert!(!compaction.session_id.to_string().is_empty());
         assert_eq!(compaction.update["sessionUpdate"], "compaction_update");
         assert_eq!(compaction.update["compactionId"], "wire-compaction");
+    }
+
+    #[tokio::test]
+    async fn acp_session_prompts_are_serialized_by_mailbox() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let backend = Arc::new(GatedBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+            runs: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (app, _session_id) = crate::run_service::test_support::make_test_app(backend);
+        let (server_channel, client_channel) = Channel::duplex();
+        let server_task = tokio::spawn(run_acp_server(app, server_channel));
+
+        let client = Client.builder().connect_with(
+            client_channel,
+            async move |connection: ConnectionTo<Agent>| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session_id = connection
+                    .send_request(NewSessionRequest::new("/tmp/disco-wire-test"))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let first = connection
+                    .send_request(PromptRequest::new(
+                        session_id.clone(),
+                        vec![ContentBlock::Text(TextContent::new("first"))],
+                    ))
+                    .block_task();
+                tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                    .await
+                    .expect("第一个 prompt 未进入 backend");
+                let second = connection
+                    .send_request(PromptRequest::new(
+                        session_id,
+                        vec![ContentBlock::Text(TextContent::new("second"))],
+                    ))
+                    .block_task();
+                release.notify_one();
+
+                assert_eq!(first.await?.stop_reason, StopReason::EndTurn);
+                assert_eq!(second.await?.stop_reason, StopReason::EndTurn);
+                Ok(())
+            },
+        );
+
+        let client_result = tokio::time::timeout(Duration::from_secs(5), client).await;
+        server_task.abort();
+        client_result
+            .expect("ACP mailbox client 超时")
+            .expect("ACP mailbox client 失败");
     }
 
     #[tokio::test]

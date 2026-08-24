@@ -83,9 +83,15 @@ pub async fn delete_session(
         .await
         .map_err(|error| SessionDeleteError::BackendDeleteFailed(error.to_string()))?;
 
-    app.db
-        .delete_session(session_id)
-        .map_err(|error| SessionDeleteError::Internal(error.to_string()))
+    {
+        let _state_guard = app.state_lock.lock().await;
+        app.db
+            .delete_session(session_id)
+            .map_err(|error| SessionDeleteError::Internal(error.to_string()))?;
+        app.bump_state_revision();
+    }
+    app.event_journal.clear_session(session_id).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,7 +149,7 @@ mod tests {
             .get_compaction_provider(&session.provider_id)
             .await
             .unwrap();
-        app.set_provider_runtime(
+        app.set_provider_runtime_locked(
             session.provider_id.clone(),
             ProviderRuntime {
                 backend: Arc::new(FailingDeleteBackend),

@@ -85,6 +85,20 @@ enum ACPRequestID: Codable, Hashable, Sendable, CustomStringConvertible {
 struct ACPSessionUpdate: Sendable {
     let sessionID: String
     let update: DaemonJSONValue
+    let eventEpoch: String?
+    let eventSequence: UInt64?
+
+    init(
+        sessionID: String,
+        update: DaemonJSONValue,
+        eventEpoch: String? = nil,
+        eventSequence: UInt64? = nil
+    ) {
+        self.sessionID = sessionID
+        self.update = update
+        self.eventEpoch = eventEpoch
+        self.eventSequence = eventSequence
+    }
 }
 
 /// ACP agent 请求 App 决定工具权限。
@@ -122,6 +136,32 @@ struct ACPLoadSessionResult: Decodable, Sendable {}
 struct ACPListSessionsResult: Decodable, Sendable {
     let sessions: [ACPSessionInfo]
     let nextCursor: String?
+}
+
+struct ACPStateProject: Decodable, Sendable {
+    let id: UUID
+    let name: String
+    let path: String
+    let createdAt: String
+}
+
+struct ACPStateSnapshotResult: Decodable, Sendable {
+    let revision: UInt64
+    let providers: [ACPProviderEntry]
+    let projects: [ACPStateProject]
+    let sessions: [ACPSessionInfo]
+}
+
+struct ACPEventReplayEntry: Decodable, Sendable {
+    let sessionId: String
+    let epoch: String
+    let sequence: UInt64
+    let update: DaemonJSONValue
+}
+
+struct ACPEventReplayResult: Decodable, Sendable {
+    let epoch: String
+    let events: [ACPEventReplayEntry]
 }
 
 struct ACPSessionMessagesResult: Decodable, Sendable {
@@ -278,6 +318,12 @@ private struct ACPLoadSessionParams: Encodable, Sendable {
 private struct ACPListSessionsParams: Encodable, Sendable {
     let cwd: String?
     let cursor: String?
+}
+
+private struct ACPEventReplayParams: Encodable, Sendable {
+    let sessionId: String
+    let epoch: String?
+    let afterSequence: UInt64
 }
 
 private struct ACPSessionIDParams: Encodable, Sendable {
@@ -558,6 +604,30 @@ final class ACPDaemonClient {
             "session/list",
             params: ACPListSessionsParams(cwd: cwd, cursor: nil),
             as: ACPListSessionsResult.self
+        )
+    }
+
+    func stateSnapshot() async throws -> ACPStateSnapshotResult {
+        try await request(
+            "_disco/state/snapshot",
+            params: ACPEmptyParams(),
+            as: ACPStateSnapshotResult.self
+        )
+    }
+
+    func replayEvents(
+        sessionID: String,
+        epoch: String?,
+        afterSequence: UInt64
+    ) async throws -> ACPEventReplayResult {
+        try await request(
+            "_disco/event/replay",
+            params: ACPEventReplayParams(
+                sessionId: sessionID,
+                epoch: epoch,
+                afterSequence: afterSequence
+            ),
+            as: ACPEventReplayResult.self
         )
     }
 
@@ -863,9 +933,13 @@ final class ACPDaemonClient {
                 if let id { sendInvalidIncomingRequestResponse(id: id) }
                 return
             }
-            sessionUpdateContinuation?.yield(
-                ACPSessionUpdate(sessionID: sessionID, update: update)
-            )
+            sessionUpdateContinuation?.yield(ACPSessionUpdate(
+                sessionID: sessionID,
+                update: update,
+                eventEpoch: object["_meta"]?.objectValue?["disco/eventEpoch"]?.stringValue,
+                eventSequence: object["_meta"]?.objectValue?["disco/eventSequence"]?.numberValue
+                    .flatMap { UInt64($0) }
+            ))
         case "_disco/session/compaction":
             guard let params,
                   let object = params.objectValue,
@@ -873,9 +947,13 @@ final class ACPDaemonClient {
                   let update = object["update"] else {
                 return
             }
-            sessionUpdateContinuation?.yield(
-                ACPSessionUpdate(sessionID: sessionID, update: update)
-            )
+            sessionUpdateContinuation?.yield(ACPSessionUpdate(
+                sessionID: sessionID,
+                update: update,
+                eventEpoch: object["_meta"]?.objectValue?["disco/eventEpoch"]?.stringValue,
+                eventSequence: object["_meta"]?.objectValue?["disco/eventSequence"]?.numberValue
+                    .flatMap { UInt64($0) }
+            ))
         case "session/request_permission":
             guard let id, let params else { return }
             do {

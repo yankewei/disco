@@ -87,11 +87,13 @@ pub async fn compact_session_with_id(
             .get(stored_messages.len().saturating_sub(7))
             .or_else(|| stored_messages.last())
         {
+            let _state_guard = app.state_lock.lock().await;
             app.db
                 .save_context_checkpoint(session_id, boundary.id, &result.summary)
                 .map_err(|error| {
                     CompactionError::Internal(format!("保存上下文 checkpoint 失败：{error}"))
                 })?;
+            app.bump_state_revision();
         }
     }
 

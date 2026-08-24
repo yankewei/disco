@@ -421,6 +421,9 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
     private var runningStateSentForSession: Set<String> = []
     private var promptTasks: [UUID: Task<Void, Never>] = [:]
     private var approvalRoutes: [UUID: ACPApprovalRoute] = [:]
+    private var eventCursors: [String: (epoch: String, sequence: UInt64)] = [:]
+    private var pendingSequencedUpdates: [String: [ACPSessionUpdate]] = [:]
+    private var replayTasks: [String: Task<Void, Never>] = [:]
 
     init(client: ACPDaemonClient) {
         self.client = client
@@ -430,6 +433,9 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
         updateTask?.cancel()
         permissionTask?.cancel()
         for task in promptTasks.values {
+            task.cancel()
+        }
+        for task in replayTasks.values {
             task.cancel()
         }
     }
@@ -511,6 +517,9 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
 
     func deleteSession(sessionID: UUID) async throws {
         try await client.deleteSession(sessionID: sessionID.uuidString)
+        eventCursors[sessionID.uuidString] = nil
+        pendingSequencedUpdates[sessionID.uuidString] = nil
+        replayTasks.removeValue(forKey: sessionID.uuidString)?.cancel()
     }
 
     func compactContext(sessionID: UUID) async throws {
@@ -545,6 +554,11 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
     }
 
     private func handleSessionUpdate(_ update: ACPSessionUpdate) {
+        if let eventEpoch = update.eventEpoch, let eventSequence = update.eventSequence {
+            guard acceptSequencedUpdate(update, epoch: eventEpoch, sequence: eventSequence) else {
+                return
+            }
+        }
         let updateKind = update.update.objectValue?["sessionUpdate"]?.stringValue
         let isCompactionUpdate = updateKind == "compaction_update"
         guard isCompactionUpdate || runIDBySessionID[update.sessionID] != nil else { return }
@@ -559,6 +573,73 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
             shouldEmitRunningState: isCompactionUpdate ? false : shouldEmitRunningState
         ) {
             emit(event)
+        }
+    }
+
+    private func acceptSequencedUpdate(
+        _ update: ACPSessionUpdate,
+        epoch: String,
+        sequence: UInt64
+    ) -> Bool {
+        guard let cursor = eventCursors[update.sessionID] else {
+            eventCursors[update.sessionID] = (epoch, sequence)
+            return true
+        }
+        guard cursor.epoch == epoch else {
+            // daemon 重启后 epoch 改变；新 epoch 从 1 重新计数，快照负责恢复权威状态。
+            eventCursors[update.sessionID] = (epoch, sequence)
+            pendingSequencedUpdates[update.sessionID] = nil
+            return true
+        }
+        if sequence <= cursor.sequence {
+            return false
+        }
+        if sequence > cursor.sequence + 1 {
+            pendingSequencedUpdates[update.sessionID, default: []].append(update)
+            startReplay(sessionID: update.sessionID, epoch: epoch, afterSequence: cursor.sequence)
+            return false
+        }
+        eventCursors[update.sessionID] = (epoch, sequence)
+        return true
+    }
+
+    private func startReplay(sessionID: String, epoch: String, afterSequence: UInt64) {
+        guard replayTasks[sessionID] == nil else { return }
+        replayTasks[sessionID] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { replayTasks[sessionID] = nil }
+            do {
+                let result = try await client.replayEvents(
+                    sessionID: sessionID,
+                    epoch: epoch,
+                    afterSequence: afterSequence
+                )
+                if let first = result.events.first,
+                   let cursor = eventCursors[sessionID],
+                   first.sequence > cursor.sequence + 1
+                {
+                    // journal 窗口已滚动，无法补齐更早事件；从最早可用事件继续，
+                    // 权威消息状态由 snapshot/持久化历史兜底。
+                    eventCursors[sessionID] = (result.epoch, first.sequence - 1)
+                }
+                for replayed in result.events {
+                    handleSessionUpdate(ACPSessionUpdate(
+                        sessionID: replayed.sessionId,
+                        update: replayed.update,
+                        eventEpoch: replayed.epoch,
+                        eventSequence: replayed.sequence
+                    ))
+                }
+            } catch {
+                // replay 失败时，后续 live event 仍会触发下一次 gap 检测；不伪造事件。
+                return
+            }
+            let pending = pendingSequencedUpdates.removeValue(forKey: sessionID) ?? []
+            for pendingUpdate in pending.sorted(by: {
+                ($0.eventSequence ?? 0) < ($1.eventSequence ?? 0)
+            }) {
+                handleSessionUpdate(pendingUpdate)
+            }
         }
     }
 

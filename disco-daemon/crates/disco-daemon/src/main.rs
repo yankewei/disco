@@ -203,6 +203,9 @@ async fn main() {
         run_coordinator: RunCoordinator::new(),
         executor,
         shutdown: shutdown.clone(),
+        state_lock: Mutex::new(()),
+        state_revision: std::sync::atomic::AtomicU64::new(0),
+        event_journal: crate::daemon::EventJournal::new(),
     });
 
     if let Err(error) = acp::run_acp_stdio_server(app).await {

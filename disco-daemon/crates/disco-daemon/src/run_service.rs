@@ -69,7 +69,15 @@ pub async fn start_run(
         }
     };
 
-    if let Err(error) = app.db.add_message(session_id, "user", &text) {
+    let user_message_result = {
+        let _state_guard = app.state_lock.lock().await;
+        let result = app.db.add_message(session_id, "user", &text);
+        if result.is_ok() {
+            app.bump_state_revision();
+        }
+        result
+    };
+    if let Err(error) = user_message_result {
         app.run_coordinator.finish_run(run_id).await;
         return Err(StartRunError::Internal(format!(
             "保存用户消息失败：{error}"
@@ -132,9 +140,17 @@ pub async fn start_run(
             }
         };
 
-        if let Some(handle) = backend_run.backend_handle.as_deref()
-            && let Err(error) = app.db.set_session_backend_handle(session_id, handle)
-        {
+        let backend_handle_result = if let Some(handle) = backend_run.backend_handle.as_deref() {
+            let _state_guard = app.state_lock.lock().await;
+            let result = app.db.set_session_backend_handle(session_id, handle);
+            if result.is_ok() {
+                app.bump_state_revision();
+            }
+            result
+        } else {
+            Ok(())
+        };
+        if let Err(error) = backend_handle_result {
             app.run_coordinator.cancel_run(run_id).await;
             let _ = event_tx.send(AgentOutput::Failed(error.to_string())).await;
             app.run_coordinator.finish_run(run_id).await;
@@ -289,21 +305,32 @@ async fn save_run_transcript(
     if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
         return;
     }
-    if let Err(error) = app
-        .db
-        .add_assistant_message(session_id, text, reasoning, tool_calls)
+    let mut changed = false;
     {
-        tracing::error!(%error, "保存 assistant 消息失败");
-    }
-    for call in tool_calls {
-        let Some(output) = call.output.as_deref() else {
-            continue;
-        };
+        let _state_guard = app.state_lock.lock().await;
         if let Err(error) = app
             .db
-            .add_tool_result_message(session_id, &call.id, &call.name, output)
+            .add_assistant_message(session_id, text, reasoning, tool_calls)
         {
-            tracing::error!(%error, call_id = %call.id, "保存 tool result 失败");
+            tracing::error!(%error, "保存 assistant 消息失败");
+        } else {
+            changed = true;
+        }
+        for call in tool_calls {
+            let Some(output) = call.output.as_deref() else {
+                continue;
+            };
+            if let Err(error) = app
+                .db
+                .add_tool_result_message(session_id, &call.id, &call.name, output)
+            {
+                tracing::error!(%error, call_id = %call.id, "保存 tool result 失败");
+            } else {
+                changed = true;
+            }
+        }
+        if changed {
+            app.bump_state_revision();
         }
     }
 }
@@ -464,6 +491,9 @@ pub(crate) mod test_support {
             run_coordinator: disco_core::RunCoordinator::new(),
             executor,
             shutdown: CancellationToken::new(),
+            state_lock: Mutex::new(()),
+            state_revision: std::sync::atomic::AtomicU64::new(0),
+            event_journal: crate::daemon::EventJournal::new(),
         });
         (app, session.id)
     }

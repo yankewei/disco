@@ -149,10 +149,11 @@ pub async fn configure_provider(
         .map_err(|error| ProviderError::InvalidParams(error.to_string()))?
     };
 
+    let _state_guard = app.state_lock.lock().await;
     app.db
         .save_provider_config(&config)
         .map_err(|error| ProviderError::Internal(format!("保存 Provider 配置失败：{error}")))?;
-    app.set_provider_runtime(config.provider_id.clone(), runtime)
+    app.set_provider_runtime_locked(config.provider_id.clone(), runtime)
         .await;
 
     Ok(disco_protocol::ProviderConfigureResult {

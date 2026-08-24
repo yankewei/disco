@@ -104,6 +104,8 @@ final class AppState: ObservableObject {
     @Published private(set) var daemonConnectionState: ACPDaemonClient.State = .disconnected
     /// 守护进程是否可用（已连接并完成初始化握手）。
     @Published private(set) var isDaemonAvailable = false
+    /// daemon 权威状态快照的 revision；本地 SwiftData 仅作为该快照的投影缓存。
+    @Published private(set) var daemonStateRevision: UInt64 = 0
 
     var selectedConversation: ConversationSession? {
         guard let selectedConversationID else { return conversations.first }
@@ -387,6 +389,7 @@ final class AppState: ObservableObject {
                     if self.providerSyncError?.vendor == syncVendor {
                         self.providerSyncError = nil
                     }
+                    await self.refreshDaemonStateSnapshot()
                 } catch {
                     self.providerSyncError = ProviderSyncError(
                         vendor: syncVendor,
@@ -1111,6 +1114,7 @@ final class AppState: ObservableObject {
                 if self.providerSyncError?.vendor == vendor {
                     self.providerSyncError = nil
                 }
+                await self.refreshDaemonStateSnapshot()
             } catch {
                 self.providerSyncError = ProviderSyncError(
                     vendor: vendor,
@@ -1254,6 +1258,12 @@ final class AppState: ObservableObject {
                         selectedConversationID = conversation.id
                     }
                     conversation.store.handleDaemonNotification(event)
+                    if event.eventName == "run.completed"
+                        || event.eventName == "run.cancelled"
+                        || event.eventName == "run.failed"
+                    {
+                        await refreshDaemonStateSnapshot(reloadSessionID: conversation.id)
+                    }
                 }
                 guard !Task.isCancelled, let self else { return }
                 daemonConnectionState = .disconnected
@@ -1275,29 +1285,54 @@ final class AppState: ObservableObject {
     }
 
     private func synchronizeDaemonConversations() async {
-        // 先从 daemon 发现本地快照缺失的 session，避免 session/list 只被当成存在性检查。
-        if let serverSessions = try? await acpDaemonClient.listSessions().sessions {
-            for serverSession in serverSessions {
-                guard let sessionID = UUID(uuidString: serverSession.sessionId),
-                      let projectID = serverSession.projectID,
-                      projects.contains(where: { $0.id == projectID }),
-                      !deletedRemoteSessionIDs.contains(sessionID),
-                      !conversations.contains(where: { $0.id == sessionID }) else { continue }
-                conversations.append(
-                    makeConversation(
-                        id: sessionID,
-                        projectID: projectID,
-                        providerID: serverSession.providerID,
-                        runtimeKind: serverSession.runtimeKind
-                    )
-                )
-            }
+        // 先从 daemon 获取一次带 revision 的权威快照，避免把多个 list 请求拼成不一致状态。
+        if let snapshot = try? await acpDaemonClient.stateSnapshot() {
+            daemonStateRevision = snapshot.revision
+            importDaemonSessions(snapshot.sessions)
+        } else if let serverSessions = try? await acpDaemonClient.listSessions().sessions {
+            // 兼容旧 daemon；升级后的 daemon 会优先走 state/snapshot。
+            importDaemonSessions(serverSessions)
         }
 
         // 所有本地会话都与 daemon 对齐：已有 daemon 会话恢复权威历史，没有的才新建。
         for conversation in conversations {
             await registerDaemonConversation(conversation)
         }
+    }
+
+    private func importDaemonSessions(_ serverSessions: [ACPSessionInfo]) {
+        for serverSession in serverSessions {
+            guard let sessionID = UUID(uuidString: serverSession.sessionId),
+                  let projectID = serverSession.projectID,
+                  projects.contains(where: { $0.id == projectID }),
+                  !deletedRemoteSessionIDs.contains(sessionID),
+                  !conversations.contains(where: { $0.id == sessionID }) else { continue }
+            conversations.append(
+                makeConversation(
+                    id: sessionID,
+                    projectID: projectID,
+                    providerID: serverSession.providerID,
+                    runtimeKind: serverSession.runtimeKind
+                )
+            )
+        }
+    }
+
+    /// 运行结束后刷新 revision；同时从 daemon 恢复当前会话的完整消息，修复 replay 窗口
+    /// 截断或连接抖动造成的 UI 增量缺失。
+    private func refreshDaemonStateSnapshot(reloadSessionID: UUID? = nil) async {
+        guard useDaemon else { return }
+        guard let snapshot = try? await acpDaemonClient.stateSnapshot() else { return }
+        if snapshot.revision != daemonStateRevision {
+            daemonStateRevision = snapshot.revision
+            importDaemonSessions(snapshot.sessions)
+        }
+        guard let reloadSessionID,
+              let conversation = conversations.first(where: { $0.id == reloadSessionID }),
+              let storedMessages = try? await acpDaemonClient.listMessages(
+                  sessionID: reloadSessionID.uuidString
+              ) else { return }
+        conversation.store.restoreMessages(restoreDaemonMessages(storedMessages))
     }
 
     /// 对齐会话与 daemon：注册缺失的会话，并把 daemon 的权威历史恢复到本地。
