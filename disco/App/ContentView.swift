@@ -164,6 +164,23 @@ private struct ConversationSidebar: View {
         VStack(spacing: 0) {
             sidebarHeader
 
+            Button(action: openProject) {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder.badge.plus")
+                        .frame(width: 20)
+
+                    Text("添加项目")
+                        .font(.callout.weight(.medium))
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            .help("把一个文件夹作为项目加入 Disco（⌘O）")
+
             ScrollViewReader { proxy in
                 List {
                     ForEach(appState.projects) { project in
@@ -228,23 +245,6 @@ private struct ConversationSidebar: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .help(storageError)
             }
-
-            Button(action: openProject) {
-                HStack(spacing: 10) {
-                    Image(systemName: "folder.badge.plus")
-                        .frame(width: 20)
-
-                    Text("添加项目")
-                        .font(.callout.weight(.medium))
-
-                    Spacer(minLength: 4)
-                }
-                .contentShape(Rectangle())
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-            }
-            .buttonStyle(.plain)
-            .help("把一个文件夹作为项目加入 Disco（⌘O）")
 
             Divider()
 
@@ -327,13 +327,6 @@ private struct ConversationSidebar: View {
                     }
                 }
 
-                Divider()
-
-                Button {
-                    openProject()
-                } label: {
-                    Label("添加项目…", systemImage: "folder.badge.plus")
-                }
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "plus")

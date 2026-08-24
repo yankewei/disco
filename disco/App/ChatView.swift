@@ -13,6 +13,7 @@ struct ChatView: View {
     @State private var shouldFollowLatestMessage = true
     @State private var isUserScrolling = false
     @State private var selectedToolCallID: String?
+    @State private var expandedTurnIDs: Set<UUID> = []
     /// 防抖滚动任务：合并同一帧内的多次滚动请求，避免在 onChange 调用栈内同步 scrollTo
     @State private var scrollTask: Task<Void, Never>?
 
@@ -83,6 +84,81 @@ struct ChatView: View {
         return nil
     }
 
+    private var turns: [ChatTurn] {
+        Self.makeTurns(from: store.messages)
+    }
+
+    private func isTurnStreaming(_ turn: ChatTurn) -> Bool {
+        guard store.isStreaming else { return false }
+        return turn.assistantMessages.contains { $0.id == store.messages.last?.id }
+    }
+
+    private func shouldShowActivity(for turn: ChatTurn) -> Bool {
+        isTurnStreaming(turn)
+            || hasTurnError(turn)
+            || expandedTurnIDs.contains(turn.id)
+    }
+
+    private func hasTurnError(_ turn: ChatTurn) -> Bool {
+        guard store.errorMessage != nil, let lastMessageID = store.messages.last?.id else {
+            return false
+        }
+        return turn.userMessage?.id == lastMessageID
+            || turn.assistantMessages.contains { $0.id == lastMessageID }
+    }
+
+    @ViewBuilder
+    private func assistantMessageRow(_ message: ChatMessage, showActivity: Bool) -> some View {
+        if showActivity || !message.text.isEmpty {
+            MessageRow(
+                message: message,
+                isStreaming: store.isStreaming && message.id == store.messages.last?.id,
+                errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
+                canRetry: store.canRetry,
+                retry: store.retryLastMessage,
+                dismissError: store.dismissError,
+                selectedToolCallID: selectedToolCallID,
+                selectToolCall: { toolCallID in
+                    withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                        selectedToolCallID = toolCallID
+                    }
+                },
+                showActivity: showActivity
+            )
+            .id(message.id)
+        }
+    }
+
+    private static func makeTurns(from messages: [ChatMessage]) -> [ChatTurn] {
+        var turns: [ChatTurn] = []
+        var index = 0
+
+        while index < messages.count {
+            let message = messages[index]
+            if message.role == .user {
+                var assistants: [ChatMessage] = []
+                var nextIndex = index + 1
+                while nextIndex < messages.count, messages[nextIndex].role == .assistant {
+                    assistants.append(messages[nextIndex])
+                    nextIndex += 1
+                }
+                turns.append(ChatTurn(id: message.id, userMessage: message, assistantMessages: assistants))
+                index = nextIndex
+            } else {
+                var assistants = [message]
+                var nextIndex = index + 1
+                while nextIndex < messages.count, messages[nextIndex].role == .assistant {
+                    assistants.append(messages[nextIndex])
+                    nextIndex += 1
+                }
+                turns.append(ChatTurn(id: message.id, userMessage: nil, assistantMessages: assistants))
+                index = nextIndex
+            }
+        }
+
+        return turns
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             ZStack {
@@ -102,22 +178,45 @@ struct ChatView: View {
                                     max(height - 150, 320)
                                 }
                             } else {
-                                ForEach(store.messages) { message in
-                                    MessageRow(
-                                        message: message,
-                                        isStreaming: store.isStreaming && message.id == store.messages.last?.id,
-                                        errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
-                                        canRetry: store.canRetry,
-                                        retry: store.retryLastMessage,
-                                        dismissError: store.dismissError,
-                                        selectedToolCallID: selectedToolCallID,
-                                        selectToolCall: { toolCallID in
-                                            withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
-                                                selectedToolCallID = toolCallID
+                                ForEach(turns) { turn in
+                                    if let userMessage = turn.userMessage {
+                                        let isLastMessage = userMessage.id == store.messages.last?.id
+                                        MessageRow(
+                                            message: userMessage,
+                                            isStreaming: false,
+                                            errorMessage: isLastMessage ? store.errorMessage : nil,
+                                            canRetry: isLastMessage && store.canRetry,
+                                            retry: isLastMessage ? store.retryLastMessage : {},
+                                            dismissError: isLastMessage ? store.dismissError : {},
+                                            selectedToolCallID: selectedToolCallID,
+                                            selectToolCall: { _ in },
+                                            showActivity: true
+                                        )
+                                        .id(userMessage.id)
+                                    }
+
+                                    let showActivity = shouldShowActivity(for: turn)
+                                    if turn.hasActivity && !isTurnStreaming(turn) && !hasTurnError(turn) {
+                                        TurnActivitySummaryRow(
+                                            activityCount: turn.activityCount,
+                                            isExpanded: showActivity,
+                                            toggle: {
+                                                withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                                                    if showActivity {
+                                                        expandedTurnIDs.remove(turn.id)
+                                                        selectedToolCallID = nil
+                                                    } else {
+                                                        expandedTurnIDs.insert(turn.id)
+                                                    }
+                                                }
                                             }
-                                        }
-                                    )
-                                    .id(message.id)
+                                        )
+                                        .id("activity-summary-" + turn.id.uuidString)
+                                    }
+
+                                    ForEach(turn.assistantMessages) { message in
+                                        assistantMessageRow(message, showActivity: showActivity)
+                                    }
                                 }
                             }
 
@@ -509,6 +608,76 @@ private struct EmptyConversationView: View {
     }
 }
 
+private struct ChatTurn: Identifiable {
+    let id: UUID
+    let userMessage: ChatMessage?
+    let assistantMessages: [ChatMessage]
+
+    var activityCount: Int {
+        assistantMessages.reduce(0) { count, message in
+            count + message.parts.reduce(0) { count, part in
+                switch part {
+                case let .reasoning(reasoning) where !reasoning.isEmpty:
+                    return count + 1
+                case .reasoning:
+                    return count
+                case .hostedTool, .toolCall:
+                    return count + 1
+                case .text:
+                    return count
+                }
+            }
+        }
+    }
+
+    var hasActivity: Bool {
+        activityCount > 0
+    }
+}
+
+private struct TurnActivitySummaryRow: View {
+    let activityCount: Int
+    let isExpanded: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 9) {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 1)
+
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.secondary)
+
+                Text("已完成")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+
+                Text("· " + String(activityCount) + " 个步骤")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.tertiary)
+
+                Rectangle()
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 1)
+            }
+            .contentShape(Rectangle())
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isExpanded ? "收起本轮处理过程" : "展开本轮处理过程")
+        .accessibilityHint("显示思考和工具调用详情")
+    }
+}
+
 private struct MessageRow: View {
     let message: ChatMessage
     let isStreaming: Bool
@@ -518,8 +687,22 @@ private struct MessageRow: View {
     let dismissError: () -> Void
     let selectedToolCallID: String?
     let selectToolCall: (String) -> Void
+    let showActivity: Bool
 
     @State private var isHovered = false
+
+    /// 只有时间线最后一个 part 是 reasoning 时，它才代表当前正在进行的思考阶段。
+    /// 工具调用会把后续 reasoning 切成新的 part，之前的 reasoning 应显示为摘要。
+    private var activeReasoningPartIndex: Int? {
+        guard showActivity, isStreaming, message.text.isEmpty,
+              let lastIndex = message.parts.indices.last else {
+            return nil
+        }
+        guard case let .reasoning(reasoning) = message.parts[lastIndex], !reasoning.isEmpty else {
+            return nil
+        }
+        return lastIndex
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -555,7 +738,7 @@ private struct MessageRow: View {
                             }
                         }
 
-                        ForEach(Array(message.parts.enumerated()), id: \.offset) { _, part in
+                        ForEach(Array(message.parts.enumerated()), id: \.offset) { partIndex, part in
                             switch part {
                             case let .text(content):
                                 if !content.text.isEmpty {
@@ -564,31 +747,32 @@ private struct MessageRow: View {
                                     }
                                 }
                             case let .reasoning(reasoning):
-                                ActivityTimelineRow(
-                                    kind: .thinking(
-                                        isActive: isStreaming
-                                            && message.text.isEmpty
-                                            && !message.hasRunningToolCall
-                                    )
-                                ) {
-                                    ReasoningDisclosure(
-                                        reasoning: reasoning,
-                                        isThinking: isStreaming
-                                            && message.text.isEmpty
-                                            && !message.hasRunningToolCall
-                                    )
+                                if showActivity {
+                                    let isThinking = activeReasoningPartIndex == partIndex
+                                    ActivityTimelineRow(
+                                        kind: .thinking(isActive: isThinking)
+                                    ) {
+                                        ReasoningDisclosure(
+                                            reasoning: reasoning,
+                                            isThinking: isThinking
+                                        )
+                                    }
                                 }
                             case let .toolCall(call):
-                                ActivityTimelineRow(kind: .tool(isCompleted: call.isCompleted)) {
-                                    ToolCallRow(
-                                        call: call,
-                                        isSelected: selectedToolCallID == call.id,
-                                        select: { selectToolCall(call.id) }
-                                    )
+                                if showActivity {
+                                    ActivityTimelineRow(kind: .tool(isCompleted: call.isCompleted)) {
+                                        ToolCallRow(
+                                            call: call,
+                                            isSelected: selectedToolCallID == call.id,
+                                            select: { selectToolCall(call.id) }
+                                        )
+                                    }
                                 }
                             case let .hostedTool(tool):
-                                ActivityTimelineRow(kind: .web(isCompleted: tool.status == .completed)) {
-                                    HostedWebSearchRow(tool: tool, isStreaming: isStreaming)
+                                if showActivity {
+                                    ActivityTimelineRow(kind: .web(isCompleted: tool.status == .completed)) {
+                                        HostedWebSearchRow(tool: tool, isStreaming: isStreaming)
+                                    }
                                 }
                             }
                         }
