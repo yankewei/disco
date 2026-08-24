@@ -19,9 +19,11 @@ use agent_client_protocol::schema::v1::{
     TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     UsageUpdate,
 };
-use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Responder, Stdio};
-use disco_core::AgentOutput;
-use disco_protocol::types::TokenUsage;
+use agent_client_protocol::{
+    Agent, Client, ConnectTo, ConnectionTo, JsonRpcNotification, Responder, Stdio,
+};
+use disco_core::{AgentOutput, CompactionUpdate};
+use disco_protocol::types::{CompactionStatus, TokenUsage};
 use disco_protocol::{ApprovalKind, ApprovalRequestedData};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -33,6 +35,7 @@ use crate::run_service::accumulate_usage;
 const META_PROVIDER_ID: &str = "disco/providerId";
 const META_SESSION_ID: &str = "disco/sessionId";
 const META_RUNTIME_KIND: &str = "disco/runtimeKind";
+const META_COMPACTION_MODE: &str = "disco/compactionMode";
 const META_PROJECT_ID: &str = "disco/projectId";
 const META_VENDOR: &str = "disco/vendor";
 const META_MODEL: &str = "disco/model";
@@ -44,6 +47,14 @@ const ACP_SESSION_COMPACT_METHOD: &str = "disco/session/compact";
 const META_APPROVAL_ID: &str = "disco/approvalId";
 const META_APPROVAL_SCOPE: &str = "disco/approvalScope";
 const META_APPROVAL_FINGERPRINT: &str = "disco/approvalFingerprint";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_disco/session/compaction")]
+#[serde(rename_all = "camelCase")]
+struct CompactionNotification {
+    session_id: SessionId,
+    update: serde_json::Value,
+}
 
 /// 通过 stdin/stdout 运行 ACP v1 server。
 ///
@@ -221,11 +232,11 @@ where
                 let app = app.clone();
                 async move |request: ClientRequest,
                             responder: Responder<serde_json::Value>,
-                            _connection: ConnectionTo<Client>| {
+                            connection: ConnectionTo<Client>| {
                     let ClientRequest::ExtMethodRequest(extension) = request else {
                         return Err(agent_client_protocol::Error::method_not_found());
                     };
-                    let result = handle_disco_extension(&app, &extension).await?;
+                    let result = handle_disco_extension(&app, &extension, &connection).await?;
                     responder.respond(result)
                 }
             },
@@ -351,13 +362,14 @@ impl From<disco_protocol::ModelCatalogEntry> for AcpModelCatalogEntry {
 async fn handle_disco_extension(
     app: &Arc<AppState>,
     extension: &ExtRequest,
+    connection: &ConnectionTo<Client>,
 ) -> agent_client_protocol::Result<serde_json::Value> {
     match extension.method.as_ref() {
         ACP_PROVIDER_CONFIGURE_METHOD => configure_provider(app, extension).await,
         ACP_PROVIDER_LIST_METHOD => list_providers(app).await,
         ACP_PROVIDER_MODELS_METHOD => list_provider_models(app, extension).await,
         ACP_SESSION_MESSAGES_METHOD => list_session_messages(app, extension).await,
-        ACP_SESSION_COMPACT_METHOD => compact_session(app, extension).await,
+        ACP_SESSION_COMPACT_METHOD => compact_session(app, extension, connection).await,
         method => Err(agent_client_protocol::Error::method_not_found()
             .data(format!("未知的 Disco ACP extension：{method}"))),
     }
@@ -445,6 +457,8 @@ struct AcpCompactionInfo {
     id: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     before_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     after_tokens: Option<i64>,
@@ -455,23 +469,138 @@ struct AcpCompactionInfo {
 async fn compact_session(
     app: &Arc<AppState>,
     extension: &ExtRequest,
+    connection: &ConnectionTo<Client>,
 ) -> agent_client_protocol::Result<serde_json::Value> {
     let params: AcpSessionMessagesParams = decode_extension_params(extension)?;
     let session_id = Uuid::parse_str(&params.session_id)
         .map_err(|_| invalid_params(format!("无效的 Disco session ID：{}", params.session_id)))?;
-    let outcome = crate::compaction_service::compact_session(app, session_id)
-        .await
-        .map_err(crate::compaction_service::CompactionError::into_acp_error)?;
+    let session = app
+        .db
+        .get_session(session_id)
+        .map_err(|error| internal_error(format!("无法读取 session：{error}")))?
+        .ok_or_else(|| resource_not_found(format!("session {session_id} 不存在。")))?;
+    let backend = app.get_backend(&session.provider_id).await.ok_or_else(|| {
+        internal_error(format!(
+            "Provider {} 当前没有可用的 Agent Backend。",
+            session.provider_id
+        ))
+    })?;
+    if backend.capabilities().compaction != disco_core::CompactionMode::Local {
+        return Err(invalid_params(
+            "当前 Agent Backend 的上下文由原生 Agent 维护，不支持 Disco 发起本地压缩。",
+        ));
+    }
+
+    let compaction_id = Uuid::new_v4().to_string();
+    connection.send_notification(compaction_notification(
+        SessionId::new(session_id.to_string()),
+        session.provider_id.runtime_kind(),
+        &CompactionUpdate {
+            id: compaction_id.clone(),
+            status: CompactionStatus::Running,
+            before_tokens: None,
+            after_tokens: None,
+            summary: None,
+            error_message: None,
+        },
+    ))?;
+
+    let outcome = match crate::compaction_service::compact_session_with_id(
+        app,
+        session_id,
+        compaction_id.clone(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error_message = match &error {
+                crate::compaction_service::CompactionError::InvalidParams(message)
+                | crate::compaction_service::CompactionError::Internal(message) => message.clone(),
+            };
+            connection.send_notification(compaction_notification(
+                SessionId::new(session_id.to_string()),
+                session.provider_id.runtime_kind(),
+                &CompactionUpdate {
+                    id: compaction_id,
+                    status: CompactionStatus::Failed,
+                    before_tokens: None,
+                    after_tokens: None,
+                    summary: None,
+                    error_message: Some(error_message),
+                },
+            ))?;
+            return Err(error.into_acp_error());
+        }
+    };
+    connection.send_notification(compaction_notification(
+        SessionId::new(session_id.to_string()),
+        session.provider_id.runtime_kind(),
+        &CompactionUpdate {
+            id: outcome.id.clone(),
+            status: outcome.status,
+            before_tokens: outcome.before_tokens,
+            after_tokens: outcome.after_tokens,
+            summary: outcome.summary.clone(),
+            error_message: outcome.error_message.clone(),
+        },
+    ))?;
     serde_json::to_value(AcpCompactionResult {
         compaction: AcpCompactionInfo {
             id: outcome.id,
             status: format!("{:?}", outcome.status).to_lowercase(),
+            summary: outcome.summary,
             before_tokens: outcome.before_tokens,
             after_tokens: outcome.after_tokens,
             error_message: outcome.error_message,
         },
     })
     .map_err(|error| internal_error(format!("无法编码压缩结果：{error}")))
+}
+
+fn compaction_notification(
+    session_id: SessionId,
+    runtime_kind: &str,
+    update: &CompactionUpdate,
+) -> CompactionNotification {
+    let status = match update.status {
+        CompactionStatus::Running => "running",
+        CompactionStatus::Completed => "completed",
+        CompactionStatus::Failed => "failed",
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "sessionUpdate".to_string(),
+        serde_json::Value::String("compaction_update".to_string()),
+    );
+    payload.insert(
+        "compactionId".to_string(),
+        serde_json::Value::String(update.id.clone()),
+    );
+    payload.insert(
+        "status".to_string(),
+        serde_json::Value::String(status.to_string()),
+    );
+    payload.insert(
+        "runtimeKind".to_string(),
+        serde_json::Value::String(runtime_kind.to_string()),
+    );
+    if let Some(value) = update.before_tokens {
+        payload.insert("beforeTokens".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = update.after_tokens {
+        payload.insert("afterTokens".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = &update.summary {
+        payload.insert("summary".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = &update.error_message {
+        payload.insert("errorMessage".to_string(), serde_json::json!(value));
+    }
+    CompactionNotification {
+        session_id,
+        update: serde_json::Value::Object(payload),
+    }
 }
 
 async fn list_provider_models(
@@ -709,6 +838,13 @@ fn list_sessions(
                 META_RUNTIME_KIND.to_string(),
                 serde_json::json!(session.provider_id.runtime_kind()),
             );
+            meta.insert(
+                META_COMPACTION_MODE.to_string(),
+                serde_json::json!(match session.provider_id.runtime_kind() {
+                    "rig" => "local",
+                    _ => "native",
+                }),
+            );
             meta.insert(META_VENDOR.to_string(), serde_json::json!(session.vendor));
             meta.insert(META_MODEL.to_string(), serde_json::json!(session.model));
             SessionInfo::new(session.id.to_string(), PathBuf::from(project.path.clone()))
@@ -767,6 +903,13 @@ async fn bridge_prompt(
     };
 
     let assistant_message_id = MessageId::new(format!("assistant-{}", Uuid::new_v4()));
+    let runtime_kind = app
+        .db
+        .get_session(session_uuid)
+        .ok()
+        .flatten()
+        .map(|session| session.provider_id.runtime_kind().to_string())
+        .unwrap_or_else(|| "generic".to_string());
     let mut events = managed_run.events;
     let mut accumulated_usage: Option<TokenUsage> = None;
     while let Some(output) = events.recv().await {
@@ -814,6 +957,13 @@ async fn bridge_prompt(
                     SessionUpdate::UsageUpdate(
                         UsageUpdate::new(used.max(0) as u64, size.max(0) as u64).meta(meta),
                     ),
+                ))?;
+            }
+            AgentOutput::CompactionUpdate(update) => {
+                connection.send_notification(compaction_notification(
+                    session_id.clone(),
+                    &runtime_kind,
+                    &update,
                 ))?;
             }
             AgentOutput::ReasoningDelta(delta) => {
@@ -1147,6 +1297,27 @@ mod tests {
         assert_eq!(value["options"][0]["optionId"], "approve_for_session");
     }
 
+    #[test]
+    fn compaction_extension_notification_uses_acp_camel_case_fields() {
+        let value = serde_json::to_value(compaction_notification(
+            SessionId::new("session-1"),
+            "codex_app_server",
+            &CompactionUpdate {
+                id: "cmp-1".to_string(),
+                status: CompactionStatus::Completed,
+                before_tokens: Some(100),
+                after_tokens: Some(40),
+                summary: Some("摘要".to_string()),
+                error_message: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(value["sessionId"], "session-1");
+        assert_eq!(value["update"]["sessionUpdate"], "compaction_update");
+        assert_eq!(value["update"]["compactionId"], "cmp-1");
+        assert_eq!(value["update"]["runtimeKind"], "codex_app_server");
+    }
+
     #[tokio::test]
     async fn acp_wire_prompt_streams_session_updates_and_returns_terminal() {
         let backend = Arc::new(crate::run_service::test_support::ScriptedBackend {
@@ -1163,6 +1334,14 @@ mod tests {
                     used: 53_000,
                     size: 200_000,
                 },
+                AgentOutput::CompactionUpdate(CompactionUpdate {
+                    id: "wire-compaction".to_string(),
+                    status: CompactionStatus::Completed,
+                    before_tokens: Some(80_000),
+                    after_tokens: Some(30_000),
+                    summary: Some("wire summary".to_string()),
+                    error_message: None,
+                }),
                 AgentOutput::Completed,
             ],
             backend_handle: None,
@@ -1172,6 +1351,8 @@ mod tests {
         let server_task = tokio::spawn(run_acp_server(app, server_channel));
 
         let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel::<SessionUpdate>();
+        let (compaction_tx, mut compaction_rx) =
+            tokio::sync::mpsc::unbounded_channel::<CompactionNotification>();
         let client = Client
             .builder()
             .on_receive_notification(
@@ -1181,6 +1362,13 @@ mod tests {
                         let _ = updates_tx.send(notification.update);
                         Ok(())
                     }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_notification(
+                async move |notification: CompactionNotification, _connection| {
+                    let _ = compaction_tx.send(notification);
+                    Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
@@ -1265,6 +1453,14 @@ mod tests {
             }
             other => panic!("期望上下文 usage_update，收到 {other:?}"),
         }
+
+        let compaction = tokio::time::timeout(Duration::from_secs(1), compaction_rx.recv())
+            .await
+            .expect("等待 compaction update 超时")
+            .expect("compaction update 流意外结束");
+        assert!(!compaction.session_id.to_string().is_empty());
+        assert_eq!(compaction.update["sessionUpdate"], "compaction_update");
+        assert_eq!(compaction.update["compactionId"], "wire-compaction");
     }
 
     #[tokio::test]

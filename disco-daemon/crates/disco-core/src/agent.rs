@@ -1,4 +1,4 @@
-use disco_protocol::types::{ApprovalDecision, ApprovalImpact, TokenUsage};
+use disco_protocol::types::{ApprovalDecision, ApprovalImpact, CompactionStatus, TokenUsage};
 use uuid::Uuid;
 
 use crate::approval::ApprovalRequest;
@@ -17,6 +17,8 @@ pub enum AgentOutput {
         used: i64,
         size: i64,
     },
+    /// 上下文压缩生命周期事件。压缩由具体 Backend 负责，daemon 只转发。
+    CompactionUpdate(CompactionUpdate),
     ToolStarted {
         tool_call_id: String,
         tool_name: String,
@@ -42,6 +44,17 @@ pub enum AgentOutput {
     Completed,
     Failed(String),
     Cancelled,
+}
+
+/// Backend 报告的一次上下文压缩状态变化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionUpdate {
+    pub id: String,
+    pub status: CompactionStatus,
+    pub before_tokens: Option<i64>,
+    pub after_tokens: Option<i64>,
+    pub summary: Option<String>,
+    pub error_message: Option<String>,
 }
 
 impl AgentOutput {

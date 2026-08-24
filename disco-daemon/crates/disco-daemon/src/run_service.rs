@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError};
-use disco_persist::messages::StoredToolCall;
+use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError, CompactionMode};
+use disco_persist::messages::{StoredMessage, StoredToolCall};
 use disco_protocol::types::TokenUsage;
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
 use tokio::sync::mpsc;
@@ -85,10 +85,13 @@ pub async fn start_run(
             )));
         }
     };
-    let chat_messages = stored_messages
-        .iter()
-        .map(stored_message_to_chat_message)
-        .collect::<Vec<_>>();
+    let chat_messages = match backend.capabilities().compaction {
+        CompactionMode::Local => messages_for_local_context(app, session_id, &stored_messages),
+        CompactionMode::Native | CompactionMode::Unsupported => stored_messages
+            .iter()
+            .map(stored_message_to_chat_message)
+            .collect::<Vec<_>>(),
+    };
 
     let backend_handle = match app.db.get_session_backend_handle(session_id) {
         Ok(handle) => handle,
@@ -230,6 +233,45 @@ fn stored_message_to_chat_message(message: &disco_persist::messages::StoredMessa
     }
 }
 
+/// Rig 只把 checkpoint 作为模型上下文前缀使用，原始消息仍由 UI/数据库完整保留。
+fn messages_for_local_context(
+    db: &AppState,
+    session_id: Uuid,
+    stored_messages: &[StoredMessage],
+) -> Vec<ChatMessage> {
+    let Ok(Some(checkpoint)) = db.db.get_context_checkpoint(session_id) else {
+        return stored_messages
+            .iter()
+            .map(stored_message_to_chat_message)
+            .collect();
+    };
+    let Some(boundary_index) = stored_messages
+        .iter()
+        .position(|message| message.id == checkpoint.boundary_message_id)
+    else {
+        return stored_messages
+            .iter()
+            .map(stored_message_to_chat_message)
+            .collect();
+    };
+
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        text: format!(
+            "Previous conversation summary:\n{}\n\nContinue the conversation from where it left off.",
+            checkpoint.summary
+        ),
+        ..Default::default()
+    }];
+    messages.extend(
+        stored_messages
+            .iter()
+            .skip(boundary_index + 1)
+            .map(stored_message_to_chat_message),
+    );
+    messages
+}
+
 fn is_terminal(output: &AgentOutput) -> bool {
     matches!(
         output,
@@ -295,7 +337,7 @@ pub(crate) fn accumulate_usage(prev: &Option<TokenUsage>, current: &TokenUsage) 
 pub(crate) mod test_support {
     use super::*;
     use async_trait::async_trait;
-    use disco_core::{AgentBackend, BackendCapabilities, BackendRun};
+    use disco_core::{AgentBackend, BackendCapabilities, BackendRun, CompactionMode};
     use disco_protocol::types::{ProviderId, Vendor};
     use disco_providers::{ModelProvider, ProviderEvent};
     use disco_tools::{CompositeExecutor, ToolDefinition};
@@ -335,6 +377,7 @@ pub(crate) mod test_support {
             BackendCapabilities {
                 has_persistent_sessions: false,
                 can_delete_session: true,
+                compaction: CompactionMode::Unsupported,
             }
         }
 
@@ -358,6 +401,7 @@ pub(crate) mod test_support {
             BackendCapabilities {
                 has_persistent_sessions: false,
                 can_delete_session: true,
+                compaction: CompactionMode::Unsupported,
             }
         }
 
@@ -450,7 +494,7 @@ mod tests {
     };
     use super::*;
     use async_trait::async_trait;
-    use disco_core::{AgentBackend, BackendCapabilities, BackendRun};
+    use disco_core::{AgentBackend, BackendCapabilities, BackendRun, CompactionMode};
     use disco_protocol::types::ApprovalDecision;
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -467,6 +511,7 @@ mod tests {
             BackendCapabilities {
                 has_persistent_sessions: true,
                 can_delete_session: true,
+                compaction: CompactionMode::Unsupported,
             }
         }
 

@@ -58,6 +58,7 @@ struct SettingsView: View {
                     : listedVendors.first
             }
         }
+        .background(DiscoScrollIndicatorHider())
     }
 
     // MARK: 左栏：设置分类
@@ -149,6 +150,8 @@ struct SettingsView: View {
                     .padding(.bottom, 12)
                 }
             }
+            .scrollIndicators(.hidden)
+            .background(DiscoScrollIndicatorHider())
         }
         .frame(width: 208)
     }
@@ -521,6 +524,8 @@ private struct VendorDetailPanel: View {
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .top)
             }
+            .scrollIndicators(.hidden)
+            .background(DiscoScrollIndicatorHider())
 
             Divider()
                 .opacity(0.65)
@@ -898,6 +903,8 @@ private struct VendorDetailPanel: View {
                             }
                         }
                     }
+                    .scrollIndicators(.hidden)
+                    .background(DiscoScrollIndicatorHider())
                     // 固定可视高度：避免被凭据等区块挤压成 1~2 行；超过上限的模型在列表内滚动 + 筛选
                     .frame(height: Self.visibleModelListHeight(for: filteredModels.count))
                 }

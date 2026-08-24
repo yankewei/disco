@@ -75,7 +75,17 @@ impl ContextCompactor {
         messages: &[ChatMessage],
         provider: &Arc<dyn ModelProvider>,
     ) -> CompactionResult {
-        let compaction_id = Uuid::new_v4().to_string();
+        self.compact_with_id(Uuid::new_v4().to_string(), messages, provider)
+            .await
+    }
+
+    /// 使用调用方分配的 ID 执行压缩，以便 facade 在开始前发送生命周期事件。
+    pub async fn compact_with_id(
+        &self,
+        compaction_id: String,
+        messages: &[ChatMessage],
+        provider: &Arc<dyn ModelProvider>,
+    ) -> CompactionResult {
         let before_tokens = Some(self.estimate_tokens(messages));
 
         info!(

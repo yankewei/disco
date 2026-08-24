@@ -111,6 +111,29 @@ enum ACPDaemonEventMapper {
                 return events
             }
             events.append(usageEvent)
+        case "compaction_update":
+            guard let compactionID = fields["compactionId"]?.stringValue,
+                  let status = fields["status"]?.stringValue,
+                  let event = makeEvent(
+                      "context.compaction",
+                      DaemonContextCompactionData(
+                          runId: runID.uuidString,
+                          sessionId: update.sessionID,
+                          id: compactionID,
+                          runtimeKind: fields["runtimeKind"]?.stringValue ?? "generic",
+                          trigger: fields["trigger"]?.stringValue ?? "automatic",
+                          status: status == "in_progress" ? "running" : status,
+                          startedAt: fields["startedAt"]?.stringValue,
+                          completedAt: fields["completedAt"]?.stringValue,
+                          beforeTokens: fields["beforeTokens"]?.numberValue.map(Int.init),
+                          afterTokens: fields["afterTokens"]?.numberValue.map(Int.init),
+                          summary: fields["summary"]?.stringValue,
+                          errorMessage: fields["errorMessage"]?.stringValue
+                      )
+                  ) else {
+                return events
+            }
+            events.append(event)
         default:
             break
         }
@@ -295,6 +318,7 @@ enum ACPDaemonEventMapper {
                 completedAt: completedAt,
                 beforeTokens: beforeTokens,
                 afterTokens: afterTokens,
+                summary: nil,
                 errorMessage: errorMessage
             )
         ) ?? DaemonEvent(eventName: "context.compaction", data: .object([:]))
@@ -490,19 +514,7 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
     }
 
     func compactContext(sessionID: UUID) async throws {
-        let result = try await client.compactSession(sessionID: sessionID.uuidString)
-        let info = result.compaction
-        let startedAt = ISO8601DateFormatter().string(from: Date.now)
-        emit(ACPDaemonEventMapper.compactionEvent(
-            sessionID: sessionID,
-            id: info.id,
-            status: info.status == "completed" ? "completed" : "failed",
-            beforeTokens: info.beforeTokens.map(Int.init),
-            afterTokens: info.afterTokens.map(Int.init),
-            errorMessage: info.errorMessage,
-            startedAt: startedAt,
-            completedAt: startedAt
-        ))
+        _ = try await client.compactSession(sessionID: sessionID.uuidString)
     }
 
     private func startEventRouting() {
@@ -533,12 +545,18 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
     }
 
     private func handleSessionUpdate(_ update: ACPSessionUpdate) {
-        guard let runID = runIDBySessionID[update.sessionID] else { return }
-        let shouldEmitRunningState = runningStateSentForSession.insert(update.sessionID).inserted
+        let updateKind = update.update.objectValue?["sessionUpdate"]?.stringValue
+        let isCompactionUpdate = updateKind == "compaction_update"
+        guard isCompactionUpdate || runIDBySessionID[update.sessionID] != nil else { return }
+        // 手动压缩不属于 session/prompt run；用短生命周期的合成 ID 让事件仍能进入
+        // 公共 DaemonEvent 流，ConversationStore 会按 session 处理压缩状态。
+        let runID = runIDBySessionID[update.sessionID] ?? UUID()
+        let shouldEmitRunningState = !isCompactionUpdate
+            && runningStateSentForSession.insert(update.sessionID).inserted
         for event in ACPDaemonEventMapper.sessionUpdateEvents(
             update,
             runID: runID,
-            shouldEmitRunningState: shouldEmitRunningState
+            shouldEmitRunningState: isCompactionUpdate ? false : shouldEmitRunningState
         ) {
             emit(event)
         }

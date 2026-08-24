@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use tracing::debug;
 
 pub mod auth;
+pub mod context_checkpoints;
 pub mod messages;
 pub mod projects;
 pub mod provider_configs;
@@ -92,6 +93,14 @@ impl Database {
                 tool_calls_json TEXT,
                 tool_call_id TEXT,
                 tool_name TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS context_checkpoints (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+                checkpoint_id TEXT NOT NULL,
+                boundary_message_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
 
@@ -276,12 +285,12 @@ mod tests {
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','sessions','messages','provider_configs','provider_profiles')",
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('projects','sessions','messages','context_checkpoints','provider_configs','provider_profiles')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 
     #[test]

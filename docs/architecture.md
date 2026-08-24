@@ -316,9 +316,12 @@ Provider 可以复用同一个 Adapter，但仍然拥有独立的配置、账户
 `codex_app_server` 和 `codex_api` 是两个不同 Provider。API Key 方式只复用模型能力，
 不自动获得 app-server 的 thread、approval、sandbox、plugin 或 compact 语义。
 
-> 现状：上下文压缩仍走迁移期 `compaction_provider`——RigBackend 复用共享 ModelProvider，
-> Codex 后端使用本地汇总而非原生 compact，OpenCode 后端用 `UnavailableModelProvider`
-> 明确降级。压缩窗口从模型目录的 `context_window` 解析，未收录时回退 128k。
+上下文压缩的权威来源由 `BackendCapabilities.compaction` 声明：CodexAdapter 和 AcpAdapter
+标记为 `Native`，只把原生压缩事件转发给 client；RigBackend 标记为 `Local`，使用 daemon
+生成的摘要 checkpoint 作为后续模型上下文前缀，原始 transcript 仍完整保存在 SQLite。
+当前 `agent-client-protocol` Rust SDK 还没有 typed `compaction_update` 枚举，因此原生事件
+通过 `_disco/session/compaction` 私有通知承载；payload 使用 ACP v1 RFD 的
+`sessionUpdate: "compaction_update"` camelCase 字段，待 SDK 纳入标准类型后可直接替换。
 
 ## 8. 会话与持久化
 

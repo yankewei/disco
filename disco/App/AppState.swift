@@ -1322,6 +1322,13 @@ final class AppState: ObservableObject {
                 UUID(uuidString: info.sessionId) == conversation.id
             }
             if let existingSession {
+                let fallbackCompactionMode = switch existingSession.runtimeKind {
+                case .acp, .codexAppServer: "native"
+                default: "local"
+                }
+                conversation.store.setCompactionMode(
+                    existingSession.compactionMode ?? fallbackCompactionMode
+                )
                 if let providerID = existingSession.providerID {
                     setSessionMetadata(
                         conversationID: conversation.id,
@@ -1367,6 +1374,12 @@ final class AppState: ObservableObject {
                     conversationID: conversation.id,
                     providerID: vendor.daemonProviderID,
                     runtimeKind: SessionRuntimeKind.from(providerID: vendor.daemonProviderID)
+                )
+                conversation.store.setCompactionMode(
+                    vendor.daemonProviderID == "opencode_app_server"
+                        || vendor.daemonProviderID == "codex_app_server"
+                        ? "native"
+                        : "local"
                 )
             }
 

@@ -93,7 +93,9 @@ mod tests {
     use super::*;
     use crate::daemon::ProviderRuntime;
     use crate::run_service::test_support::{ScriptedBackend, make_test_app};
-    use disco_core::{AgentBackend, BackendCapabilities, BackendRun, BackendRunRequest};
+    use disco_core::{
+        AgentBackend, BackendCapabilities, BackendRun, BackendRunRequest, CompactionMode,
+    };
 
     struct FailingDeleteBackend;
 
@@ -103,6 +105,7 @@ mod tests {
             BackendCapabilities {
                 has_persistent_sessions: true,
                 can_delete_session: true,
+                compaction: CompactionMode::Unsupported,
             }
         }
 

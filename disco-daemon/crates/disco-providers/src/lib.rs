@@ -4,8 +4,8 @@ pub mod openai_responses;
 
 pub use chat_completions::ChatCompletionsProvider;
 pub use codex::{
-    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexProvider,
-    CodexProviderEvent, CodexToolCall, CodexToolResult,
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexCompactionUpdate,
+    CodexProvider, CodexProviderEvent, CodexToolCall, CodexToolResult,
 };
 pub use openai_responses::{ChatMessage, OpenAIResponsesProvider, ProviderEvent, StreamOptions};
 

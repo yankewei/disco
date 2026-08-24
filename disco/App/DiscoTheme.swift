@@ -25,6 +25,70 @@ enum DiscoMotion {
     static let press = Animation.spring(duration: 0.28, bounce: 0)
 }
 
+/// SwiftUI 在 macOS 上桥接的 NSScrollView 可能在自动滚动期间短暂显示 scroller。
+/// 在每个滚动容器的视图层级完成挂载后关闭 scroller，保留滚动手势本身。
+final class DiscoScrollIndicatorHidingView: NSView {
+    private weak var scheduledWindow: NSWindow?
+    private var hasScheduledHidePasses = false
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        scheduleHidePasses()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            scheduledWindow = nil
+            hasScheduledHidePasses = false
+        }
+        scheduleHidePasses()
+    }
+
+    func scheduleHidePasses() {
+        guard let window else { return }
+
+        if scheduledWindow !== window {
+            scheduledWindow = window
+            hasScheduledHidePasses = false
+        }
+        guard !hasScheduledHidePasses else { return }
+        hasScheduledHidePasses = true
+
+        for delay in [0.0, 0.1, 0.25, 0.5, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.hideScrollIndicators()
+            }
+        }
+    }
+
+    private func hideScrollIndicators() {
+        guard let contentView = window?.contentView else { return }
+
+        var views = [contentView]
+        while let view = views.popLast() {
+            if let scrollView = view as? NSScrollView {
+                scrollView.autohidesScrollers = true
+                scrollView.verticalScroller?.isHidden = true
+                scrollView.horizontalScroller?.isHidden = true
+                scrollView.hasVerticalScroller = false
+                scrollView.hasHorizontalScroller = false
+            }
+            views.append(contentsOf: view.subviews)
+        }
+    }
+}
+
+struct DiscoScrollIndicatorHider: NSViewRepresentable {
+    func makeNSView(context: Context) -> DiscoScrollIndicatorHidingView {
+        DiscoScrollIndicatorHidingView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: DiscoScrollIndicatorHidingView, context: Context) {
+        nsView.scheduleHidePasses()
+    }
+}
+
 struct DiscoMark: View {
     var size: CGFloat = 28
     var isActive = false

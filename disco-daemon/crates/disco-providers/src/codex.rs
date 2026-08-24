@@ -85,12 +85,23 @@ pub enum CodexProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
     Usage(TokenUsage),
+    Compaction(CodexCompactionUpdate),
     ToolStarted(CodexToolCall),
     ToolCompleted(CodexToolResult),
     ApprovalRequested(CodexApprovalRequest),
     Completed,
     Cancelled,
     Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCompactionUpdate {
+    pub id: String,
+    pub status: String,
+    pub before_tokens: Option<i64>,
+    pub after_tokens: Option<i64>,
+    pub summary: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -771,6 +782,20 @@ impl CodexProvider {
                     }
                 }
             }
+            method
+                if method.to_ascii_lowercase().contains("compaction")
+                    || method.to_ascii_lowercase().contains("compact") =>
+            {
+                if let Some(update) = parse_codex_compaction(method, params) {
+                    let s = state.lock().await;
+                    if let Some(active) = &s.active_turn {
+                        let _ = active
+                            .sender
+                            .send(CodexProviderEvent::Compaction(update))
+                            .await;
+                    }
+                }
+            }
             "turn/completed" => {
                 let event = match params["turn"]["status"].as_str() {
                     Some("interrupted") => CodexProviderEvent::Cancelled,
@@ -790,7 +815,9 @@ impl CodexProvider {
                 }
             }
             "item/started" => {
-                if let Some(event) = tool_started_event(&params["item"]) {
+                if let Some(event) = parse_codex_compaction_item(&params["item"], "running")
+                    .or_else(|| tool_started_event(&params["item"]))
+                {
                     let sender = state
                         .lock()
                         .await
@@ -803,7 +830,9 @@ impl CodexProvider {
                 }
             }
             "item/completed" => {
-                if let Some(event) = tool_completed_event(&params["item"]) {
+                if let Some(event) = parse_codex_compaction_item(&params["item"], "completed")
+                    .or_else(|| tool_completed_event(&params["item"]))
+                {
                     let sender = state
                         .lock()
                         .await
@@ -1239,6 +1268,7 @@ impl ModelProvider for CodexProvider {
                     CodexProviderEvent::Usage(usage) => {
                         yield ProviderEvent::Usage(usage);
                     }
+                    CodexProviderEvent::Compaction(_) => {}
                     CodexProviderEvent::ApprovalRequested(request) => {
                         self.respond_to_approval(&request, CodexApprovalDecision::Decline).await?;
                     }
@@ -1283,6 +1313,86 @@ fn parse_codex_usage(params: &serde_json::Value) -> Option<TokenUsage> {
         cached_input,
         reasoning_output,
     })
+}
+
+/// 兼容不同 Codex app-server 版本的原生压缩通知命名。
+///
+/// Codex app-server 的压缩通知尚未稳定为一个公开 ACP 类型，因此这里只在通知名明确
+/// 表示 compact/compaction 且 payload 含有可识别状态时转为内部事件，不根据 token usage
+/// 推断压缩。
+fn parse_codex_compaction(
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<CodexCompactionUpdate> {
+    let id = params
+        .get("compactionId")
+        .or_else(|| params.get("id"))
+        .or_else(|| params.get("compaction").and_then(|value| value.get("id")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(method)
+        .to_string();
+    let status = params
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            let method = method.to_ascii_lowercase();
+            if method.contains("start") || method.contains("progress") {
+                "running".to_string()
+            } else if method.contains("fail") || method.contains("error") {
+                "failed".to_string()
+            } else {
+                "completed".to_string()
+            }
+        });
+    let status = match status.as_str() {
+        "running" | "in_progress" | "started" => "running",
+        "completed" | "complete" | "done" | "finished" => "completed",
+        "failed" | "error" => "failed",
+        _ => return None,
+    };
+    let value = params.get("compaction").unwrap_or(params);
+    Some(CodexCompactionUpdate {
+        id,
+        status: status.to_string(),
+        before_tokens: value
+            .get("beforeTokens")
+            .or_else(|| value.get("before_tokens"))
+            .and_then(serde_json::Value::as_i64),
+        after_tokens: value
+            .get("afterTokens")
+            .or_else(|| value.get("after_tokens"))
+            .and_then(serde_json::Value::as_i64),
+        summary: value
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        error_message: value
+            .get("errorMessage")
+            .or_else(|| value.get("error_message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn parse_codex_compaction_item(
+    item: &serde_json::Value,
+    default_status: &str,
+) -> Option<CodexProviderEvent> {
+    let item_type = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)?
+        .to_ascii_lowercase();
+    if !item_type.contains("compact") && !item_type.contains("compaction") {
+        return None;
+    }
+    let mut payload = item.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("status")
+            .or_insert_with(|| serde_json::Value::String(default_status.to_string()));
+    }
+    parse_codex_compaction("item/compaction", &payload).map(CodexProviderEvent::Compaction)
 }
 
 // MARK: - JSON-RPC encoding/decoding helpers (for testing)
@@ -1524,6 +1634,45 @@ mod tests {
     fn parse_codex_usage_no_token_usage() {
         let params = serde_json::json!({"threadId": "t1"});
         assert!(parse_codex_usage(&params).is_none());
+    }
+
+    #[test]
+    fn parse_codex_compaction_notification() {
+        let update = parse_codex_compaction(
+            "thread/compaction/completed",
+            &serde_json::json!({
+                "compactionId": "cmp-1",
+                "status": "completed",
+                "beforeTokens": 1000,
+                "afterTokens": 250,
+                "summary": "保留关键上下文"
+            }),
+        )
+        .unwrap();
+        assert_eq!(update.id, "cmp-1");
+        assert_eq!(update.status, "completed");
+        assert_eq!(update.before_tokens, Some(1000));
+        assert_eq!(update.after_tokens, Some(250));
+        assert_eq!(update.summary.as_deref(), Some("保留关键上下文"));
+    }
+
+    #[test]
+    fn parse_codex_compaction_item_lifecycle() {
+        let update = parse_codex_compaction_item(
+            &serde_json::json!({
+                "type": "contextCompaction",
+                "id": "cmp-item"
+            }),
+            "running",
+        );
+        assert!(matches!(
+            update,
+            Some(CodexProviderEvent::Compaction(CodexCompactionUpdate {
+                id,
+                status,
+                ..
+            })) if id == "cmp-item" && status == "running"
+        ));
     }
 
     #[test]

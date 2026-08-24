@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, BackendCapabilities, BackendRun, BackendRunRequest,
-    BackendSession, PreparedApproval, tool_approval_request,
+    BackendSession, CompactionMode, PreparedApproval, tool_approval_request,
 };
 use disco_protocol::types::{ApprovalDecision, TokenUsage};
 use disco_providers::{ChatMessage, ModelProvider, ProviderEvent};
@@ -79,6 +79,7 @@ where
         BackendCapabilities {
             has_persistent_sessions: false,
             can_delete_session: true,
+            compaction: CompactionMode::Local,
         }
     }
 

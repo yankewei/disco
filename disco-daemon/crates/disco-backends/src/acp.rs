@@ -10,19 +10,22 @@ use agent_client_protocol::schema::v1::{
     PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolKind,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
+    InitializeResponse,
 };
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, Responder,
+    AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, JsonRpcMessage,
+    JsonRpcNotification, Responder, UntypedMessage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, ApprovalRequest, BackendCapabilities, BackendRun,
-    BackendRunRequest, BackendSession, PreparedApproval,
+    BackendRunRequest, BackendSession, CompactionMode, CompactionUpdate, PreparedApproval,
 };
-use disco_protocol::types::{ApprovalDecision, ApprovalImpact};
+use disco_protocol::types::{ApprovalDecision, ApprovalImpact, CompactionStatus};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -64,6 +67,70 @@ struct AcpRunContext {
     tool_title_by_id: Arc<StdMutex<HashMap<String, String>>>,
 }
 
+/// 允许接收 ACP v1 尚未纳入 SDK 枚举的 `compaction_update`，避免未知 update
+/// 因反序列化失败而丢失。已知 update 仍在收到后转换为 SDK 类型处理。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSessionNotification {
+    session_id: SessionId,
+    update: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct RawExtensionNotification {
+    method: Arc<str>,
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+enum AcpAgentNotification {
+    Session(RawSessionNotification),
+    Extension(RawExtensionNotification),
+}
+
+impl JsonRpcMessage for AcpAgentNotification {
+    fn matches_method(method: &str) -> bool {
+        method == "session/update" || method.starts_with('_')
+    }
+
+    fn method(&self) -> &str {
+        match self {
+            Self::Session(_) => "session/update",
+            Self::Extension(notification) => &notification.method,
+        }
+    }
+
+    fn to_untyped_message(&self) -> agent_client_protocol::Result<UntypedMessage> {
+        match self {
+            Self::Session(notification) => UntypedMessage::new(self.method(), notification),
+            Self::Extension(notification) => {
+                UntypedMessage::new(self.method(), &notification.params)
+            }
+        }
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> agent_client_protocol::Result<Self> {
+        if method == "session/update" {
+            return agent_client_protocol::util::json_cast_params(params).map(Self::Session);
+        }
+        if method.starts_with('_') {
+            let params = serde_json::to_value(params).map_err(|error| {
+                agent_client_protocol::Error::internal_error().data(error.to_string())
+            })?;
+            return Ok(Self::Extension(RawExtensionNotification {
+                method: Arc::from(method),
+                params,
+            }));
+        }
+        Err(agent_client_protocol::Error::method_not_found())
+    }
+}
+
+impl JsonRpcNotification for AcpAgentNotification {}
+
 impl AcpAdapter {
     /// 启动外部 ACP agent 并完成协议初始化。
     pub async fn connect(config: AcpAgentConfig) -> Result<Self> {
@@ -96,8 +163,16 @@ impl AcpAdapter {
             let result = Client
                 .builder()
                 .on_receive_notification(
-                    async move |notification: SessionNotification, _connection| {
-                        forward_session_update(notification, &notification_runs).await;
+                    async move |notification: AcpAgentNotification, _connection| {
+                        match notification {
+                            AcpAgentNotification::Session(notification) => {
+                                forward_session_update(notification, &notification_runs).await;
+                            }
+                            AcpAgentNotification::Extension(notification) => {
+                                forward_extension_notification(notification, &notification_runs)
+                                    .await;
+                            }
+                        }
                         Ok(())
                     },
                     agent_client_protocol::on_receive_notification!(),
@@ -112,10 +187,25 @@ impl AcpAdapter {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
+                    let mut initialize_params = serde_json::to_value(InitializeRequest::new(
+                        ProtocolVersion::V1,
+                    ))
+                    .map_err(|error| {
+                        agent_client_protocol::Error::internal_error()
+                            .data(format!("ACP 初始化参数编码失败：{error}"))
+                    })?;
+                    initialize_params["clientCapabilities"]["session"]["compaction"] =
+                        serde_json::json!({});
                     let initialization = connection
-                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .send_request(UntypedMessage::new("initialize", initialize_params)?)
                         .block_task()
-                        .await;
+                        .await
+                        .and_then(|value| {
+                            serde_json::from_value::<InitializeResponse>(value).map_err(|error| {
+                                agent_client_protocol::Error::internal_error()
+                                    .data(format!("ACP 初始化响应解析失败：{error}"))
+                            })
+                        });
                     match initialization {
                         Ok(response) if response.protocol_version == ProtocolVersion::V1 => {
                             initialized_connection_alive.store(true, Ordering::Release);
@@ -157,6 +247,7 @@ impl AcpAdapter {
         let capabilities = BackendCapabilities {
             has_persistent_sessions: agent_capabilities.load_session,
             can_delete_session: agent_capabilities.session_capabilities.delete.is_some(),
+            compaction: CompactionMode::Native,
         };
 
         Ok(Self {
@@ -195,7 +286,8 @@ impl AcpAdapter {
             if !self.can_load_sessions {
                 bail!("ACP agent 不支持恢复已有 session {handle}");
             }
-            self.connection
+            self
+                .connection
                 .send_request(LoadSessionRequest::new(session_id.clone(), workspace))
                 .block_task()
                 .await
@@ -520,16 +612,52 @@ impl AgentBackend for AcpAdapter {
     }
 }
 
-async fn forward_session_update(notification: SessionNotification, active_runs: &ActiveRunMap) {
-    let Some(run) = active_runs
-        .lock()
-        .await
-        .get(&notification.session_id)
-        .cloned()
+async fn forward_session_update(notification: RawSessionNotification, active_runs: &ActiveRunMap) {
+    forward_update_value(notification.session_id, notification.update, active_runs).await;
+}
+
+async fn forward_extension_notification(
+    notification: RawExtensionNotification,
+    active_runs: &ActiveRunMap,
+) {
+    let method = notification.method.to_ascii_lowercase();
+    if notification.method.as_ref() != "_disco/session/compaction"
+        && !method.contains("compact")
+        && !method.contains("compaction")
+    {
+        return;
+    }
+    let Some(object) = notification.params.as_object() else {
+        return;
+    };
+    let Some(session_id) = object
+        .get("sessionId")
+        .or_else(|| object.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(SessionId::new)
     else {
         return;
     };
-    for output in outputs_for_session_update(notification.update, &run.tool_title_by_id) {
+    let Some(update) = object.get("update").cloned().or_else(|| {
+        object
+            .get("sessionUpdate")
+            .is_some()
+            .then(|| notification.params.clone())
+    }) else {
+        return;
+    };
+    forward_update_value(session_id, update, active_runs).await;
+}
+
+async fn forward_update_value(
+    session_id: SessionId,
+    update: serde_json::Value,
+    active_runs: &ActiveRunMap,
+) {
+    let Some(run) = active_runs.lock().await.get(&session_id).cloned() else {
+        return;
+    };
+    for output in outputs_for_update_value(update, &run.tool_title_by_id) {
         let _ = run.event_tx.send(output);
     }
 }
@@ -606,6 +734,62 @@ fn outputs_for_session_update(
         }],
         _ => Vec::new(),
     }
+}
+
+fn outputs_for_update_value(
+    update: serde_json::Value,
+    tool_title_by_id: &StdMutex<HashMap<String, String>>,
+) -> Vec<AgentOutput> {
+    if let Ok(update) = serde_json::from_value::<SessionUpdate>(update.clone()) {
+        return outputs_for_session_update(update, tool_title_by_id);
+    }
+    compaction_output_from_value(&update).into_iter().collect()
+}
+
+fn compaction_output_from_value(value: &serde_json::Value) -> Option<AgentOutput> {
+    if value
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+        != Some("compaction_update")
+    {
+        return None;
+    }
+    let id = value
+        .get("compactionId")
+        .or_else(|| value.get("id"))
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let status = match value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        "running" | "in_progress" | "started" => CompactionStatus::Running,
+        "completed" | "complete" | "done" | "finished" => CompactionStatus::Completed,
+        "failed" | "error" => CompactionStatus::Failed,
+        _ => return None,
+    };
+    Some(AgentOutput::CompactionUpdate(CompactionUpdate {
+        id,
+        status,
+        before_tokens: value
+            .get("beforeTokens")
+            .or_else(|| value.get("before_tokens"))
+            .and_then(serde_json::Value::as_i64),
+        after_tokens: value
+            .get("afterTokens")
+            .or_else(|| value.get("after_tokens"))
+            .and_then(serde_json::Value::as_i64),
+        summary: value
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        error_message: value
+            .get("errorMessage")
+            .or_else(|| value.get("error_message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }))
 }
 
 fn outputs_for_tool_call(
@@ -801,6 +985,7 @@ mod tests {
         AgentCapabilities, ContentChunk, DeleteSessionResponse, InitializeResponse,
         LoadSessionResponse, NewSessionResponse, PromptResponse, SessionCapabilities,
         SessionDeleteCapabilities, TextContent, ToolCallUpdateFields, UsageUpdate,
+        SessionNotification,
     };
     use disco_providers::ChatMessage;
     use tokio::sync::Notify;
@@ -866,6 +1051,29 @@ mod tests {
                 used: 53_000,
                 size: 200_000
             }]
+        ));
+    }
+
+    #[test]
+    fn acp_compaction_update_survives_unknown_session_update_variant() {
+        let outputs = outputs_for_update_value(
+            serde_json::json!({
+                "sessionUpdate": "compaction_update",
+                "compactionId": "cmp-1",
+                "status": "in_progress",
+                "beforeTokens": 120_000,
+            }),
+            &StdMutex::new(HashMap::new()),
+        );
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [AgentOutput::CompactionUpdate(CompactionUpdate {
+                id,
+                status: CompactionStatus::Running,
+                before_tokens: Some(120_000),
+                ..
+            })] if id == "cmp-1"
         ));
     }
 
@@ -1036,6 +1244,7 @@ mod tests {
             BackendCapabilities {
                 has_persistent_sessions: true,
                 can_delete_session: true,
+                compaction: CompactionMode::Native,
             }
         );
 

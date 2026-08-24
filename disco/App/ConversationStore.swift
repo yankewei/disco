@@ -38,6 +38,8 @@ final class ConversationStore: ObservableObject {
     private(set) var threadID: String?
     /// 压缩状态（最近一次成功压缩）；随每次持久化回调落盘。
     private(set) var contextState: ConversationContextState
+    /// 原生 Agent 的上下文由其自身维护；只有 Rig 本地链路允许手动请求压缩。
+    @Published private(set) var compactionMode = "local"
 
     var hasRuntime: Bool {
         daemonRunsEnabled && daemonClient != nil && daemonSessionID != nil
@@ -94,8 +96,13 @@ final class ConversationStore: ObservableObject {
 
     var canCompactContext: Bool {
         guard !isStreaming, compactionTask == nil else { return false }
-        return daemonSessionID != nil && daemonClient != nil && messages.count >= 2
+        return compactionMode == "local"
+            && daemonSessionID != nil
+            && daemonClient != nil
+            && messages.count >= 2
     }
+
+    var usesNativeCompaction: Bool { compactionMode == "native" }
 
     var canRetry: Bool {
         guard !isStreaming, errorMessage != nil, let last = messages.last else { return false }
@@ -107,6 +114,10 @@ final class ConversationStore: ObservableObject {
     /// 设置守护进程客户端引用；注册 session 后再单独启用 daemon 运行。
     func configure(daemonClient: (any DiscoDaemonClient)?) {
         self.daemonClient = daemonClient
+    }
+
+    func setCompactionMode(_ mode: String?) {
+        compactionMode = mode ?? "local"
     }
 
     func enableDaemonRuns(sessionID: UUID) {
@@ -360,7 +371,7 @@ final class ConversationStore: ObservableObject {
 
     private func handleDaemonCompactionEvent(_ event: DaemonEvent) {
         guard let data = try? event.decoded(as: DaemonContextCompactionData.self) else { return }
-        let runtimeKind: RuntimeKind = data.runtimeKind == "codex" ? .codex : .generic
+        let runtimeKind: RuntimeKind = data.runtimeKind.contains("codex") ? .codex : .generic
         let trigger: ContextCompactionSnapshot.Trigger
         switch data.trigger {
         case "automatic": trigger = .automatic
@@ -381,7 +392,9 @@ final class ConversationStore: ObservableObject {
             startedAt: Date.now,
             completedAt: status != .running ? Date.now : nil,
             beforeTokens: data.beforeTokens,
-            afterTokens: data.afterTokens
+            afterTokens: data.afterTokens,
+            summary: data.summary,
+            errorMessage: data.errorMessage
         )
         handleCompactionUpdate(ContextCompactionUpdate(snapshot: snapshot))
     }

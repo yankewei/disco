@@ -293,6 +293,21 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.activeCompaction)
     }
 
+    func testNativeAgentCompactionDisablesManualCompaction() {
+        let sessionID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: UUID())
+        let store = ConversationStore(messages: [
+            ChatMessage(role: .user, text: "问题"),
+            ChatMessage(role: .assistant, text: "回答"),
+        ])
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.setCompactionMode("native")
+
+        XCTAssertFalse(store.canCompactContext)
+        XCTAssertTrue(store.usesNativeCompaction)
+    }
+
     func testDaemonDisconnectionFailsTheActiveRun() async throws {
         let client = RecordingDiscoDaemonClient(runID: UUID())
         let store = ConversationStore()

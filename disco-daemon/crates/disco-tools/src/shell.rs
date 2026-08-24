@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -16,8 +17,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Maximum allowed timeout in seconds.
 const MAX_TIMEOUT_SECS: u64 = 120;
 
+struct ProcessControl {
+    control_id: Uuid,
+    cancel_signal: oneshot::Sender<()>,
+}
+
 pub struct ShellExecutor {
-    active_processes: Mutex<HashMap<Uuid, Vec<Child>>>,
+    active_processes: Mutex<HashMap<Uuid, Vec<ProcessControl>>>,
 }
 
 impl ShellExecutor {
@@ -92,76 +98,125 @@ impl ToolExecutor for ShellExecutor {
         // Capture stdout and stderr separately, combine later
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // Detach from parent process group so cancellation kills children
+        // Put the command in its own process group so cancellation also kills
+        // descendants started by the shell.
+        #[cfg(unix)]
+        cmd.process_group(0);
         cmd.kill_on_drop(true);
 
         // Spawn the process
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn command: {e}"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn command: {e}"))?;
 
-        // Track the child process for cancellation
+        let control_id = Uuid::new_v4();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+
+        // Track a cancellation signal while the execution task owns the child.
         {
             let mut processes = self.active_processes.lock().unwrap();
             processes
                 .entry(context.run_id)
                 .or_default()
-                .push(child);
+                .push(ProcessControl {
+                    control_id,
+                    cancel_signal: cancel_tx,
+                });
         }
 
-        // Wait for the child with timeout.
-        // We need to take the child out of the map to wait on it.
-        let child = {
-            let mut processes = self.active_processes.lock().unwrap();
-            let entry = processes.entry(context.run_id).or_default();
-            entry.pop().expect("child was just inserted")
+        let outcome = tokio::select! {
+            result = wait_for_child(&mut child) => ChildOutcome::Completed(result),
+            _ = cancel_rx => ChildOutcome::Cancelled,
+            _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => ChildOutcome::TimedOut,
         };
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            wait_for_child(child),
-        )
-        .await;
+        let result = match outcome {
+            ChildOutcome::Completed(result) => result,
+            ChildOutcome::Cancelled => {
+                terminate_process_tree(&mut child).await;
+                let _ = child.wait().await;
+                Err("Command cancelled".to_string())
+            }
+            ChildOutcome::TimedOut => {
+                warn!("Command timed out after {}s: {}", timeout_secs, command);
+                // Preserve the previous behavior of cancelling any other
+                // shell commands associated with the same run.
+                self.cancel(context.run_id).await;
+                terminate_process_tree(&mut child).await;
+                let _ = child.wait().await;
+                Err(format!(
+                    "Command timed out after {timeout_secs}s: {command}"
+                ))
+            }
+        };
+
+        self.remove_process(context.run_id, control_id);
 
         match result {
-            Ok(Ok(output)) => {
+            Ok(output) => {
                 let output = truncate_output(&output);
                 Ok(ToolResult {
                     call_id: call.call_id.clone(),
                     output,
                 })
             }
-            Ok(Err(e)) => Err(format!("Command error: {e}")),
-            Err(_) => {
-                // Timeout: kill the process
-                warn!(
-                    "Command timed out after {}s: {}",
-                    timeout_secs, command
-                );
-                // Kill any remaining processes for this run
-                self.cancel(context.run_id).await;
-                Err(format!(
-                    "Command timed out after {timeout_secs}s: {command}"
-                ))
-            }
+            Err(e) => Err(format!("Command error: {e}")),
         }
     }
 
     async fn cancel(&self, run_id: Uuid) {
-        let children = {
+        let process_controls = {
             let mut processes = self.active_processes.lock().unwrap();
             processes.remove(&run_id)
         };
 
-        if let Some(mut children) = children {
-            for child in &mut children {
-                let _ = child.kill().await;
+        if let Some(process_controls) = process_controls {
+            let process_count = process_controls.len();
+            for process_control in process_controls {
+                let _ = process_control.cancel_signal.send(());
             }
-            debug!("Cancelled {} processes for run {}", children.len(), run_id);
+            debug!(
+                "Cancellation requested for {} processes in run {}",
+                process_count, run_id
+            );
         }
     }
 }
 
+impl ShellExecutor {
+    fn remove_process(&self, run_id: Uuid, control_id: Uuid) {
+        let mut processes = self.active_processes.lock().unwrap();
+        let Some(run_processes) = processes.get_mut(&run_id) else {
+            return;
+        };
+
+        run_processes.retain(|process| process.control_id != control_id);
+        if run_processes.is_empty() {
+            processes.remove(&run_id);
+        }
+    }
+}
+
+enum ChildOutcome {
+    Completed(Result<String, String>),
+    Cancelled,
+    TimedOut,
+}
+
+async fn terminate_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let group_killed = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) } == 0;
+        if group_killed {
+            return;
+        }
+    }
+
+    let _ = child.kill().await;
+}
+
 /// Wait for a child process to exit and return combined stdout + stderr.
-async fn wait_for_child(mut child: Child) -> Result<String, String> {
+async fn wait_for_child(child: &mut Child) -> Result<String, String> {
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
 
@@ -291,7 +346,9 @@ mod tests {
         let call = ToolCall {
             call_id: "tc_6".to_string(),
             name: "shell".to_string(),
-            arguments: r#"{"command":"sleep 60","timeout":30}"#.to_string(),
+            // Keep a descendant alive and holding the output pipes so this
+            // test also verifies that cancellation reaches the process group.
+            arguments: r#"{"command":"sleep 60 & wait","timeout":30}"#.to_string(),
         };
         let context = ToolContext {
             run_id,
@@ -302,9 +359,7 @@ mod tests {
         let exec = std::sync::Arc::new(executor);
         let exec2 = exec.clone();
         let call2 = call.clone();
-        let handle = tokio::spawn(async move {
-            exec2.execute(&call2, &context).await
-        });
+        let handle = tokio::spawn(async move { exec2.execute(&call2, &context).await });
 
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -313,7 +368,10 @@ mod tests {
         exec.cancel(run_id).await;
 
         // The execution should complete (with error due to cancellation)
-        let result = handle.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancelling a running process should not wait for the command timeout")
+            .unwrap();
         assert!(result.is_err());
     }
 
@@ -350,10 +408,12 @@ mod tests {
         let def = tool_definition();
         assert_eq!(def.name, "shell");
         assert!(def.input_schema["properties"]["command"].is_object());
-        assert!(def.input_schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str() == Some("command")));
+        assert!(
+            def.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("command"))
+        );
     }
 }

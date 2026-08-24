@@ -83,119 +83,127 @@ struct ChatView: View {
         return nil
     }
 
-    private var isToolInspectorPresented: Binding<Bool> {
-        Binding(
-            get: { selectedToolCall != nil },
-            set: { isPresented in
-                if !isPresented {
-                    selectedToolCallID = nil
+    var body: some View {
+        HStack(spacing: 0) {
+            ZStack {
+                DiscoTheme.canvas
+                    .ignoresSafeArea()
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 32) {
+                            if store.messages.isEmpty {
+                                EmptyConversationView(
+                                    isConfigured: appState.isActiveVendorConfigured,
+                                    model: appState.model,
+                                    providerHost: providerHost
+                                )
+                                .containerRelativeFrame(.vertical, alignment: .center) { height, _ in
+                                    max(height - 150, 320)
+                                }
+                            } else {
+                                ForEach(store.messages) { message in
+                                    MessageRow(
+                                        message: message,
+                                        isStreaming: store.isStreaming && message.id == store.messages.last?.id,
+                                        errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
+                                        canRetry: store.canRetry,
+                                        retry: store.retryLastMessage,
+                                        dismissError: store.dismissError,
+                                        selectedToolCallID: selectedToolCallID,
+                                        selectToolCall: { toolCallID in
+                                            withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                                                selectedToolCallID = toolCallID
+                                            }
+                                        }
+                                    )
+                                    .id(message.id)
+                                }
+                            }
+
+                            Color.clear
+                                .frame(height: 1)
+                                .id(Self.latestMessageAnchor)
+                        }
+                        .frame(maxWidth: 760)
+                        .padding(.horizontal, 28)
+                        .padding(.top, 36)
+                        .padding(.bottom, 20)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .scrollIndicators(.hidden)
+                    .background(DiscoScrollIndicatorHider())
+                    .onScrollGeometryChange(for: Bool.self) { geometry in
+                        geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+                    } action: { _, isAtLatest in
+                        // 滚动几何回调可能在布局/视图更新期间触发，延迟到下一个
+                        // run loop 写入状态，避免 SwiftUI 运行时警告
+                        // （"Publishing changes from within view updates"）。
+                        Task { @MainActor in
+                            isAtLatestMessage = isAtLatest
+                            if isAtLatest {
+                                shouldFollowLatestMessage = true
+                            } else if isUserScrolling {
+                                shouldFollowLatestMessage = false
+                            }
+                        }
+                    }
+                    .onScrollPhaseChange { _, phase in
+                        let isScrolling = phase.isScrolling && phase != .animating
+                        Task { @MainActor in
+                            isUserScrolling = isScrolling
+                        }
+                    }
+                    .onChange(of: store.messages) {
+                        guard shouldFollowLatestMessage else { return }
+                        scheduleScrollToLatest(proxy)
+                    }
+                    .onAppear {
+                        scheduleScrollToLatest(proxy)
+                    }
+                    .overlay(alignment: .bottom) {
+                        if !isAtLatestMessage && !shouldFollowLatestMessage {
+                            Button {
+                                shouldFollowLatestMessage = true
+                                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                                    proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
+                                }
+                            } label: {
+                                Label("回到最新", systemImage: "arrow.down")
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(DiscoTheme.elevatedSurface, in: Capsule())
+                                    .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                            }
+                            .buttonStyle(DiscoPressButtonStyle())
+                            .padding(.bottom, 12)
+                            .transition(
+                                reduceMotion
+                                    ? .opacity
+                                    : .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))
+                            )
+                            .accessibilityLabel("回到最新消息")
+                        }
+                    }
                 }
             }
-        )
-    }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-    var body: some View {
-        ZStack {
-            DiscoTheme.canvas
-                .ignoresSafeArea()
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 32) {
-                        if store.messages.isEmpty {
-                            EmptyConversationView(
-                                isConfigured: appState.isActiveVendorConfigured,
-                                model: appState.model,
-                                providerHost: providerHost
-                            )
-                            .containerRelativeFrame(.vertical, alignment: .center) { height, _ in
-                                max(height - 150, 320)
-                            }
-                        } else {
-                            ForEach(store.messages) { message in
-                                MessageRow(
-                                    message: message,
-                                    isStreaming: store.isStreaming && message.id == store.messages.last?.id,
-                                    errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
-                                    canRetry: store.canRetry,
-                                    retry: store.retryLastMessage,
-                                    dismissError: store.dismissError,
-                                    selectedToolCallID: selectedToolCallID,
-                                    selectToolCall: { toolCallID in
-                                        withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
-                                            selectedToolCallID = toolCallID
-                                        }
-                                    }
-                                )
-                                .id(message.id)
-                            }
-                        }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id(Self.latestMessageAnchor)
-                    }
-                    .frame(maxWidth: 760)
-                    .padding(.horizontal, 28)
-                    .padding(.top, 36)
-                    .padding(.bottom, 20)
-                    .frame(maxWidth: .infinity)
-                }
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.visibleRect.maxY >= geometry.contentSize.height - 24
-                } action: { _, isAtLatest in
-                    // 滚动几何回调可能在布局/视图更新期间触发，延迟到下一个
-                    // run loop 写入状态，避免 SwiftUI 运行时警告
-                    // （"Publishing changes from within view updates"）。
-                    Task { @MainActor in
-                        isAtLatestMessage = isAtLatest
-                        if isAtLatest {
-                            shouldFollowLatestMessage = true
-                        } else if isUserScrolling {
-                            shouldFollowLatestMessage = false
-                        }
+            if let selectedToolCall {
+                ToolInspectorPanel(call: selectedToolCall) {
+                    withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                        selectedToolCallID = nil
                     }
                 }
-                .onScrollPhaseChange { _, phase in
-                    let isScrolling = phase.isScrolling && phase != .animating
-                    Task { @MainActor in
-                        isUserScrolling = isScrolling
-                    }
-                }
-                .onChange(of: store.messages) {
-                    guard shouldFollowLatestMessage else { return }
-                    scheduleScrollToLatest(proxy)
-                }
-                .onAppear {
-                    scheduleScrollToLatest(proxy)
-                }
-                .overlay(alignment: .bottom) {
-                    if !isAtLatestMessage && !shouldFollowLatestMessage {
-                        Button {
-                            shouldFollowLatestMessage = true
-                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
-                                proxy.scrollTo(Self.latestMessageAnchor, anchor: .bottom)
-                            }
-                        } label: {
-                            Label("回到最新", systemImage: "arrow.down")
-                                .font(.caption.weight(.medium))
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
-                                .background(DiscoTheme.elevatedSurface, in: Capsule())
-                                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-                        }
-                        .buttonStyle(DiscoPressButtonStyle())
-                        .padding(.bottom, 12)
-                        .transition(
-                            reduceMotion
-                                ? .opacity
-                                : .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))
-                        )
-                        .accessibilityLabel("回到最新消息")
-                    }
-                }
+                .transition(
+                    reduceMotion
+                        ? .opacity
+                        : .move(edge: .trailing).combined(with: .opacity)
+                )
             }
         }
+        .background(DiscoTheme.canvas.ignoresSafeArea())
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 if let approval = store.pendingApproval {
@@ -293,16 +301,99 @@ struct ChatView: View {
             }
             selectedToolCallID = nil
         }
-        .inspector(isPresented: isToolInspectorPresented) {
-            if let selectedToolCall {
-                ToolCallInspector(call: selectedToolCall) {
-                    selectedToolCallID = nil
-                }
-            }
-        }
-        .inspectorColumnWidth(min: 280, ideal: 340, max: 420)
         .task(id: "\(appState.activeVendor.rawValue):\(appState.model)") {
             await appState.refreshCodexModelCatalogIfNeeded()
+        }
+    }
+}
+private struct ToolInspectorPanel: View {
+    let call: ChatMessage.ToolCallSnapshot
+    let dismiss: () -> Void
+
+    @State private var width: CGFloat = 420
+    @State private var dragStartWidth: CGFloat?
+    @State private var frozenContentWidth: CGFloat?
+
+    private static let minWidth: CGFloat = 280
+    private static let maxWidth: CGFloat = 560
+    private static let resizeHandleWidth: CGFloat = 10
+
+    private var contentWidth: CGFloat {
+        frozenContentWidth ?? max(width - Self.resizeHandleWidth, 1)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ToolInspectorResizeHandle(
+                isDragging: dragStartWidth != nil,
+                onChanged: { translation in
+                    let startWidth = dragStartWidth ?? width
+                    if dragStartWidth == nil {
+                        dragStartWidth = startWidth
+                        frozenContentWidth = max(startWidth - Self.resizeHandleWidth, 1)
+                    }
+                    width = min(
+                        max(startWidth - translation, Self.minWidth),
+                        Self.maxWidth
+                    )
+                },
+                onEnded: {
+                    dragStartWidth = nil
+                    frozenContentWidth = nil
+                }
+            )
+
+            ToolCallInspector(call: call, dismiss: dismiss)
+                .equatable()
+                .frame(width: contentWidth, alignment: .leading)
+        }
+        .background(DiscoTheme.surface)
+        .frame(width: width)
+        .clipped()
+        .frame(width: Self.maxWidth, alignment: .trailing)
+    }
+}
+
+private struct ToolInspectorResizeHandle: View {
+    let isDragging: Bool
+    let onChanged: (CGFloat) -> Void
+    let onEnded: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(isDragging || isHovering ? 0.22 : 0.08))
+            .frame(width: isDragging ? 2 : 1)
+            .frame(width: 10)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { value in
+                        onChanged(value.translation.width)
+                    }
+                    .onEnded { _ in
+                        onEnded()
+                    }
+            )
+            .onHover { hovering in
+                isHovering = hovering
+                updateCursor(isHovering: hovering, isDragging: isDragging)
+            }
+            .onChange(of: isDragging) { _, dragging in
+                updateCursor(isHovering: isHovering, isDragging: dragging)
+            }
+            .help("左右拖动调整工具详情宽度")
+            .accessibilityLabel("工具详情宽度调节")
+            .accessibilityHint("左右拖动调整右侧工具详情宽度")
+    }
+
+    private func updateCursor(isHovering: Bool, isDragging: Bool) {
+        if isHovering || isDragging {
+            NSCursor.resizeLeftRight.set()
+        } else {
+            NSCursor.arrow.set()
         }
     }
 }
@@ -740,6 +831,8 @@ private struct ReasoningDisclosure: View {
                                     .padding(10)
                             }
                             .frame(maxHeight: 240)
+                            .scrollIndicators(.hidden)
+                            .background(DiscoScrollIndicatorHider())
                             .onChange(of: reasoning.count) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
@@ -1395,7 +1488,9 @@ private struct ContextUsagePopover: View {
 
             Text(isCodex
                 ? "Codex 由服务端维护历史上下文和自动压缩。"
-                : "本地估算只用于阈值决策；原始聊天记录不会被删除。")
+                : store.usesNativeCompaction
+                    ? "当前 Agent 会自行维护上下文和自动压缩。"
+                    : "本地估算只用于阈值决策；原始聊天记录不会被删除。")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1673,6 +1768,8 @@ private struct ModelDrawer: View {
                 }
                 .padding(6)
             }
+            .scrollIndicators(.hidden)
+            .background(DiscoScrollIndicatorHider())
         }
         .frame(width: 168)
     }
@@ -1753,6 +1850,8 @@ private struct ModelDrawer: View {
                     }
                     .padding(.vertical, 4)
                 }
+                .scrollIndicators(.hidden)
+                .background(DiscoScrollIndicatorHider())
             }
         }
         .transition(.asymmetric(

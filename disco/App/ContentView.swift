@@ -39,7 +39,7 @@ struct ContentView: View {
                 ContentUnavailableView(
                     "选择一段对话",
                     systemImage: "bubble.left.and.bubble.right",
-                    description: Text("从左侧选择会话，或点击右上角的「新建对话」。")
+                    description: Text("从左侧选择会话，或点击项目行右侧的新建会话按钮。")
                 )
             }
         }
@@ -81,6 +81,7 @@ struct ContentView: View {
                     + "但不会删除磁盘上的项目目录。"
             )
         }
+        .background(DiscoScrollIndicatorHider())
     }
 
     private func expandSelectedProject() {
@@ -175,6 +176,10 @@ private struct ConversationSidebar: View {
                                 expandedProjectIDs.insert(project.id)
                                 appState.selectProject(id: project.id)
                             },
+                            createConversation: {
+                                expandedProjectIDs.insert(project.id)
+                                appState.createConversation(projectID: project.id)
+                            },
                             showFinder: {
                                 NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
                             },
@@ -183,7 +188,6 @@ private struct ConversationSidebar: View {
                         )
                         .id(project.id)
                     }
-
                     // 注意：Section body 必须始终是同一类型的 ForEach。
                     // 在这里用 if/else 在占位 Text 与行列表之间切换，
                     // 会触发 macOS List（NSTableView 桥接）的行渲染丢失：
@@ -200,6 +204,8 @@ private struct ConversationSidebar: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .scrollIndicators(.hidden)
+                .background(DiscoScrollIndicatorHider())
                 .scrollContentBackground(.hidden)
                 .onAppear {
                     revealSelectedProject(using: proxy)
@@ -288,7 +294,6 @@ private struct ConversationSidebar: View {
             }
 
             Spacer(minLength: 12)
-
             Menu {
                 if let currentProject {
                     Button {
@@ -410,9 +415,12 @@ private struct ProjectConversationSection: View {
     let isExpanded: Bool
     let toggle: () -> Void
     let selectProject: () -> Void
+    let createConversation: () -> Void
     let showFinder: () -> Void
     let deleteProject: () -> Void
     let reconnect: () -> Void
+
+    @State private var isHovered = false
 
     private var unavailable: Bool {
         guard let availability = appState.projectAvailability[project.id] else { return true }
@@ -420,15 +428,23 @@ private struct ProjectConversationSection: View {
         return false
     }
 
+    private var isCurrentProject: Bool {
+        appState.selectedConversation?.projectID == project.id
+    }
+
+    private var showsProjectActions: Bool {
+        isHovered || isCurrentProject
+    }
+
     var body: some View {
         Section {
             if isExpanded {
                 if conversations.isEmpty {
-                    Text("尚无对话，可使用顶部“新建对话”创建")
+                    Text("点击项目行右侧的新建会话按钮")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
-                    .padding(.leading, 42)
-                    .padding(.vertical, 4)
+                        .padding(.leading, 42)
+                        .padding(.vertical, 4)
                 } else {
                     ForEach(conversations) { conversation in
                         ConversationListRow(conversation: conversation)
@@ -474,10 +490,26 @@ private struct ProjectConversationSection: View {
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .buttonStyle(DiscoPressButtonStyle())
+                .opacity(showsProjectActions ? 1 : 0)
+                .allowsHitTesting(showsProjectActions)
+                .accessibilityHidden(!showsProjectActions)
                 .accessibilityLabel("项目操作")
                 .help("项目操作")
+
+                Button(action: createConversation) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(width: 34, height: 40)
+                }
+                .buttonStyle(DiscoPressButtonStyle())
+                .opacity(showsProjectActions ? 1 : 0)
+                .allowsHitTesting(showsProjectActions)
+                .accessibilityHidden(!showsProjectActions)
+                .accessibilityLabel("在“\(project.name)”中新建会话")
+                .help("在“\(project.name)”中新建会话")
             }
             .textCase(nil)
+            .onHover { isHovered = $0 }
         }
     }
 }

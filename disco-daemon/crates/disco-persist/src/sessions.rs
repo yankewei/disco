@@ -190,6 +190,12 @@ impl Database {
         .context("Failed to delete messages for session")?;
 
         conn.execute(
+            "DELETE FROM context_checkpoints WHERE session_id = ?1",
+            rusqlite::params![session_id.to_string()],
+        )
+        .context("Failed to delete context checkpoint for session")?;
+
+        conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
             rusqlite::params![session_id.to_string()],
         )

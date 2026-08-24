@@ -106,6 +106,7 @@ struct ContextCompactionSnapshot: Codable, Sendable, Equatable {
     let beforeTokens: Int?
     let afterTokens: Int?
     let compactedMessageCount: Int?
+    let summary: String?
     let errorMessage: String?
 
     init(
@@ -118,6 +119,7 @@ struct ContextCompactionSnapshot: Codable, Sendable, Equatable {
         beforeTokens: Int? = nil,
         afterTokens: Int? = nil,
         compactedMessageCount: Int? = nil,
+        summary: String? = nil,
         errorMessage: String? = nil
     ) {
         self.id = id
@@ -129,6 +131,7 @@ struct ContextCompactionSnapshot: Codable, Sendable, Equatable {
         self.beforeTokens = beforeTokens
         self.afterTokens = afterTokens
         self.compactedMessageCount = compactedMessageCount
+        self.summary = summary
         self.errorMessage = errorMessage
     }
 }

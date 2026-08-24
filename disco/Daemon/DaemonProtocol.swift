@@ -163,6 +163,7 @@ struct DaemonContextCompactionData: Codable, Sendable {
     let completedAt: String?
     let beforeTokens: Int?
     let afterTokens: Int?
+    let summary: String?
     let errorMessage: String?
 }
 

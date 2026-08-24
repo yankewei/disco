@@ -189,6 +189,10 @@ struct ACPSessionInfo: Decodable, Sendable {
         }
         return SessionRuntimeKind.from(providerID: providerID)
     }
+
+    var compactionMode: String? {
+        meta?.objectValue?["disco/compactionMode"]?.stringValue
+    }
 }
 
 struct ACPDeleteSessionResult: Decodable, Sendable {}
@@ -234,7 +238,15 @@ private struct ACPClientInfo: Encodable, Sendable {
     let version: String
 }
 
-private struct ACPClientCapabilities: Encodable, Sendable {}
+private struct ACPCompactionCapabilities: Encodable, Sendable {}
+
+private struct ACPSessionClientCapabilities: Encodable, Sendable {
+    let compaction: ACPCompactionCapabilities
+}
+
+private struct ACPClientCapabilities: Encodable, Sendable {
+    let session: ACPSessionClientCapabilities
+}
 
 private struct ACPInitializeParams: Encodable, Sendable {
     let protocolVersion: Int
@@ -476,7 +488,11 @@ final class ACPDaemonClient {
             "initialize",
             params: ACPInitializeParams(
                 protocolVersion: 1,
-                clientCapabilities: ACPClientCapabilities(),
+                clientCapabilities: ACPClientCapabilities(
+                    session: ACPSessionClientCapabilities(
+                        compaction: ACPCompactionCapabilities()
+                    )
+                ),
                 clientInfo: ACPClientInfo(name: "disco", version: "0.1.0")
             ),
             as: ACPInitializeResult.self
@@ -845,6 +861,16 @@ final class ACPDaemonClient {
                   let sessionID = object["sessionId"]?.stringValue,
                   let update = object["update"] else {
                 if let id { sendInvalidIncomingRequestResponse(id: id) }
+                return
+            }
+            sessionUpdateContinuation?.yield(
+                ACPSessionUpdate(sessionID: sessionID, update: update)
+            )
+        case "_disco/session/compaction":
+            guard let params,
+                  let object = params.objectValue,
+                  let sessionID = object["sessionId"]?.stringValue,
+                  let update = object["update"] else {
                 return
             }
             sessionUpdateContinuation?.yield(

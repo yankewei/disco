@@ -127,12 +127,15 @@ pub fn truncate_output(output: &str) -> String {
     if output.len() <= MAX_OUTPUT_SIZE {
         output.to_string()
     } else {
-        let kept = MAX_OUTPUT_SIZE;
-        let truncated = output.len() - kept;
+        let mut kept_bytes = MAX_OUTPUT_SIZE;
+        while !output.is_char_boundary(kept_bytes) {
+            kept_bytes -= 1;
+        }
+        let truncated_bytes = output.len() - kept_bytes;
         format!(
             "{}\n\n[... {} bytes truncated]",
-            &output[..kept],
-            truncated
+            &output[..kept_bytes],
+            truncated_bytes
         )
     }
 }
@@ -199,6 +202,17 @@ mod tests {
         let truncated = truncate_output(&output);
         assert!(truncated.len() < output.len());
         assert!(truncated.contains("bytes truncated"));
+    }
+
+    #[test]
+    fn truncate_multibyte_output_at_character_boundary() {
+        let output = format!("{}中rest", "x".repeat(MAX_OUTPUT_SIZE - 1));
+        let truncated = truncate_output(&output);
+        let (kept, note) = truncated.split_once("\n\n[...").unwrap();
+
+        assert_eq!(kept.len(), MAX_OUTPUT_SIZE - 1);
+        assert!(kept.is_char_boundary(kept.len()));
+        assert!(note.contains("bytes truncated"));
     }
 
     #[test]

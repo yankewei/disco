@@ -508,6 +508,7 @@ dependencies = [
  "futures-core",
  "rig-agent",
  "rig-core",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -607,6 +608,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "disco-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

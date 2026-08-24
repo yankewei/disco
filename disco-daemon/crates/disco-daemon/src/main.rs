@@ -137,6 +137,31 @@ async fn main() {
                             continue;
                         }
                     }
+                } else if config.provider_id.as_str() == ProviderId::OPENCODE_APP_SERVER {
+                    let options = provider_service::opencode_session_config_options(
+                        &config.model,
+                        config.reasoning_effort.as_deref(),
+                    );
+                    match AcpAdapter::connect_with_session_config(
+                        AcpAgentConfig::new(disco_providers::find_opencode()).arg("acp"),
+                        options,
+                    )
+                    .await
+                    {
+                        Ok(adapter) => ProviderRuntime {
+                            backend: Arc::new(adapter),
+                            compaction_provider: Arc::new(UnavailableModelProvider::new(
+                                "OpenCode provider 不支持上下文压缩",
+                            )),
+                        },
+                        Err(error) => {
+                            tracing::warn!(
+                                "Failed to connect OpenCode ACP agent {}: {error}",
+                                config.provider_id
+                            );
+                            continue;
+                        }
+                    }
                 } else {
                     match api_key_provider_runtime(
                         config.vendor,

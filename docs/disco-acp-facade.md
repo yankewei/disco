@@ -49,6 +49,10 @@ ACP v1 将自定义方法限制为以下划线开头，因此 facade 的实际 w
 - `_disco/session/messages`
 - `_disco/session/compact`
 
+上下文压缩事件使用 ACP extension notification `_disco/session/compaction`。其 `update`
+payload 遵循 ACP v1 compaction RFD 的 `sessionUpdate: "compaction_update"` 结构；这是
+SDK 尚未提供 typed update 时的兼容承载方式。
+
 扩展参数使用 ACP 的 camelCase 字段名。Provider 配置会复用现有 daemon 配置校验、SQLite
 持久化和 runtime 装配逻辑。
 
@@ -85,12 +89,13 @@ ACP facade 消费 daemon 共享 run service 的 `AgentOutput`，并映射为协�
 | `ReasoningDelta` | `session/update.agent_thought_chunk` |
 | `ToolStarted` | `session/update.tool_call` |
 | `ToolCompleted` | `session/update.tool_call_update` |
+| `CompactionUpdate` | `_disco/session/compaction`，payload 为 `compaction_update` |
 | `ApprovalWaiting` | `session/request_permission` |
 | `Completed` | `session/prompt` 返回 `end_turn` |
 | `Cancelled` | `session/prompt` 返回 `cancelled` |
 | `Failed` | `session/prompt` 返回 JSON-RPC internal error |
 
-Provider 配置、模型目录、session 删除、上下文压缩等产品操作由共享 service
+Provider 配置、模型目录、session 删除、本地上下文压缩等产品操作由共享 service
 （`provider_service.rs`、`session_service.rs`、`compaction_service.rs`）实现，运行主链路
 由共享 `run_service.rs` 承担。
 

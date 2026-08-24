@@ -117,10 +117,13 @@ struct ToolExecutionView: View {
         return values.joined(separator: "，")
     }
 }
-
-struct ToolCallInspector: View {
+struct ToolCallInspector: View, Equatable {
     let call: ChatMessage.ToolCallSnapshot
     let dismiss: () -> Void
+
+    static func == (lhs: ToolCallInspector, rhs: ToolCallInspector) -> Bool {
+        lhs.call == rhs.call
+    }
 
     private var presentation: ToolCallPresentation {
         ToolCallPresentation(call: call)
@@ -198,6 +201,8 @@ struct ToolCallInspector: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(16)
             }
+            .scrollIndicators(.hidden)
+            .background(DiscoScrollIndicatorHider())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DiscoTheme.surface)

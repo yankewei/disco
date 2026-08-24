@@ -214,6 +214,31 @@ final class ACPTransportTests: XCTestCase {
         XCTAssertEqual(standardUsageData.current.total, 53_000)
         XCTAssertEqual(standardUsageData.contextWindow, 200_000)
         XCTAssertNil(standardUsageData.accumulated)
+
+        let compactionUpdate = ACPSessionUpdate(
+            sessionID: sessionID,
+            update: .object([
+                "sessionUpdate": .string("compaction_update"),
+                "compactionId": .string("cmp-1"),
+                "status": .string("completed"),
+                "runtimeKind": .string("codex_app_server"),
+                "beforeTokens": .number(1000),
+                "afterTokens": .number(250),
+                "summary": .string("保留关键上下文")
+            ])
+        )
+        let compactionEvents = ACPDaemonEventMapper.sessionUpdateEvents(
+            compactionUpdate,
+            runID: runID,
+            shouldEmitRunningState: false
+        )
+        XCTAssertEqual(compactionEvents.map(\.eventName), ["context.compaction"])
+        let compactionData = try compactionEvents[0].decoded(
+            as: DaemonContextCompactionData.self
+        )
+        XCTAssertEqual(compactionData.id, "cmp-1")
+        XCTAssertEqual(compactionData.runtimeKind, "codex_app_server")
+        XCTAssertEqual(compactionData.summary, "保留关键上下文")
     }
 
     func testACPEventMapperTranslatesToolCallLifecycle() throws {

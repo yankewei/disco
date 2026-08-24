@@ -10,6 +10,17 @@ use uuid::Uuid;
 
 use crate::{AgentOutput, ApprovalManager};
 
+/// 上下文压缩的权威来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionMode {
+    /// Backend 不提供压缩语义。
+    Unsupported,
+    /// Disco 在 Backend 内部维护 transcript 并执行本地压缩。
+    Local,
+    /// Backend 自己维护上下文，Disco 只转发压缩事件。
+    Native,
+}
+
 /// 后端对 Disco 暴露的稳定能力。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCapabilities {
@@ -17,6 +28,8 @@ pub struct BackendCapabilities {
     pub has_persistent_sessions: bool,
     /// 后端是否支持删除其权威会话。
     pub can_delete_session: bool,
+    /// 上下文压缩由谁负责。
+    pub compaction: CompactionMode,
 }
 
 /// 启动一次后端运行所需的会话快照。

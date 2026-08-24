@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, ApprovalRequest, BackendCapabilities, BackendRun,
-    BackendRunRequest, BackendSession, PreparedApproval,
+    BackendRunRequest, BackendSession, CompactionMode, CompactionUpdate, PreparedApproval,
 };
 use disco_protocol::types::{ApprovalDecision, ApprovalImpact};
 #[cfg(test)]
@@ -66,6 +66,7 @@ impl AgentBackend for CodexAdapter {
         BackendCapabilities {
             has_persistent_sessions: true,
             can_delete_session: true,
+            compaction: CompactionMode::Native,
         }
     }
 
@@ -126,6 +127,20 @@ impl AgentBackend for CodexAdapter {
                             Some(Ok(CodexProviderEvent::TextDelta(delta))) => AgentOutput::TextDelta(delta),
                             Some(Ok(CodexProviderEvent::ReasoningDelta(delta))) => AgentOutput::ReasoningDelta(delta),
                             Some(Ok(CodexProviderEvent::Usage(usage))) => AgentOutput::Usage(usage),
+                            Some(Ok(CodexProviderEvent::Compaction(update))) => {
+                                AgentOutput::CompactionUpdate(CompactionUpdate {
+                                    id: update.id,
+                                    status: match update.status.as_str() {
+                                        "running" => disco_protocol::types::CompactionStatus::Running,
+                                        "completed" => disco_protocol::types::CompactionStatus::Completed,
+                                        _ => disco_protocol::types::CompactionStatus::Failed,
+                                    },
+                                    before_tokens: update.before_tokens,
+                                    after_tokens: update.after_tokens,
+                                    summary: update.summary,
+                                    error_message: update.error_message,
+                                })
+                            }
                             Some(Ok(CodexProviderEvent::ToolStarted(tool))) => {
                                 tool_arguments_by_id.insert(tool.id.clone(), tool.arguments.clone());
                                 AgentOutput::ToolStarted {

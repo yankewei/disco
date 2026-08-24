@@ -5,6 +5,7 @@
 //  Created by 闫柯玮 on 2026/8/4.
 //
 
+import AppKit
 import SwiftUI
 
 @main
