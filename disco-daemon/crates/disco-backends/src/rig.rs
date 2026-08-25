@@ -206,7 +206,11 @@ where
         })
     }
 
-    async fn delete_session(&self, _session: &BackendSession) -> Result<()> {
+    async fn delete_session(
+        &self,
+        _session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<()> {
         // API Key 后端没有远端持久会话，权威会话状态只存在于 Disco 数据库。
         Ok(())
     }

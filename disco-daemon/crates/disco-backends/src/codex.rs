@@ -199,7 +199,11 @@ impl AgentBackend for CodexAdapter {
         })
     }
 
-    async fn delete_session(&self, session: &BackendSession) -> Result<()> {
+    async fn delete_session(
+        &self,
+        session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<()> {
         let provider = self.sessions.lock().await.remove(&session.id);
         let provider = match (provider, session.backend_handle.as_ref()) {
             (Some(provider), _) => provider,
@@ -532,10 +536,13 @@ while read -r ignored; do :; done
         assert!(matches!(&events[5], AgentOutput::Completed));
 
         adapter
-            .delete_session(&BackendSession {
-                backend_handle: run.backend_handle,
-                ..session
-            })
+            .delete_session(
+                &BackendSession {
+                    backend_handle: run.backend_handle,
+                    ..session
+                },
+                None,
+            )
             .await
             .unwrap();
     }
@@ -729,11 +736,14 @@ while read -r ignored; do :; done
         );
         let adapter = CodexAdapter::new(executable.path(), None);
         adapter
-            .delete_session(&BackendSession {
-                id: Uuid::new_v4(),
-                model: "gpt-5-codex".to_string(),
-                backend_handle: Some("missing-thread".to_string()),
-            })
+            .delete_session(
+                &BackendSession {
+                    id: Uuid::new_v4(),
+                    model: "gpt-5-codex".to_string(),
+                    backend_handle: Some("missing-thread".to_string()),
+                },
+                None,
+            )
             .await
             .unwrap();
     }

@@ -17,7 +17,9 @@ Rust agent 生态的扩展能力。
 2. Rust daemon 是唯一 agent host，负责运行、会话、权限、工具、安全策略和持久化。
 3. 系统必须支持三类 agent 后端：
    - Codex app-server：Codex 自有 JSON-RPC 协议，Codex 自己拥有 agent loop 和 thread。
-   - ACP agent：OpenCode、Kimi、Qoder 等，后端通过 ACP 暴露完整 agent 能力。
+   - OpenCode server：daemon 托管一个 loopback `opencode serve`，通过 REST + SSE 接入；每个
+     project-scoped 请求显式携带绝对 `directory`，不依赖 server 当前工作目录。
+   - ACP agent：Kimi、Qoder 等，后端通过 ACP 暴露完整 agent 能力。
    - 模型 API：DeepSeek、Codex/OpenAI API Key、Anthropic 等，Disco 基于 Rig
      运行自己的 agent。
 4. Swift 只维护一个 daemon 客户端和一套公共运行状态，不感知后端原始协议。
@@ -37,7 +39,7 @@ Rust agent 生态的扩展能力。
 
 ### A1. Rust daemon 是唯一 agent 内核
 
-SwiftUI 不直连模型、不启动 Codex、不启动外部 ACP agent，也不持有后端会话句柄。
+SwiftUI 不直连模型、不启动 Codex 或 OpenCode，也不持有后端会话句柄。
 这些职责全部收敛到 daemon。
 
 ### A2. App 使用 ACP-compatible Disco Protocol
@@ -104,6 +106,7 @@ App 通过 `disco/*` 扩展提交和读取配置。daemon 负责校验、持久�
 │          ▼                                              │
 │  AgentBackend seam                                      │
 │    ├── CodexAdapter ── Codex app-server JSON-RPC        │
+│    ├── OpenCodeAdapter ── REST + SSE ── opencode serve  │
 │    ├── AcpAdapter   ── External ACP agent               │
 │    └── RigBackend   ── Rig ── Model Provider APIs       │
 │                                                         │

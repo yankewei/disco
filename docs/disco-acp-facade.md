@@ -53,6 +53,10 @@ ACP v1 将自定义方法限制为以下划线开头，因此 facade 的实际 w
 - `_disco/event/replay`：按 session 的 epoch 和 sequence 重放连接短暂中断期间的 session
   update。事件仅保留在 daemon 进程内的有限窗口，完整历史仍从 SQLite 恢复。
 
+`_disco/provider/models` 的 `workspacePath` 使用当前项目的绝对路径。它只用于 daemon 内部
+向 OpenCode Server 传递 `directory` 查询参数，不是 OpenCode 的 workspace ID；SwiftUI 不
+直接访问 OpenCode Server。
+
 上下文压缩事件使用 ACP extension notification `_disco/session/compaction`。其 `update`
 payload 遵循 ACP v1 compaction RFD 的 `sessionUpdate: "compaction_update"` 结构；这是
 SDK 尚未提供 typed update 时的兼容承载方式。

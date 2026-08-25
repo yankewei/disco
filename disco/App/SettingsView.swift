@@ -550,7 +550,8 @@ private struct VendorDetailPanel: View {
                 let loadedModels = try await appState.availableModels(
                     vendor: vendor,
                     baseURL: trimmedBaseURL.isEmpty ? nil : trimmedBaseURL,
-                    apiKey: apiKey
+                    apiKey: apiKey,
+                    workspacePath: appState.modelDiscoveryWorkspacePath
                 )
                 guard !Task.isCancelled else { return }
                 draft.models = loadedModels

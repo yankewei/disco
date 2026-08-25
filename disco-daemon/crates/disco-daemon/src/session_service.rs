@@ -73,13 +73,18 @@ pub async fn delete_session(
         .db
         .get_session_backend_handle(session.id)
         .map_err(|error| SessionDeleteError::Internal(error.to_string()))?;
+    let workspace_path = app
+        .db
+        .get_project(session.project_id)
+        .map_err(|error| SessionDeleteError::Internal(error.to_string()))?
+        .map(|project| project.path);
     let backend_session = BackendSession {
         id: session.id,
         model: session.model,
         backend_handle,
     };
     backend
-        .delete_session(&backend_session)
+        .delete_session(&backend_session, workspace_path)
         .await
         .map_err(|error| SessionDeleteError::BackendDeleteFailed(error.to_string()))?;
 
@@ -119,7 +124,11 @@ mod tests {
             Err(anyhow::anyhow!("测试后端不运行任务"))
         }
 
-        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+        async fn delete_session(
+            &self,
+            _session: &BackendSession,
+            _workspace_path: Option<String>,
+        ) -> anyhow::Result<()> {
             Err(anyhow::anyhow!("上游不可用"))
         }
     }

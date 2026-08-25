@@ -6,13 +6,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, CloseSessionRequest, ContentBlock, DeleteSessionRequest, ErrorCode,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOption,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOption,
     PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
     SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCall, ToolCallStatus,
     ToolCallUpdate, ToolKind,
-    InitializeResponse,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, JsonRpcMessage,
@@ -286,8 +285,7 @@ impl AcpAdapter {
             if !self.can_load_sessions {
                 bail!("ACP agent 不支持恢复已有 session {handle}");
             }
-            self
-                .connection
+            self.connection
                 .send_request(LoadSessionRequest::new(session_id.clone(), workspace))
                 .block_task()
                 .await
@@ -588,7 +586,11 @@ impl AgentBackend for AcpAdapter {
         })
     }
 
-    async fn delete_session(&self, session: &BackendSession) -> Result<()> {
+    async fn delete_session(
+        &self,
+        session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<()> {
         let Some(handle) = session.backend_handle.as_deref() else {
             return Ok(());
         };
@@ -984,8 +986,8 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AgentCapabilities, ContentChunk, DeleteSessionResponse, InitializeResponse,
         LoadSessionResponse, NewSessionResponse, PromptResponse, SessionCapabilities,
-        SessionDeleteCapabilities, TextContent, ToolCallUpdateFields, UsageUpdate,
-        SessionNotification,
+        SessionDeleteCapabilities, SessionNotification, TextContent, ToolCallUpdateFields,
+        UsageUpdate,
     };
     use disco_providers::ChatMessage;
     use tokio::sync::Notify;
@@ -1348,11 +1350,14 @@ mod tests {
         );
 
         backend
-            .delete_session(&BackendSession {
-                id: Uuid::new_v4(),
-                model: "fake-acp".to_string(),
-                backend_handle: Some("restored-session".to_string()),
-            })
+            .delete_session(
+                &BackendSession {
+                    id: Uuid::new_v4(),
+                    model: "fake-acp".to_string(),
+                    backend_handle: Some("restored-session".to_string()),
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(state.delete_session_count.load(Ordering::Relaxed), 1);

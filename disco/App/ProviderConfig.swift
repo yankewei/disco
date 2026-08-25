@@ -63,7 +63,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "Kimi Code 订阅 API，使用 Chat Completions 接口"
         case .zhipu: "智谱清言 GLM API，兼容 OpenAI 接口"
         case .chatgpt: "使用 Codex (OpenAI) 订阅额度（codex app-server）"
-        case .opencode: "本地 opencode CLI，经 ACP 驱动（模型由 opencode 自身管理）"
+        case .opencode: "本地 opencode server，经 REST + SSE 驱动（模型由 opencode 自身管理）"
         case .anthropic: "Anthropic 官方 Claude API"
         case .gemini: "Google Gemini API"
         }
@@ -133,7 +133,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .deepseek: ["none", "low", "high", "max"]
         case .kimiCode: ["none", "low", "high", "max"]
         case .openai, .moonshot, .zhipu: ["none", "high"]
-        // OpenCode 的 effort 能力按模型从 ACP configOptions 获取，不能用供应商级静态列表兜底。
+        // OpenCode 的 effort 能力按模型由 server 返回，不能用供应商级静态列表兜底。
         case .opencode: []
         default: []
         }

@@ -44,6 +44,9 @@ pub struct ProviderModelsParams {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// 用于需要工作区上下文的本地 Provider（例如 OpenCode）模型发现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
 }
 
 // MARK: - 审批（run service 产生的协议无关审批请求）

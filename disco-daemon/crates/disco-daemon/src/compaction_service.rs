@@ -110,19 +110,32 @@ pub async fn compact_session_with_id(
 /// 解析会话模型的上下文窗口。
 ///
 /// API Key 服务商优先使用内置模型目录的 context_window；OpenCode 的目录来自
-/// ACP agent 的 session configOptions 缓存。模型未收录时回退到默认窗口，
+/// OpenCode server 的模型目录缓存。模型未收录时回退到默认窗口，
 /// 阈值偏保守，不影响正确性。
 async fn context_window_for(app: &Arc<AppState>, session: &disco_protocol::types::Session) -> i64 {
-    let entries = if session.vendor == Vendor::OpenCode {
-        app.opencode_model_catalog
+    if session.vendor == Vendor::OpenCode {
+        let Some(workspace) = app
+            .db
+            .get_project(session.project_id)
+            .ok()
+            .flatten()
+            .map(|project| project.path)
+        else {
+            return disco_core::DEFAULT_CONTEXT_WINDOW;
+        };
+        return app
+            .opencode_model_catalog
             .lock()
             .await
-            .clone()
-            .unwrap_or_default()
-    } else {
-        crate::provider_service::get_default_models(session.vendor)
-    };
-    entries
+            .get(&workspace)
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.id == session.model)
+            .and_then(|entry| entry.context_window)
+            .unwrap_or(disco_core::DEFAULT_CONTEXT_WINDOW);
+    }
+
+    crate::provider_service::get_default_models(session.vendor)
         .into_iter()
         .find(|entry| entry.id == session.model)
         .and_then(|entry| entry.context_window)
@@ -133,6 +146,7 @@ async fn context_window_for(app: &Arc<AppState>, session: &disco_protocol::types
 mod tests {
     use super::*;
     use crate::run_service::test_support::{ScriptedBackend, make_test_app};
+    use disco_protocol::types::ModelCatalogEntry;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -161,5 +175,47 @@ mod tests {
         assert_eq!(outcome.status, CompactionStatus::Failed);
         assert!(outcome.before_tokens.is_some());
         assert!(outcome.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn opencode_context_window_uses_the_session_project_catalog() {
+        let (app, session_id) = make_test_app(Arc::new(ScriptedBackend {
+            outputs: vec![],
+            backend_handle: None,
+        }));
+        let mut session = app.db.get_session(session_id).unwrap().unwrap();
+        session.vendor = Vendor::OpenCode;
+        session.model = "provider/model".to_string();
+        let project_path = app
+            .db
+            .get_project(session.project_id)
+            .unwrap()
+            .unwrap()
+            .path;
+
+        app.opencode_model_catalog.lock().await.extend([
+            (
+                project_path,
+                vec![ModelCatalogEntry {
+                    id: session.model.clone(),
+                    display_name: None,
+                    context_window: Some(123_456),
+                    supported_reasoning_efforts: None,
+                    default_reasoning_effort: None,
+                }],
+            ),
+            (
+                "/tmp/other-project".to_string(),
+                vec![ModelCatalogEntry {
+                    id: session.model.clone(),
+                    display_name: None,
+                    context_window: Some(654_321),
+                    supported_reasoning_efforts: None,
+                    default_reasoning_effort: None,
+                }],
+            ),
+        ]);
+
+        assert_eq!(context_window_for(&app, &session).await, 123_456);
     }
 }

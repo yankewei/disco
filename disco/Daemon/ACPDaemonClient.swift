@@ -359,6 +359,7 @@ private struct ACPProviderModelsParams: Encodable, Sendable {
     let vendor: String
     let baseUrl: String?
     let apiKey: String?
+    let workspacePath: String?
 }
 
 /// `session/request_permission` 响应的 outcome 字段：服务端按 ACP schema
@@ -704,7 +705,8 @@ final class ACPDaemonClient {
         providerID: String?,
         vendor: String,
         baseURL: String? = nil,
-        apiKey: String? = nil
+        apiKey: String? = nil,
+        workspacePath: String? = nil
     ) async throws -> [ACPModelCatalogEntry] {
         let result = try await request(
             "_disco/provider/models",
@@ -712,7 +714,8 @@ final class ACPDaemonClient {
                 providerId: providerID,
                 vendor: vendor,
                 baseUrl: baseURL,
-                apiKey: apiKey
+                apiKey: apiKey,
+                workspacePath: workspacePath
             ),
             as: ACPProviderModelsResult.self
         )

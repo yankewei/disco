@@ -112,6 +112,15 @@ final class AppState: ObservableObject {
         return conversations.first { $0.id == selectedConversationID } ?? conversations.first
     }
 
+    /// 设置页查询本地 Provider 模型时使用当前会话的项目工作区；临时会话回退到用户主目录。
+    var modelDiscoveryWorkspacePath: String {
+        if let projectID = selectedConversation?.projectID,
+           case let .available(workspace) = projectAvailability[projectID] {
+            return workspace.rootURL.path
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
     init(
         keychain: APIKeyStoring? = nil,
         defaults: UserDefaults? = nil,
@@ -460,7 +469,8 @@ final class AppState: ObservableObject {
     func availableModels(
         vendor: ProviderVendor,
         baseURL: String? = nil,
-        apiKey: String? = nil
+        apiKey: String? = nil,
+        workspacePath: String? = nil
     ) async throws -> [String] {
         guard useDaemon else {
             throw DaemonError.notConnected
@@ -469,7 +479,8 @@ final class AppState: ObservableObject {
             providerID: vendor.daemonProviderID,
             vendor: vendor.daemonVendor,
             baseURL: baseURL,
-            apiKey: apiKey
+            apiKey: apiKey,
+            workspacePath: workspacePath
         )
         let modelCatalog = entries.map { entry in
             vendor.enrichingCatalogEntry(ModelCatalogEntry(
@@ -780,8 +791,8 @@ final class AppState: ObservableObject {
                     removeProjectLocally(id: id)
                 } catch let error as ACPDaemonError {
                     if isUnsupportedRemoteSessionDeletion(error) {
-                        // 部分 ACP 后端（例如 OpenCode）没有实现 session/delete；
-                        // 此时仍移除 Disco 本地项目记录，避免项目永久无法删除。
+                        // 部分远端 backend 没有实现 session/delete；此时仍移除
+                        // Disco 本地项目记录，避免项目永久无法删除。
                         for conversation in daemonConversations {
                             markRemoteSessionAsDeleted(conversation.id)
                         }

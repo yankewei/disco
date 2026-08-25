@@ -1,55 +1,12 @@
 use std::sync::Arc;
 
-use agent_client_protocol::AcpAgentConfig;
-use agent_client_protocol::schema::v1::{
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
-};
-use disco_backends::{AcpAdapter, CodexAdapter, ModelEntry, SessionConfigSelection};
+use disco_backends::{CodexAdapter, ModelEntry, OpenCodeAdapter};
 use disco_protocol::types::{ModelCatalogEntry, ProviderId, Vendor};
 use disco_providers::{CodexProvider, UnavailableModelProvider};
 
 use crate::daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
 
-/// 本地 opencode CLI 作为 ACP agent 的启动配置。
-fn opencode_acp_config() -> AcpAgentConfig {
-    AcpAgentConfig::new(disco_providers::find_opencode()).arg("acp")
-}
-
-/// 构造下发给 opencode 的 session 配置项：模型 + 思考级别（effort）。
-///
-/// 顺序敏感：effort 档位依赖当前模型，必须先设置模型。
-pub(crate) fn opencode_session_config_options(
-    model: &str,
-    reasoning_effort: Option<&str>,
-) -> Vec<SessionConfigSelection> {
-    let mut options = Vec::new();
-    if !model.is_empty() {
-        options.push(SessionConfigSelection {
-            config_id: "model".to_string(),
-            value: model.to_string(),
-        });
-    }
-    if let Some(effort) = reasoning_effort.filter(|value| !value.is_empty()) {
-        options.push(SessionConfigSelection {
-            config_id: "effort".to_string(),
-            value: effort.to_string(),
-        });
-    }
-    options
-}
-
-/// 启动并连接外部 opencode ACP agent。
-async fn connect_opencode(
-    session_config_options: Vec<SessionConfigSelection>,
-) -> Result<AcpAdapter, ProviderError> {
-    AcpAdapter::connect_with_session_config(opencode_acp_config(), session_config_options)
-        .await
-        .map_err(|error| {
-            ProviderError::InvalidParams(format!("启动 OpenCode ACP agent 失败：{error}"))
-        })
-}
-
-fn opencode_runtime(adapter: AcpAdapter) -> ProviderRuntime {
+fn opencode_runtime(adapter: OpenCodeAdapter) -> ProviderRuntime {
     ProviderRuntime {
         backend: Arc::new(adapter),
         compaction_provider: Arc::new(UnavailableModelProvider::new(
@@ -132,11 +89,12 @@ pub async fn configure_provider(
             )),
         }
     } else if config.provider_id.as_str() == ProviderId::OPENCODE_APP_SERVER {
-        let options =
-            opencode_session_config_options(&params.model, params.reasoning_effort.as_deref());
-        let runtime = opencode_runtime(connect_opencode(options).await?);
-        // 配置更新后清除模型目录缓存，下次请求重新从 agent 拉取。
-        *app.opencode_model_catalog.lock().await = None;
+        let runtime = opencode_runtime(OpenCodeAdapter::new_with_server_manager(
+            app.opencode_server_manager.clone(),
+            params.reasoning_effort.clone(),
+        ));
+        // 配置更新后清除模型目录缓存，下次请求重新从 server 拉取。
+        app.opencode_model_catalog.lock().await.clear();
         runtime
     } else {
         api_key_provider_runtime(
@@ -185,16 +143,16 @@ pub fn list_providers(
 
 /// 返回 Provider 的模型目录。
 ///
-/// - OpenCode：从 ACP agent 的 session configOptions 读取（带缓存）。
+/// - OpenCode：从当前 runtime 的本地 server API 刷新读取，结果写入运行时元数据缓存。
 /// - API Key 类服务商：带凭据时用 Rig `list_models()` 实时查询，失败回退内置目录。
 /// - 其他：内置默认目录。
 pub async fn list_provider_models(
     app: &Arc<AppState>,
     params: disco_protocol::ProviderModelsParams,
 ) -> Result<Vec<ModelCatalogEntry>, ProviderError> {
-    resolve_provider_id(params.provider_id, params.vendor)?;
+    let provider_id = resolve_provider_id(params.provider_id, params.vendor)?;
     match params.vendor {
-        Vendor::OpenCode => opencode_model_catalog(app).await,
+        Vendor::OpenCode => opencode_model_catalog(app, provider_id, params.workspace_path).await,
         Vendor::Codex => {
             let executable = CodexProvider::find_codex();
             codex_app_server_models(&executable).await
@@ -245,8 +203,6 @@ async fn codex_app_server_models(
         })
         .collect())
 }
-
-/// 用 Rig 实时获取 API Key 类服务商的模型列表。
 
 /// 用 Rig 实时获取 API Key 类服务商的模型列表。
 ///
@@ -320,118 +276,40 @@ fn is_chat_capable_model(model: &ModelEntry) -> bool {
         .any(|marker| normalized_id.contains(marker))
 }
 
-/// 返回 opencode 模型目录：优先用缓存；否则临时连接 ACP agent，
-/// 从 session configOptions 的 `model` 选项读取真实列表（含显示名）。
+/// 返回 OpenCode 模型目录：每次验证都通过当前 runtime 的 server API 读取真实列表。
 ///
-/// agent 不可用或未返回模型列表时返回错误（让设置页验证如实失败），
+/// server 不可用或未返回模型列表时返回错误（让设置页验证如实失败），
 /// 不缓存失败结果。
 async fn opencode_model_catalog(
     app: &Arc<AppState>,
+    provider_id: ProviderId,
+    workspace_path: Option<String>,
 ) -> Result<Vec<ModelCatalogEntry>, ProviderError> {
-    let cached = { app.opencode_model_catalog.lock().await.clone() };
-    if let Some(catalog) = cached {
-        return Ok(catalog);
-    }
-    let catalog = fetch_opencode_model_catalog().await?;
+    // None 仅用于兼容旧客户端；新客户端总是传当前会话所属项目目录。
+    let cache_key = workspace_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("__daemon_current_directory__")
+        .to_string();
+    let backend = app.get_backend(&provider_id).await.ok_or_else(|| {
+        ProviderError::Internal(format!(
+            "Provider {} 当前没有可用的 OpenCode Backend",
+            provider_id
+        ))
+    })?;
+    let catalog = backend.list_models(workspace_path).await.map_err(|error| {
+        ProviderError::InvalidParams(format!("无法读取 OpenCode 模型列表：{error}"))
+    })?;
     if catalog.is_empty() {
-        return Err(ProviderError::Internal(
-            "opencode agent 未返回模型列表".to_string(),
+        return Err(ProviderError::InvalidParams(
+            "OpenCode 没有返回可用的已连接模型，请先在 OpenCode CLI 中登录 provider。".to_string(),
         ));
     }
-    *app.opencode_model_catalog.lock().await = Some(catalog.clone());
-    Ok(catalog)
-}
-
-async fn fetch_opencode_model_catalog() -> Result<Vec<ModelCatalogEntry>, ProviderError> {
-    let adapter = connect_opencode(Vec::new()).await?;
-    let options = adapter
-        .fetch_session_config_options()
+    app.opencode_model_catalog
+        .lock()
         .await
-        .map_err(|error| {
-            ProviderError::InvalidParams(format!("无法读取 opencode 模型列表：{error}"))
-        })?;
-    let mut catalog = model_entries_from_config_options(&options);
-    for entry in &mut catalog {
-        match adapter
-            .fetch_session_config_options_for_model(&entry.id)
-            .await
-        {
-            Ok(model_options) => apply_model_config_capabilities(entry, &model_options),
-            Err(error) => tracing::warn!(
-                model = %entry.id,
-                %error,
-                "无法读取 OpenCode 模型的独立配置能力"
-            ),
-        }
-    }
+        .insert(cache_key, catalog.clone());
     Ok(catalog)
-}
-
-/// 从 session configOptions 中提取 `model` 选项的全部可选模型。
-fn model_entries_from_config_options(options: &[SessionConfigOption]) -> Vec<ModelCatalogEntry> {
-    let Some(option) = options
-        .iter()
-        .find(|option| option.id.0.as_ref() == "model")
-    else {
-        return Vec::new();
-    };
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return Vec::new();
-    };
-    let choices: Vec<(&str, &str)> = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(entries) => entries
-            .iter()
-            .map(|entry| (entry.value.0.as_ref(), entry.name.as_str()))
-            .collect(),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|group| group.options.iter())
-            .map(|entry| (entry.value.0.as_ref(), entry.name.as_str()))
-            .collect(),
-        _ => return Vec::new(),
-    };
-    choices
-        .into_iter()
-        .map(|(id, name)| ModelCatalogEntry {
-            id: id.to_string(),
-            display_name: Some(name.to_string()),
-            context_window: None,
-            supported_reasoning_efforts: None,
-            default_reasoning_effort: None,
-        })
-        .collect()
-}
-
-/// 将模型切换后 agent 返回的 effort 选项写入该模型自身的目录条目。
-fn apply_model_config_capabilities(entry: &mut ModelCatalogEntry, options: &[SessionConfigOption]) {
-    let effort = options.iter().find(|option| {
-        option.id.0.as_ref() == "effort"
-            || option.category == Some(SessionConfigOptionCategory::ThoughtLevel)
-    });
-    let Some(effort) = effort else {
-        entry.supported_reasoning_efforts = Some(Vec::new());
-        entry.default_reasoning_effort = None;
-        return;
-    };
-    let SessionConfigKind::Select(select) = &effort.kind else {
-        entry.supported_reasoning_efforts = Some(Vec::new());
-        entry.default_reasoning_effort = None;
-        return;
-    };
-    let values = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(entries) => entries
-            .iter()
-            .map(|entry| entry.value.0.to_string())
-            .collect(),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|group| group.options.iter())
-            .map(|entry| entry.value.0.to_string())
-            .collect(),
-        _ => Vec::new(),
-    };
-    entry.supported_reasoning_efforts = Some(values);
-    entry.default_reasoning_effort = Some(select.current_value.0.to_string());
 }
 
 pub fn get_default_models(vendor: Vendor) -> Vec<ModelCatalogEntry> {
@@ -508,7 +386,7 @@ pub fn get_default_models(vendor: Vendor) -> Vec<ModelCatalogEntry> {
             ]),
             default_reasoning_effort: Some("medium".to_string()),
         }],
-        // OpenCode 的模型目录只由 ACP agent 的 session configOptions 提供。
+        // OpenCode 模型目录来自本地 server API，不使用静态兜底列表。
         Vendor::OpenCode => Vec::new(),
     }
 }
@@ -517,9 +395,6 @@ pub fn get_default_models(vendor: Vendor) -> Vec<ModelCatalogEntry> {
 mod tests {
     use super::*;
     use crate::run_service::test_support::{ScriptedBackend, make_test_app};
-    use agent_client_protocol::schema::v1::{
-        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -613,68 +488,8 @@ mod tests {
 
         assert!(!get_default_models(Vendor::Codex).is_empty());
 
-        // OpenCode 模型目录只来自 ACP agent，内置目录应为空。
+        // OpenCode 模型目录只来自本地 server，内置目录应为空。
         assert!(get_default_models(Vendor::OpenCode).is_empty());
-    }
-
-    #[test]
-    fn model_entries_from_config_options_extracts_model_choices() {
-        let options = vec![
-            SessionConfigOption::select(
-                "model",
-                "Model",
-                "opencode-go/kimi-k3",
-                vec![
-                    SessionConfigSelectOption::new("opencode-go/kimi-k3", "Kimi K3"),
-                    SessionConfigSelectOption::new("opencode-go/gpt-5.6-luna", "GPT-5.6 Luna"),
-                ],
-            ),
-            SessionConfigOption::select(
-                "effort",
-                "Effort",
-                "none",
-                vec![SessionConfigSelectOption::new("none", "None")],
-            ),
-        ];
-
-        let entries = model_entries_from_config_options(&options);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "opencode-go/kimi-k3");
-        assert_eq!(entries[0].display_name.as_deref(), Some("Kimi K3"));
-        assert_eq!(entries[1].id, "opencode-go/gpt-5.6-luna");
-
-        assert!(model_entries_from_config_options(&[]).is_empty());
-    }
-
-    #[test]
-    fn model_config_capabilities_are_recorded_per_model() {
-        let mut entry = ModelCatalogEntry {
-            id: "model-a".to_string(),
-            display_name: None,
-            context_window: None,
-            supported_reasoning_efforts: None,
-            default_reasoning_effort: None,
-        };
-        let options = vec![
-            SessionConfigOption::select(
-                "effort",
-                "Effort",
-                "low",
-                vec![
-                    SessionConfigSelectOption::new("none", "None"),
-                    SessionConfigSelectOption::new("low", "Low"),
-                ],
-            )
-            .category(SessionConfigOptionCategory::ThoughtLevel),
-        ];
-
-        apply_model_config_capabilities(&mut entry, &options);
-
-        assert_eq!(
-            entry.supported_reasoning_efforts,
-            Some(vec!["none".to_string(), "low".to_string()])
-        );
-        assert_eq!(entry.default_reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -729,6 +544,7 @@ mod tests {
                 vendor: Vendor::Openai,
                 base_url: None,
                 api_key: None,
+                workspace_path: None,
             },
         )
         .await
@@ -742,6 +558,7 @@ mod tests {
                 vendor: Vendor::Openai,
                 base_url: None,
                 api_key: None,
+                workspace_path: None,
             },
         )
         .await

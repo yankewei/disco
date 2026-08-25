@@ -8,9 +8,8 @@ mod session_service;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_client_protocol::AcpAgentConfig;
 use daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
-use disco_backends::{AcpAdapter, CodexAdapter};
+use disco_backends::{CodexAdapter, OpenCodeAdapter, OpenCodeServerManager};
 use disco_core::RunCoordinator;
 use disco_persist::{Database, default_db_path};
 use disco_protocol::types::{ProviderId, Vendor};
@@ -95,6 +94,8 @@ async fn main() {
     };
 
     // Provider 保存账户/模型配置；Backend 保存 agent 运行语义。二者都按稳定 Provider ID 索引。
+    let opencode_server_manager =
+        Arc::new(OpenCodeServerManager::new(disco_providers::find_opencode()));
     let mut runtime_by_provider_id = HashMap::new();
     match db.list_provider_configs() {
         Ok(configs) => {
@@ -113,54 +114,14 @@ async fn main() {
                         backend: Arc::new(CodexAdapter::new(executable, reasoning_effort)),
                     }
                 } else if config.provider_id.as_str() == ProviderId::OPENCODE_APP_SERVER {
-                    let options = provider_service::opencode_session_config_options(
-                        &config.model,
-                        config.reasoning_effort.as_deref(),
-                    );
-                    match AcpAdapter::connect_with_session_config(
-                        AcpAgentConfig::new(disco_providers::find_opencode()).arg("acp"),
-                        options,
-                    )
-                    .await
-                    {
-                        Ok(adapter) => ProviderRuntime {
-                            backend: Arc::new(adapter),
-                            compaction_provider: Arc::new(UnavailableModelProvider::new(
-                                "OpenCode provider 不支持上下文压缩",
-                            )),
-                        },
-                        Err(error) => {
-                            tracing::warn!(
-                                "Failed to connect OpenCode ACP agent {}: {error}",
-                                config.provider_id
-                            );
-                            continue;
-                        }
-                    }
-                } else if config.provider_id.as_str() == ProviderId::OPENCODE_APP_SERVER {
-                    let options = provider_service::opencode_session_config_options(
-                        &config.model,
-                        config.reasoning_effort.as_deref(),
-                    );
-                    match AcpAdapter::connect_with_session_config(
-                        AcpAgentConfig::new(disco_providers::find_opencode()).arg("acp"),
-                        options,
-                    )
-                    .await
-                    {
-                        Ok(adapter) => ProviderRuntime {
-                            backend: Arc::new(adapter),
-                            compaction_provider: Arc::new(UnavailableModelProvider::new(
-                                "OpenCode provider 不支持上下文压缩",
-                            )),
-                        },
-                        Err(error) => {
-                            tracing::warn!(
-                                "Failed to connect OpenCode ACP agent {}: {error}",
-                                config.provider_id
-                            );
-                            continue;
-                        }
+                    ProviderRuntime {
+                        backend: Arc::new(OpenCodeAdapter::new_with_server_manager(
+                            opencode_server_manager.clone(),
+                            config.reasoning_effort.clone(),
+                        )),
+                        compaction_provider: Arc::new(UnavailableModelProvider::new(
+                            "OpenCode provider 不支持上下文压缩",
+                        )),
                     }
                 } else {
                     match api_key_provider_runtime(
@@ -199,7 +160,8 @@ async fn main() {
     let app = Arc::new(AppState {
         db,
         runtime_by_provider_id: Mutex::new(runtime_by_provider_id),
-        opencode_model_catalog: Mutex::new(None),
+        opencode_model_catalog: Mutex::new(HashMap::new()),
+        opencode_server_manager,
         run_coordinator: RunCoordinator::new(),
         executor,
         shutdown: shutdown.clone(),

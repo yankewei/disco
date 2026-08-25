@@ -455,6 +455,8 @@ struct AcpProviderModelsParams {
     base_url: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -894,6 +896,7 @@ async fn list_provider_models(
             vendor: params.vendor,
             base_url: params.base_url,
             api_key: params.api_key,
+            workspace_path: params.workspace_path,
         },
     )
     .await
@@ -1613,6 +1616,7 @@ mod tests {
         async fn delete_session(
             &self,
             _session: &disco_core::BackendSession,
+            _workspace_path: Option<String>,
         ) -> anyhow::Result<()> {
             Ok(())
         }

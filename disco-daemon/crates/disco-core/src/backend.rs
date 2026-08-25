@@ -1,8 +1,9 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
+use disco_protocol::types::ModelCatalogEntry;
 use disco_providers::ChatMessage;
 use futures_core::Stream;
 use tokio_util::sync::CancellationToken;
@@ -80,6 +81,15 @@ pub trait AgentBackend: Send + Sync {
 
     async fn start_run(&self, request: BackendRunRequest) -> Result<BackendRun>;
 
+    /// 获取后端当前可用的模型目录。没有独立模型发现 API 的后端使用默认实现。
+    async fn list_models(&self, _workspace_path: Option<String>) -> Result<Vec<ModelCatalogEntry>> {
+        bail!("该 Agent Backend 不支持动态模型目录")
+    }
+
     /// 删除权威会话。Adapter 应在内部把“已经不存在”归一化为成功。
-    async fn delete_session(&self, session: &BackendSession) -> Result<()>;
+    async fn delete_session(
+        &self,
+        session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<()>;
 }

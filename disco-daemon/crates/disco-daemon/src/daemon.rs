@@ -2,7 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use disco_backends::{deepseek_runtime, openai_chat_runtime, openai_responses_runtime};
+use disco_backends::{
+    OpenCodeServerManager, deepseek_runtime, openai_chat_runtime, openai_responses_runtime,
+};
 use disco_core::{AgentBackend, RunCoordinator};
 use disco_persist::Database;
 use disco_protocol::types::{ModelCatalogEntry, ProviderId, Vendor};
@@ -159,8 +161,8 @@ pub fn api_key_provider_runtime(
         Vendor::MoonshotKimi | Vendor::KimiCode | Vendor::Glm => {
             openai_chat_runtime(base_url, api_key, model, executor)?
         }
-        // OpenCode 走外部 ACP agent（AcpAdapter），不会经过 API Key runtime。
-        Vendor::OpenCode => anyhow::bail!("OpenCode 使用 ACP backend，不走 API Key runtime"),
+        // OpenCode 走本地 server backend，不会经过 API Key runtime。
+        Vendor::OpenCode => anyhow::bail!("OpenCode 使用 server backend，不走 API Key runtime"),
     };
     Ok(ProviderRuntime {
         backend: runtime.backend,
@@ -173,8 +175,10 @@ pub struct AppState {
     pub db: Database,
     /// Provider 配置对应的运行时依赖，配置更新时原子替换。
     pub runtime_by_provider_id: Mutex<HashMap<ProviderId, ProviderRuntime>>,
-    /// OpenCode 模型目录缓存：来自 ACP agent session configOptions，首次请求时懒加载。
-    pub opencode_model_catalog: Mutex<Option<Vec<ModelCatalogEntry>>>,
+    /// OpenCode 模型元数据缓存：来自本地 server API，按项目目录隔离，供上下文估算使用。
+    pub opencode_model_catalog: Mutex<HashMap<String, Vec<ModelCatalogEntry>>>,
+    /// daemon 进程内共享的 OpenCode server 生命周期管理器。
+    pub opencode_server_manager: Arc<OpenCodeServerManager>,
     /// 活动运行、会话互斥、取消和审批路由。
     pub run_coordinator: RunCoordinator,
     /// Tool executor composite.

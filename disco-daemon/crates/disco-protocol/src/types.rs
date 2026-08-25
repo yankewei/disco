@@ -13,7 +13,7 @@ pub enum Vendor {
     KimiCode,
     Glm,
     Codex,
-    /// 本地 opencode CLI（`opencode acp`），经 ACP 接入。
+    /// 本地 OpenCode server（`opencode serve`），由 daemon 通过 REST + SSE 接入。
     #[serde(rename = "opencode")]
     OpenCode,
 }
@@ -57,6 +57,7 @@ impl ProviderId {
     pub fn runtime_kind(&self) -> &'static str {
         match self.as_str() {
             Self::CODEX_APP_SERVER => "codex_app_server",
+            // 这里描述的是 Disco 对外的 ACP 运行时，不是 OpenCode 的内部 transport。
             Self::OPENCODE_APP_SERVER => "acp",
             _ => "rig",
         }

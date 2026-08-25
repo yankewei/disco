@@ -415,7 +415,11 @@ pub(crate) mod test_support {
             })
         }
 
-        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+        async fn delete_session(
+            &self,
+            _session: &BackendSession,
+            _workspace_path: Option<String>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -444,7 +448,11 @@ pub(crate) mod test_support {
             })
         }
 
-        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+        async fn delete_session(
+            &self,
+            _session: &BackendSession,
+            _workspace_path: Option<String>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -487,7 +495,10 @@ pub(crate) mod test_support {
         let app = Arc::new(AppState {
             db: database,
             runtime_by_provider_id: Mutex::new(runtimes),
-            opencode_model_catalog: Mutex::new(None),
+            opencode_model_catalog: Mutex::new(HashMap::new()),
+            opencode_server_manager: Arc::new(disco_backends::OpenCodeServerManager::new(
+                "opencode".to_string(),
+            )),
             run_coordinator: disco_core::RunCoordinator::new(),
             executor,
             shutdown: CancellationToken::new(),
@@ -561,7 +572,11 @@ mod tests {
             })
         }
 
-        async fn delete_session(&self, _session: &BackendSession) -> anyhow::Result<()> {
+        async fn delete_session(
+            &self,
+            _session: &BackendSession,
+            _workspace_path: Option<String>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
