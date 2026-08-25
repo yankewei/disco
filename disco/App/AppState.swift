@@ -304,6 +304,18 @@ final class AppState: ObservableObject {
         refreshRuntimes(stopActiveStreams: true)
     }
 
+    /// 验证成功后记录验证时间（不改变已保存的模型/URL 等配置）。
+    ///
+    /// 设置页“验证并加载模型”成功时调用：旧版本保存的配置可能没有验证记录，
+    /// 既然已成功从服务端拉到模型列表，即视为最近一次连接验证通过。
+    func recordVerificationTime(for vendor: ProviderVendor) {
+        guard var config = providerConfigs[vendor] else { return }
+        let verifiedAt = Date.now
+        config.lastVerifiedAt = verifiedAt
+        providerConfigs[vendor] = config
+        defaults.set(verifiedAt.timeIntervalSince1970, forKey: vendor.verifiedAtDefaultsKey)
+    }
+
     func saveProviderConfig(
         vendor: ProviderVendor,
         baseURL: String,

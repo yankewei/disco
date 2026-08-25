@@ -495,6 +495,40 @@ final class AppStateTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "provider.deepseek.verifiedAt"))
     }
 
+    func testRecordVerificationTimeUpdatesExistingConfigWithoutChangingIt() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let keychain = InMemoryAuthStore()
+        let appState = try makeAppState(keychain: keychain, defaults: defaults)
+
+        // 先保存配置，再清掉验证记录，模拟旧版本保存的无验证记录配置
+        try appState.saveProviderConfig(
+            vendor: .deepseek,
+            baseURL: "https://api.deepseek.com/v1",
+            apiKey: "deepseek-key",
+            model: "deepseek-chat"
+        )
+        defaults.removeObject(forKey: "provider.deepseek.verifiedAt")
+        let stale = try makeAppState(keychain: keychain, defaults: defaults)
+        XCTAssertNil(stale.config(for: .deepseek)?.lastVerifiedAt)
+
+        // 验证成功回写验证时间，其余配置不变
+        stale.recordVerificationTime(for: .deepseek)
+        let config = try XCTUnwrap(stale.config(for: .deepseek))
+        XCTAssertEqual(
+            try XCTUnwrap(config.lastVerifiedAt).timeIntervalSinceNow,
+            0,
+            accuracy: 5
+        )
+        XCTAssertNotNil(defaults.object(forKey: "provider.deepseek.verifiedAt"))
+        XCTAssertEqual(config.model, "deepseek-chat")
+
+        // 无配置的服务商调用无副作用
+        stale.recordVerificationTime(for: .anthropic)
+        XCTAssertNil(stale.config(for: .anthropic))
+    }
+
     func testAuthFileStoreRecoversWhenFileMissing() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

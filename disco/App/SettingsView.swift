@@ -441,7 +441,7 @@ private struct VendorDetailPanel: View {
         case saved
         /// 已保存配置与当前输入一致，可直接切换模型
         case verified
-        /// 已保存凭据但从未验证过连接
+        /// 已保存凭据、模型已加载，但尚无验证记录（点验证或选模型可消除）
         case unverifiedSaved
     }
 
@@ -557,6 +557,11 @@ private struct VendorDetailPanel: View {
                 draft.modelSearch = ""
                 if !loadedModels.contains(draft.selectedModel) {
                     draft.selectedModel = ""
+                }
+                // 已有配置时同步记录验证时间：旧版本保存的配置可能没有验证记录，
+                // 能成功拉到模型列表即视为连接验证通过，状态立即变为“已验证”。
+                if config != nil {
+                    appState.recordVerificationTime(for: vendor)
                 }
                 // 记录本次验证通过的凭据指纹；输入改动后自动失效，需重新验证
                 verifiedFingerprint = gate.currentFingerprint
@@ -820,7 +825,7 @@ private struct VendorDetailPanel: View {
         case .verified:
             StatusLabel(icon: "checkmark.circle", text: "配置有效，可直接切换模型", color: .secondary)
         case .unverifiedSaved:
-            StatusLabel(icon: "exclamationmark.circle", text: "已保存凭据，尚未验证连接", color: .orange)
+            StatusLabel(icon: "exclamationmark.circle", text: "凭据已保存，选择模型后完成验证", color: .orange)
         }
     }
 
