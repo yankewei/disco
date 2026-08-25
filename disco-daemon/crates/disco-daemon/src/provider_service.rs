@@ -195,6 +195,10 @@ pub async fn list_provider_models(
     resolve_provider_id(params.provider_id, params.vendor)?;
     match params.vendor {
         Vendor::OpenCode => opencode_model_catalog(app).await,
+        Vendor::Codex => {
+            let executable = CodexProvider::find_codex();
+            codex_app_server_models(&executable).await
+        }
         Vendor::Deepseek
         | Vendor::Openai
         | Vendor::MoonshotKimi
@@ -207,9 +211,42 @@ pub async fn list_provider_models(
             )
             .await
         }
-        vendor => Ok(get_default_models(vendor)),
     }
 }
+
+/// Codex app-server 模式的“验证”：通过与 app-server 的 `model/list` 查询真实模型。
+///
+/// 建立 initialize 握手即证明本地 codex CLI 可用（含登录态），`model/list` 返回
+/// 真实模型及其 effort 能力，替代内置硬编码目录。
+async fn codex_app_server_models(
+    executable: &str,
+) -> Result<Vec<ModelCatalogEntry>, ProviderError> {
+    let entries = disco_providers::list_codex_models(executable)
+        .await
+        .map_err(|error| {
+            ProviderError::InvalidParams(format!("验证 codex app-server 失败：{error}"))
+        })?;
+    if entries.is_empty() {
+        return Err(ProviderError::InvalidParams(
+            "codex app-server 未返回任何可用模型".to_string(),
+        ));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|entry| ModelCatalogEntry {
+            id: entry.id,
+            display_name: entry.display_name,
+            // model/list 不提供上下文窗口，由客户端按已知模型兜底
+            context_window: None,
+            supported_reasoning_efforts: entry
+                .supported_reasoning_efforts
+                .map(|efforts| efforts.into_iter().map(|e| e.reasoning_effort).collect()),
+            default_reasoning_effort: entry.default_reasoning_effort,
+        })
+        .collect())
+}
+
+/// 用 Rig 实时获取 API Key 类服务商的模型列表。
 
 /// 用 Rig 实时获取 API Key 类服务商的模型列表。
 ///
@@ -484,6 +521,45 @@ mod tests {
         SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use uuid::Uuid;
+
+    /// 临时可执行的 fake codex 脚本（模仿 disco-backends 测试的 FakeCodexExecutable）。
+    #[cfg(unix)]
+    struct FakeCodex {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeCodex {
+        fn new(script: &str) -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("disco-probe-codex-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("codex");
+            std::fs::write(&path, script).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            Self { directory, path }
+        }
+
+        fn path(&self) -> String {
+            self.path.display().to_string()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeCodex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
     #[tokio::test]
     async fn configure_and_list_providers() {
         let (app, _session_id) = make_test_app(Arc::new(ScriptedBackend {
@@ -671,5 +747,33 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ProviderError::InvalidParams(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_provider_models_uses_live_model_list() {
+        // 用 fake codex 脚本模拟 app-server：处理 initialize 后响应 model/list。
+        let fake = FakeCodex::new(
+            r###"#!/bin/sh
+read -r init_line
+printf '%s\n' '{"id":0,"result":{"protocolVersion":"1"}}'
+read -r init_notification
+read -r list_line
+printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","displayName":"GPT-5.6-Sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]}]}}'"###,
+        );
+
+        let models = crate::provider_service::codex_app_server_models(&fake.path())
+            .await
+            .expect("fake codex app-server 应返回模型列表");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            models[0]
+                .supported_reasoning_efforts
+                .as_ref()
+                .map(|e| e.len()),
+            Some(2)
+        );
     }
 }

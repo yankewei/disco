@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
@@ -76,6 +77,27 @@ struct RpcErrorResponse {
 struct RpcErrorPayloadOut {
     code: i32,
     message: String,
+}
+
+// MARK: - Codex app-server 模型目录
+
+/// `model/list` 返回的单个模型条目（取本项目需要的字段，wire 字段为 camelCase）。
+#[derive(Debug, Deserialize)]
+pub struct CodexModelEntry {
+    pub id: String,
+    #[serde(rename = "displayName", default)]
+    pub display_name: Option<String>,
+    #[serde(rename = "defaultReasoningEffort", default)]
+    pub default_reasoning_effort: Option<String>,
+    #[serde(rename = "supportedReasoningEfforts", default)]
+    pub supported_reasoning_efforts: Option<Vec<CodexReasoningEffort>>,
+}
+
+/// `model/list` 条目里的单个 effort 档位。
+#[derive(Debug, Deserialize)]
+pub struct CodexReasoningEffort {
+    #[serde(rename = "reasoningEffort")]
+    pub reasoning_effort: String,
 }
 
 // MARK: - Codex turn events (internal)
@@ -248,6 +270,200 @@ pub struct CodexProvider {
     shutdown_tx: Arc<StdMutex<Option<mpsc::Sender<WriteRequest>>>>,
 }
 
+/// 通过 `codex app-server` 的 `model/list` 查询可用模型。
+///
+/// 与对话用的 `CodexProvider` 相互独立：只完成 initialize 握手后请求一次
+/// `model/list`，拿到结果即断开，不创建 thread。失败返回明确错误（CLI 缺失、
+/// 启动失败、握手失败或模型列表不可用）。
+pub async fn list_codex_models(executable: &str) -> Result<Vec<CodexModelEntry>> {
+    let mut child = Command::new(executable)
+        .arg("app-server")
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动 codex app-server")?;
+    let mut stdin = child.stdin.take().context("codex stdin 不可用")?;
+    let stdout = child.stdout.take().context("codex stdout 不可用")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    // initialize 握手
+    send_jsonrpc_line(
+        &mut stdin,
+        &serde_json::json!({
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "disco",
+                    "title": "Disco",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": null,
+            }
+        }),
+    )
+    .await?;
+    let init = recv_jsonrpc_response(&mut lines, &CodexRequestId::Number(0))
+        .await
+        .context("codex app-server initialize 握手失败")?;
+    if let Some(error) = init.error {
+        return Err(anyhow::anyhow!(
+            "codex app-server initialize 失败：{}",
+            error.message
+        ));
+    }
+
+    send_jsonrpc_line(
+        &mut stdin,
+        &serde_json::json!({ "method": "initialized", "params": {} }),
+    )
+    .await?;
+
+    // model/list：includeHidden 让客户端自行按 hidden 过滤
+    send_jsonrpc_line(
+        &mut stdin,
+        &serde_json::json!({
+            "id": 1,
+            "method": "model/list",
+            "params": { "includeHidden": true },
+        }),
+    )
+    .await?;
+    let list = recv_jsonrpc_response(&mut lines, &CodexRequestId::Number(1))
+        .await
+        .context("codex app-server model/list 请求失败")?;
+    if let Some(error) = list.error {
+        return Err(anyhow::anyhow!("model/list 失败：{}", error.message));
+    }
+    let data = list
+        .result
+        .and_then(|result| result.get("data").cloned())
+        .unwrap_or_default();
+    Ok(serde_json::from_value(data).context("解析 model/list 响应失败")?)
+}
+
+/// 向 app-server 写入一行 JSON-RPC 消息（JSONL）。
+async fn send_jsonrpc_line(
+    stdin: &mut tokio::process::ChildStdin,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    stdin.write_all(payload.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+/// 读取 app-server 响应行，跳过 notification 与其它 id 的响应，直到匹配目标 id。
+/// 30 秒无匹配视为超时。
+async fn recv_jsonrpc_response(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    target_id: &CodexRequestId,
+) -> Result<RpcEnvelope> {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("codex app-server 已退出，未收到响应"))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(envelope) = serde_json::from_str::<RpcEnvelope>(trimmed) {
+                if envelope.method.is_none() && envelope.id.as_ref() == Some(target_id) {
+                    return Ok(envelope);
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("等待 codex app-server 响应超时"))?
+}
+
+/// 在给定的 PATH 中查找第一个存在的 codex 可执行文件。
+fn find_codex_in_path(path: &str) -> Option<String> {
+    for dir in path.split(':') {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{dir}/codex");
+        if std::path::Path::new(&candidate).exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 解析登录 shell 配置文件，提取真实的 PATH。
+///
+/// 解析登录 shell 配置文件，还原真实 PATH。
+///
+/// GUI 会话启动的进程 PATH 很精简（不含 Homebrew / npm-global 等安装目录），
+/// 从用户 shell 配置里读 PATH 才能覆盖这些位置。zsh 常见的写法是
+/// `export PATH="$HOME/.npm-global/bin:$PATH"`，因此按执行顺序收集每行的
+/// 前置目录段，最后拼接上当前进程 PATH 作基底。
+fn login_shell_path() -> Option<String> {
+    static RC_FILES: &[&str] = &[
+        "~/.zshenv",
+        "~/.zprofile",
+        "~/.zshrc",
+        "~/.bash_profile",
+        "~/.profile",
+    ];
+    let home = std::env::var("HOME").ok()?;
+    let base_path = std::env::var("PATH").unwrap_or_default();
+    let mut segments: Vec<String> = Vec::new();
+
+    for rc_file in RC_FILES {
+        let path = rc_file.replace('~', &home);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            let Some(rest) = line
+                .strip_prefix("export PATH=")
+                .or_else(|| line.strip_prefix("PATH="))
+            else {
+                continue;
+            };
+            let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+            if value.is_empty() {
+                continue;
+            }
+            // 取 `$PATH` / `${PATH}` 之前的目录段（zsh 通常用它引用旧值）
+            let prefix = value.split("$PATH").next().unwrap_or(value).to_string();
+            let prefix = if prefix != value {
+                prefix
+            } else {
+                value.split("${PATH}").next().unwrap_or(value).to_string()
+            };
+            if prefix.is_empty() {
+                continue;
+            }
+            let prefix = prefix
+                .replace("${HOME}", &home)
+                .replace("$HOME", &home)
+                .replace('~', &home)
+                .trim_end_matches(':')
+                .to_string();
+            if !prefix.is_empty() {
+                segments.push(prefix);
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return None;
+    }
+    segments.push(base_path);
+    Some(segments.join(":"))
+}
+
 impl CodexProvider {
     /// Create a new CodexProvider.
     pub fn new(
@@ -270,21 +486,26 @@ impl CodexProvider {
 
     /// Find the codex executable in PATH or well-known locations.
     pub fn find_codex() -> String {
-        let candidates = ["codex", "/usr/local/bin/codex", "/opt/homebrew/bin/codex"];
-
-        // Check PATH
+        // 1. 当前进程 PATH
         if let Ok(path) = std::env::var("PATH") {
-            for dir in path.split(':') {
-                let candidate = format!("{dir}/codex");
-                if std::path::Path::new(&candidate).exists() {
-                    return candidate;
-                }
+            if let Some(found) = find_codex_in_path(&path) {
+                return found;
             }
         }
 
-        // Check home directory locations
+        // 2. 从 app bundle 启动的 daemon 继承的 PATH 很精简（不含 Homebrew /
+        //    npm-global 等），回退解析登录 shell 的 PATH 再找一遍。
+        if let Some(shell_path) = login_shell_path() {
+            if let Some(found) = find_codex_in_path(&shell_path) {
+                return found;
+            }
+        }
+
+        // 3. home 目录下的常见安装位置
         if let Ok(home) = std::env::var("HOME") {
             let home_candidates = [
+                format!("{home}/.npm-global/bin/codex"),
+                format!("{home}/.cargo/bin/codex"),
                 format!("{home}/.local/bin/codex"),
                 format!("{home}/.codex/bin/codex"),
             ];
@@ -295,8 +516,15 @@ impl CodexProvider {
             }
         }
 
-        // Fall back to first candidate (will fail at launch if not found)
-        candidates[0].to_string()
+        // 4. 系统级安装位置
+        for c in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+
+        // 兜底裸命令名（启动时如仍找不到会给出明确错误）
+        "codex".to_string()
     }
 
     /// 流式执行一个 turn，并保留 Codex 的审批与 item 生命周期语义。
@@ -1425,6 +1653,79 @@ pub fn decode_rpc_envelope(line: &str) -> Result<RpcEnvelope> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use uuid::Uuid;
+
+    /// 临时可执行的 fake codex 脚本（模仿 disco-backends 测试的 FakeCodexExecutable）。
+    #[cfg(unix)]
+    struct FakeCodex {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeCodex {
+        fn new(script: &str) -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("disco-list-codex-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("codex");
+            std::fs::write(&path, script).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            Self { directory, path }
+        }
+
+        fn path(&self) -> String {
+            self.path.display().to_string()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeCodex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_codex_models_parses_model_list() {
+        // fake app-server：处理 initialize 后响应一条 model/list。
+        let fake = FakeCodex::new(
+            r###"#!/bin/sh
+read -r init_line
+printf '%s\n' '{"id":0,"result":{"protocolVersion":"1"}}'
+read -r init_notification
+read -r list_line
+printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","displayName":"GPT-5.6-Sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]},{"id":"internal-model","hidden":true}]}}'"###,
+        );
+
+        let entries = list_codex_models(&fake.path())
+            .await
+            .expect("fake app-server 应返回模型列表");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "gpt-5.6-sol");
+        assert_eq!(entries[0].display_name.as_deref(), Some("GPT-5.6-Sol"));
+        assert_eq!(entries[0].default_reasoning_effort.as_deref(), Some("low"));
+        let efforts = entries[0].supported_reasoning_efforts.as_ref().unwrap();
+        assert_eq!(efforts.len(), 2);
+        assert_eq!(efforts[0].reasoning_effort, "low");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_codex_models_reports_app_server_exit() {
+        // 脚本启动后立即退出（不响应 initialize）→ 明确报错，且不挂起。
+        let fake = FakeCodex::new("#!/bin/sh\nexit 1\n");
+        let err = list_codex_models(&fake.path()).await.unwrap_err();
+        assert!(err.to_string().contains("initialize"), "{err}");
+    }
+
     #[test]
     fn encode_initialize_request() {
         let json = encode_rpc_request(
@@ -1725,5 +2026,22 @@ mod tests {
                 .unwrap()
                 .contains("approval/request")
         );
+    }
+}
+
+#[cfg(test)]
+mod temp_gui_repro {
+    use super::*;
+
+    #[tokio::test]
+    async fn gui_lean_path_repro() {
+        // 模拟 GUI 启动的 daemon：PATH 精简，靠 login_shell_path 回退
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin") };
+        let exe = CodexProvider::find_codex();
+        eprintln!("==> find_codex() = {exe}");
+        match list_codex_models(&exe).await {
+            Ok(models) => eprintln!("OK: {} models", models.len()),
+            Err(e) => eprintln!("ERR: {e}"),
+        }
     }
 }
