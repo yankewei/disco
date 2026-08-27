@@ -129,6 +129,9 @@ private struct ConversationSidebar: View {
     let requestDeleteProject: (ProjectSnapshot) -> Void
     let reconnectProject: (UUID) -> Void
 
+    @State private var searchText = ""
+    @FocusState private var isSearchFieldFocused: Bool
+
     /// 当前服务商已保存 Key 但从未验证过连接时，提示用户去设置页验证
     private var needsVerificationAttention: Bool {
         guard let config = appState.config(for: appState.activeVendor) else { return false }
@@ -160,9 +163,49 @@ private struct ConversationSidebar: View {
         appState.projects.filter { $0.id != currentProject?.id }
     }
 
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 搜索命中：项目名或会话内任意消息文本（命中项目名时包含该项目全部会话）
+    private func searchMatches(_ conversation: ConversationSession) -> Bool {
+        let project = appState.projects.first { $0.id == conversation.projectID }
+        return ConversationSearch.matches(
+            query: searchText,
+            project: project?.name,
+            messages: conversation.store.messages
+        )
+    }
+
+    private var searchResults: [ConversationSession] {
+        appState.conversations.filter(searchMatches)
+    }
+
+    private enum SearchResultRow: Identifiable {
+        case empty(query: String)
+        case conversation(ConversationSession)
+
+        var id: String {
+            switch self {
+            case .empty: "search-empty"
+            case let .conversation(conversation): conversation.id.uuidString
+            }
+        }
+    }
+
+    private var searchResultRows: [SearchResultRow] {
+        let results = searchResults
+        guard !results.isEmpty else {
+            return [.empty(query: searchText.trimmingCharacters(in: .whitespacesAndNewlines))]
+        }
+        return results.map { .conversation($0) }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             sidebarHeader
+
+            sidebarSearchField
 
             Button(action: openProject) {
                 HStack(spacing: 10) {
@@ -183,41 +226,49 @@ private struct ConversationSidebar: View {
 
             ScrollViewReader { proxy in
                 List {
-                    ForEach(appState.projects) { project in
-                        ProjectConversationSection(
-                            project: project,
-                            conversations: appState.conversations.filter { $0.projectID == project.id },
-                            isExpanded: expandedProjectIDs.contains(project.id),
-                            toggle: { toggleProject(project.id) },
-                            selectProject: {
-                                expandedProjectIDs.insert(project.id)
-                                appState.selectProject(id: project.id)
-                            },
-                            createConversation: {
-                                expandedProjectIDs.insert(project.id)
-                                appState.createConversation(projectID: project.id)
-                            },
-                            showFinder: {
-                                NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
-                            },
-                            deleteProject: { requestDeleteProject(project) },
-                            reconnect: { reconnectProject(project.id) }
-                        )
-                        .id(project.id)
+                    if isSearching {
+                        searchResultsSection
+                    } else {
+                        ForEach(appState.projects) { project in
+                            ProjectConversationSection(
+                                project: project,
+                                conversations: appState.conversations.filter { $0.projectID == project.id },
+                                isExpanded: expandedProjectIDs.contains(project.id),
+                                toggle: { toggleProject(project.id) },
+                                selectProject: {
+                                    expandedProjectIDs.insert(project.id)
+                                    appState.selectProject(id: project.id)
+                                },
+                                createConversation: {
+                                    expandedProjectIDs.insert(project.id)
+                                    appState.createConversation(projectID: project.id)
+                                },
+                                showFinder: {
+                                    NSWorkspace.shared.activateFileViewerSelecting([project.workspaceRoot])
+                                },
+                                deleteProject: { requestDeleteProject(project) },
+                                reconnect: { reconnectProject(project.id) }
+                            )
+                            .id(project.id)
+                        }
                     }
                     // 注意：Section body 必须始终是同一类型的 ForEach。
                     // 在这里用 if/else 在占位 Text 与行列表之间切换，
                     // 会触发 macOS List（NSTableView 桥接）的行渲染丢失：
                     // 数据从空变为非空时新行不出现，表现为“点了没反应”。
-                    Section {
-                        ForEach(visibleTemporaryConversations) { conversation in
-                            ConversationListRow(conversation: conversation)
+                    // 搜索时隐藏：命中结果已由 searchResultsSection 平铺展示，
+                    // 避免临时对话在两个分区重复出现。
+                    if !isSearching {
+                        Section {
+                            ForEach(visibleTemporaryConversations) { conversation in
+                                ConversationListRow(conversation: conversation)
+                            }
+                        } header: {
+                            HStack {
+                                Text("临时对话")
+                            }
+                            .textCase(nil)
                         }
-                    } header: {
-                        HStack {
-                            Text("临时对话")
-                        }
-                        .textCase(nil)
                     }
                 }
                 .listStyle(.sidebar)
@@ -232,6 +283,9 @@ private struct ConversationSidebar: View {
                 }
                 .onChange(of: appState.projects) { _, _ in
                     revealSelectedProject(using: proxy)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .discoFocusSidebarSearch)) { _ in
+                    isSearchFieldFocused = true
                 }
             }
 
@@ -279,6 +333,65 @@ private struct ConversationSidebar: View {
             .buttonStyle(.plain)
         }
         .background(.regularMaterial)
+    }
+
+    private var sidebarSearchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            TextField("搜索对话", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .focused($isSearchFieldFocused)
+                .accessibilityLabel("搜索对话")
+                .help("按项目名或消息内容搜索会话（⌘F）")
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("清除搜索")
+                .accessibilityLabel("清除搜索")
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            Color.primary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var searchResultsSection: some View {
+        Section {
+            ForEach(searchResultRows) { result in
+                switch result {
+                case let .empty(query):
+                    Text("没有匹配“\(query)”的对话")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                case let .conversation(conversation):
+                    ConversationListRow(conversation: conversation)
+                }
+            }
+        } header: {
+            HStack {
+                Text("搜索结果")
+            }
+            .textCase(nil)
+        }
     }
 
     private var sidebarHeader: some View {
@@ -386,7 +499,7 @@ private struct ConversationListRow: View {
         Button {
             appState.selectedConversationID = conversation.id
         } label: {
-            ConversationRow(conversation: conversation)
+            ConversationRow(conversation: conversation, isSelected: isSelected)
                 .padding(.horizontal, 10)
                 .discoRowStyle(isSelected: isSelected, isHovered: isHovered)
         }
@@ -509,11 +622,13 @@ private struct ProjectConversationSection: View {
 
 private struct ConversationRow: View {
     let conversation: ConversationSession
+    let isSelected: Bool
 
     @ObservedObject private var store: ConversationStore
 
-    init(conversation: ConversationSession) {
+    init(conversation: ConversationSession, isSelected: Bool) {
         self.conversation = conversation
+        self.isSelected = isSelected
         store = conversation.store
     }
 
@@ -545,6 +660,11 @@ private struct ConversationRow: View {
                             .fill(DiscoTheme.accent)
                             .frame(width: 7, height: 7)
                             .help("等待你的确认")
+                    } else if store.hasUnreadResult && !isSelected {
+                        Circle()
+                            .fill(.green)
+                            .frame(width: 7, height: 7)
+                            .help("有新的运行结果")
                     }
 
                     Text(conversation.updatedAt, style: .time)

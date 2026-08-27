@@ -25,6 +25,23 @@ struct DiscoApp: App {
         }
     }
 
+    private var sidebarOrderedConversations: [ConversationSession] {
+        let projectIDs = Set(appState.projects.map(\.id))
+        let projectConversations = appState.projects.flatMap { project in
+            appState.conversations.filter { $0.projectID == project.id }
+        }
+        let temporaryConversations = appState.conversations.filter { conversation in
+            guard let projectID = conversation.projectID else {
+                return !conversation.store.messages.isEmpty
+                    || conversation.id == appState.selectedConversationID
+            }
+            return !projectIDs.contains(projectID)
+                && (!conversation.store.messages.isEmpty
+                    || conversation.id == appState.selectedConversationID)
+        }
+        return projectConversations + temporaryConversations
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -50,6 +67,26 @@ struct DiscoApp: App {
                     appState.createConversation(projectID: nil)
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("搜索对话…") {
+                    NotificationCenter.default.post(
+                        name: .discoFocusSidebarSearch,
+                        object: nil
+                    )
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
+
+            // ⌘1-9：按侧栏顺序跳转到前 9 个会话
+            CommandGroup(after: .sidebar) {
+                ForEach(Array(sidebarOrderedConversations.prefix(9).enumerated()), id: \.element.id) { index, conversation in
+                    Button("转到：\(ConversationTitle.make(from: conversation.store.messages))") {
+                        appState.selectedConversationID = conversation.id
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                }
             }
 
             CommandMenu("对话") {

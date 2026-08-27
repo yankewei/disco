@@ -151,7 +151,7 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertTrue(store.canRetry)
 
         client.startRunError = nil
-        store.retryLastMessage()
+        store.regenerateLastResponse()
         for _ in 0..<100 where client.startedRuns.isEmpty {
             try await Task.sleep(for: .milliseconds(10))
         }

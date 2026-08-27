@@ -172,11 +172,7 @@ struct ApprovalPromptView: View {
 
             if let diff = approval.impact.diff {
                 ScrollView {
-                    Text(diff)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(6)
+                    ApprovalDiffView(diff: diff)
                 }
                 .frame(maxHeight: 120)
                 .scrollIndicators(.hidden)
@@ -312,4 +308,40 @@ struct ApprovalPromptView: View {
     )
     .padding()
     .frame(width: 560)
+}
+
+/// diff 行级着色：新增行绿、删除行红、hunk 头弱化；保持等宽字体与可选中。
+private struct ApprovalDiffView: View {
+    let diff: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(
+                Array(diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated()),
+                id: \.offset
+            ) { _, line in
+                Text(String(line))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(color(for: line))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6)
+            }
+        }
+        .padding(.vertical, 6)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func color(for line: Substring) -> Color {
+        if line.hasPrefix("+") && !line.hasPrefix("+++") {
+            return .green
+        }
+        if line.hasPrefix("-") && !line.hasPrefix("---") {
+            return .red
+        }
+        if line.hasPrefix("@@") {
+            return .secondary
+        }
+        return .primary
+    }
 }

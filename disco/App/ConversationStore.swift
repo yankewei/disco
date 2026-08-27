@@ -15,6 +15,9 @@ final class ConversationStore: ObservableObject {
     @Published private(set) var activeCompaction: ContextCompactionSnapshot?
     /// 当前待处理的守护进程审批请求；nil 表示无审批等待。
     @Published var pendingApproval: DaemonApprovalRequestedData?
+    /// 上一次运行结束后尚未被查看的结果；用于侧栏未读点。
+    /// 选中的会话由 ChatView / AppState 选中变化时清除。
+    @Published private(set) var hasUnreadResult = false
     /// daemon 运行边界；所有会话都由 daemon 托管，注册 session 后启用。
     private var daemonClient: (any DiscoDaemonClient)?
     private var daemonSessionID: UUID?
@@ -105,10 +108,31 @@ final class ConversationStore: ObservableObject {
     var usesNativeCompaction: Bool { compactionMode == "native" }
 
     var canRetry: Bool {
-        guard !isStreaming, errorMessage != nil, let last = messages.last else { return false }
-        if last.role == .user { return true }
-        return last.role == .assistant
-            && messages.dropLast().last?.role == .user
+        canRegenerate && errorMessage != nil
+    }
+
+    /// 能否编辑最后一个会话回合；编辑只载入草稿，不修改当前历史。
+    var canEditLastUserMessage: Bool {
+        guard !isStreaming, !isClearingDaemonSession, compactionTask == nil else { return false }
+        return lastUserMessageText != nil
+    }
+
+    /// 能否在当前 daemon 会话中再次发起最后一次提问。
+    var canRegenerate: Bool {
+        canEditLastUserMessage && hasRuntime
+    }
+
+    private var lastUserMessageText: String? {
+        guard let last = messages.last else { return nil }
+        switch last.role {
+        case .user:
+            return last.text
+        case .assistant:
+            guard let previous = messages.dropLast().last, previous.role == .user else {
+                return nil
+            }
+            return previous.text
+        }
     }
 
     /// 设置守护进程客户端引用；注册 session 后再单独启用 daemon 运行。
@@ -428,6 +452,7 @@ final class ConversationStore: ObservableObject {
         let shouldClear = clearAfterDaemonRun
         let sessionIDToClear = daemonSessionID
         persistImmediately()
+        hasUnreadResult = true
         activeRunID = nil
         daemonRunID = nil
         daemonAssistantID = nil
@@ -479,6 +504,7 @@ final class ConversationStore: ObservableObject {
         lastSuccessfulCompaction = nil
         activeCompaction = nil
         pendingApproval = nil
+        hasUnreadResult = false
         runState = .idle
         persistImmediately()
     }
@@ -506,6 +532,11 @@ final class ConversationStore: ObservableObject {
         errorMessage = nil
     }
 
+    /// 标记运行结果已被查看（选中会话时调用）。
+    func markResultSeen() {
+        hasUnreadResult = false
+    }
+
     /// 响应审批请求。
     func respondToApproval(decision: String) {
         guard let approval = pendingApproval else { return }
@@ -525,17 +556,19 @@ final class ConversationStore: ObservableObject {
         }
     }
 
-    func retryLastMessage() {
-        guard canRetry, let lastMessage = messages.last else { return }
-        if lastMessage.role == .assistant {
-            messages.removeLast()
-            guard let userMessage = messages.popLast(), userMessage.role == .user else { return }
-            draft = userMessage.text
-        } else {
-            messages.removeLast()
-            draft = lastMessage.text
-        }
+    /// 重新发起最后一次提问。
+    /// daemon session 的历史是追加式的，因此保留原始回合，新的提问作为后续回合发送。
+    func regenerateLastResponse() {
+        guard canRegenerate, let text = lastUserMessageText else { return }
+        draft = text
         send()
+    }
+
+    /// 将最后一个回合中的用户消息载入草稿以便编辑后再次提问。
+    /// 不提前截断历史；用户放弃编辑时，原始会话内容仍然保留。
+    func beginEditLastUserMessage() {
+        guard canEditLastUserMessage, let text = lastUserMessageText else { return }
+        draft = text
     }
 
     /// 手动压缩当前会话；不创建聊天占位消息。

@@ -27,6 +27,10 @@ extension Notification.Name {
     static let discoRequestClearConversation = Notification.Name("discoRequestClearConversation")
     /// 菜单栏“添加项目”发出的请求，由 ContentView 展示目录选择器
     static let discoRequestOpenProject = Notification.Name("discoRequestOpenProject")
+    /// 菜单栏“搜索对话”发出的请求，由 ConversationSidebar 聚焦搜索框
+    static let discoFocusSidebarSearch = Notification.Name("discoFocusSidebarSearch")
+    /// 用户消息“编辑后再次提问”发出的请求，由 ComposerView 聚焦输入框
+    static let discoFocusComposer = Notification.Name("discoFocusComposer")
 }
 
 @MainActor
@@ -48,6 +52,7 @@ final class AppState: ObservableObject {
         didSet {
             if let selectedConversationID {
                 defaults.set(selectedConversationID.uuidString, forKey: "selectedConversationID")
+                conversations.first(where: { $0.id == selectedConversationID })?.store.markResultSeen()
             } else {
                 defaults.removeObject(forKey: "selectedConversationID")
             }

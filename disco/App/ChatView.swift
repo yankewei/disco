@@ -14,6 +14,8 @@ struct ChatView: View {
     @State private var isUserScrolling = false
     @State private var selectedToolCallID: String?
     @State private var expandedTurnIDs: Set<UUID> = []
+    /// 会话回合缓存：由 store.messages 变化驱动重建，避免每次 body 求值都重跑 makeTurns。
+    @State private var turns: [ChatTurn] = []
     /// 防抖滚动任务：合并同一帧内的多次滚动请求，避免在 onChange 调用栈内同步 scrollTo
     @State private var scrollTask: Task<Void, Never>?
 
@@ -66,10 +68,7 @@ struct ChatView: View {
     }
 
     private var conversationTitle: String {
-        guard let text = store.messages.first(where: { $0.role == .user })?.text else {
-            return "新对话"
-        }
-        return text.split(whereSeparator: \Character.isNewline).first.map(String.init) ?? "新对话"
+        ConversationTitle.make(from: store.messages)
     }
 
     private var selectedToolCall: ChatMessage.ToolCallSnapshot? {
@@ -82,10 +81,6 @@ struct ChatView: View {
             }
         }
         return nil
-    }
-
-    private var turns: [ChatTurn] {
-        Self.makeTurns(from: store.messages)
     }
 
     private func isTurnStreaming(_ turn: ChatTurn) -> Bool {
@@ -115,7 +110,7 @@ struct ChatView: View {
                 isStreaming: store.isStreaming && message.id == store.messages.last?.id,
                 errorMessage: message.id == store.messages.last?.id ? store.errorMessage : nil,
                 canRetry: store.canRetry,
-                retry: store.retryLastMessage,
+                retry: store.regenerateLastResponse,
                 dismissError: store.dismissError,
                 selectedToolCallID: selectedToolCallID,
                 selectToolCall: { toolCallID in
@@ -123,7 +118,9 @@ struct ChatView: View {
                         selectedToolCallID = toolCallID
                     }
                 },
-                showActivity: showActivity
+                showActivity: showActivity,
+                canRegenerate: store.canRegenerate && message.id == store.messages.last?.id,
+                regenerate: store.regenerateLastResponse
             )
             .id(message.id)
         }
@@ -181,16 +178,25 @@ struct ChatView: View {
                                 ForEach(turns) { turn in
                                     if let userMessage = turn.userMessage {
                                         let isLastMessage = userMessage.id == store.messages.last?.id
+                                        let isLastTurn = turn.id == turns.last?.id
                                         MessageRow(
                                             message: userMessage,
                                             isStreaming: false,
                                             errorMessage: isLastMessage ? store.errorMessage : nil,
                                             canRetry: isLastMessage && store.canRetry,
-                                            retry: isLastMessage ? store.retryLastMessage : {},
+                                            retry: isLastMessage ? store.regenerateLastResponse : {},
                                             dismissError: isLastMessage ? store.dismissError : {},
                                             selectedToolCallID: selectedToolCallID,
                                             selectToolCall: { _ in },
-                                            showActivity: true
+                                            showActivity: true,
+                                            canEdit: isLastTurn && store.canEditLastUserMessage,
+                                            edit: {
+                                                store.beginEditLastUserMessage()
+                                                NotificationCenter.default.post(
+                                                    name: .discoFocusComposer,
+                                                    object: nil
+                                                )
+                                            }
                                         )
                                         .id(userMessage.id)
                                     }
@@ -253,11 +259,11 @@ struct ChatView: View {
                             isUserScrolling = isScrolling
                         }
                     }
-                    .onChange(of: store.messages) {
+                    .onChange(of: store.messages, initial: true) {
+                        // 回合缓存重建 + 滚动跟随共用一个观察者；initial 保证
+                        // 恢复历史会话时首帧就有回合数据并滚动到底部。
+                        turns = Self.makeTurns(from: store.messages)
                         guard shouldFollowLatestMessage else { return }
-                        scheduleScrollToLatest(proxy)
-                    }
-                    .onAppear {
                         scheduleScrollToLatest(proxy)
                     }
                     .overlay(alignment: .bottom) {
@@ -394,6 +400,14 @@ struct ChatView: View {
             guard !store.messages.isEmpty else { return }
             isConfirmingClear = true
         }
+        .onAppear {
+            store.markResultSeen()
+        }
+        .onChange(of: store.runState) { _, newState in
+            if !newState.isActive {
+                store.markResultSeen()
+            }
+        }
         .onChange(of: store.messages) {
             if selectedToolCall != nil {
                 return
@@ -409,7 +423,8 @@ private struct ToolInspectorPanel: View {
     let call: ChatMessage.ToolCallSnapshot
     let dismiss: () -> Void
 
-    @State private var width: CGFloat = 420
+    /// 宽度跨会话持久化：拖拽调整后写入 UserDefaults，重开会话/重启应用保持。
+    @AppStorage("toolInspectorPanelWidth") private var width: Double = 420
     @State private var dragStartWidth: CGFloat?
     @State private var frozenContentWidth: CGFloat?
 
@@ -688,6 +703,10 @@ private struct MessageRow: View {
     let selectedToolCallID: String?
     let selectToolCall: (String) -> Void
     let showActivity: Bool
+    var canEdit = false
+    var edit: () -> Void = {}
+    var canRegenerate = false
+    var regenerate: () -> Void = {}
 
     @State private var isHovered = false
 
@@ -720,8 +739,17 @@ private struct MessageRow: View {
                             .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
 
                         if !message.text.isEmpty {
-                            messageActionButton(action: copyMessage)
-                                .opacity(isHovered ? 1 : 0.45)
+                            HStack(spacing: 4) {
+                                if canEdit {
+                                    messageActionButton(systemImage: "pencil", action: edit)
+                                        .help("编辑后再次提问")
+                                        .accessibilityLabel("编辑这条消息并再次提问")
+                                }
+                                messageActionButton(action: copyMessage)
+                                    .help("复制")
+                                    .accessibilityLabel("复制消息")
+                            }
+                            .opacity(isHovered ? 1 : 0.45)
                         }
                     }
                 }
@@ -743,7 +771,8 @@ private struct MessageRow: View {
                             case let .text(content):
                                 if !content.text.isEmpty {
                                     ActivityTimelineRow(kind: .response) {
-                                        MarkdownView(content.text)
+                                        MarkdownBody(text: content.text)
+                                            .equatable()
                                     }
                                 }
                             case let .reasoning(reasoning):
@@ -780,9 +809,16 @@ private struct MessageRow: View {
                         if !isStreaming && !message.text.isEmpty {
                             HStack {
                                 Spacer(minLength: 0)
+                                if canRegenerate && errorMessage == nil {
+                                    messageActionButton(systemImage: "arrow.clockwise", action: regenerate)
+                                        .help("重新生成")
+                                        .accessibilityLabel("重新生成回复")
+                                }
                                 messageActionButton(action: copyMessage)
-                                    .opacity(isHovered ? 1 : 0.55)
+                                    .help("复制")
+                                    .accessibilityLabel("复制消息")
                             }
+                            .opacity(isHovered ? 1 : 0.55)
                         }
                     }
                     .frame(maxWidth: 680, alignment: .leading)
@@ -833,22 +869,37 @@ private struct MessageRow: View {
         .animation(.easeOut(duration: 0.16), value: errorMessage)
     }
 
-    private func messageActionButton(action: @escaping () -> Void) -> some View {
+    private func messageActionButton(
+        systemImage: String = "doc.on.doc",
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
-            Image(systemName: "doc.on.doc")
+            Image(systemName: systemImage)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 24, height: 24)
                 .background(.quaternary, in: Capsule())
         }
         .buttonStyle(DiscoPressButtonStyle())
-        .help("复制")
-        .accessibilityLabel("复制消息")
     }
 
     private func copyMessage() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(message.text, forType: .string)
+    }
+}
+
+/// Markdown 渲染的等值缓存包装：文本不变时不重新解析 Markdown。
+/// 流式期间历史消息行会被 SwiftUI 反复 diff，该包装避免昂贵的内容重渲染。
+private struct MarkdownBody: View, Equatable {
+    let text: String
+
+    var body: some View {
+        MarkdownView(text)
+    }
+
+    static func == (lhs: MarkdownBody, rhs: MarkdownBody) -> Bool {
+        lhs.text == rhs.text
     }
 }
 
@@ -1022,7 +1073,8 @@ private struct ReasoningDisclosure: View {
                             }
                         }
                     } else {
-                        MarkdownView(reasoning)
+                        MarkdownBody(text: reasoning)
+                            .equatable()
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -1244,6 +1296,8 @@ private struct ComposerView: View {
     @State private var isContextUsagePresented = false
     @State private var isModelTriggerHovered = false
     @State private var isReasoningTriggerHovered = false
+    /// 大编辑态：展开输入框便于编写长 prompt / 粘贴代码。
+    @State private var isExpanded = false
     @FocusState private var isFocused: Bool
 
     var body: some View {
@@ -1255,7 +1309,8 @@ private struct ComposerView: View {
             )
             .textFieldStyle(.plain)
             .font(.body)
-            .lineLimit(1...6)
+            .lineLimit(1...(isExpanded ? 24 : 6))
+            .frame(minHeight: isExpanded ? 120 : 0, alignment: .top)
             .focused($isFocused)
             .disabled(!isConfigured)
             .onKeyPress(.return, phases: .down) { keyPress in
@@ -1263,6 +1318,11 @@ private struct ComposerView: View {
                 // 放行给文本系统处理，避免误发送。
                 if isIMEComposing {
                     return .ignored
+                }
+                // 审批等待期间（runState 为 waitingForApproval）不允许发送新消息；
+                // 显式吞掉回车，避免与审批卡片的 defaultAction 快捷键产生歧义。
+                if store.pendingApproval != nil {
+                    return .handled
                 }
                 if keyPress.modifiers.contains(.shift) {
                     store.draft.append("\n")
@@ -1308,6 +1368,11 @@ private struct ComposerView: View {
                 if isConfigured {
                     contextUsageTrigger
                 }
+
+                if isConfigured {
+                    expandToggleButton
+                }
+
                 composerActionButton
             }
             .font(.caption)
@@ -1331,6 +1396,9 @@ private struct ComposerView: View {
         }
         .onChange(of: isReasoningSettingsPresented) { _, presented in
             if !presented { isFocused = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .discoFocusComposer)) { _ in
+            isFocused = true
         }
     }
 
@@ -1515,6 +1583,27 @@ private struct ComposerView: View {
     /// 当前选择文案：服务商 · 模型（未选模型时只显示服务商）
     private var modelLabel: String {
         appState.model.isEmpty ? appState.activeVendor.title : "\(appState.activeVendor.title) · \(appState.model)"
+    }
+
+    private var expandToggleButton: some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
+                isExpanded.toggle()
+            }
+        } label: {
+            Image(
+                systemName: isExpanded
+                    ? "arrow.down.right.and.arrow.up.left"
+                    : "arrow.up.left.and.arrow.down.right"
+            )
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(width: 24, height: 24)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(DiscoPressButtonStyle())
+        .help(isExpanded ? "收起输入框" : "展开输入框")
+        .accessibilityLabel(isExpanded ? "收起输入框" : "展开输入框")
     }
 
     @ViewBuilder
