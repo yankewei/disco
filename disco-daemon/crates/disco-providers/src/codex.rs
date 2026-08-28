@@ -276,7 +276,7 @@ pub struct CodexProvider {
 /// `model/list`，拿到结果即断开，不创建 thread。失败返回明确错误（CLI 缺失、
 /// 启动失败、握手失败或模型列表不可用）。
 pub async fn list_codex_models(executable: &str) -> Result<Vec<CodexModelEntry>> {
-    let mut child = Command::new(executable)
+    let mut child = codex_command(executable)
         .arg("app-server")
         .kill_on_drop(true)
         .stdin(Stdio::piped())
@@ -464,6 +464,61 @@ fn login_shell_path() -> Option<String> {
     Some(segments.join(":"))
 }
 
+/// Build a Codex command with the tool paths available to the user's login shell.
+///
+/// GUI-launched processes often inherit a minimal PATH. The npm Codex launcher
+/// uses `#!/usr/bin/env node`, so finding the launcher is not enough; its child
+/// process must receive a PATH that can resolve Node as well.
+fn codex_command(executable: &str) -> Command {
+    let mut command = Command::new(executable);
+    if let Some(runtime_path) = codex_runtime_path() {
+        command.env("PATH", runtime_path);
+    }
+    command
+}
+
+fn codex_runtime_path() -> Option<String> {
+    let current_path = std::env::var("PATH").ok();
+    let shell_path = login_shell_path();
+    build_codex_runtime_path(current_path.as_deref(), shell_path.as_deref())
+}
+
+fn build_codex_runtime_path(
+    current_path: Option<&str>,
+    shell_path: Option<&str>,
+) -> Option<String> {
+    let mut path_segments: Vec<String> = Vec::new();
+    let mut append_path_segments = |path: &str| {
+        for segment in path.split(':') {
+            let segment = segment.trim();
+            if segment.is_empty()
+                || path_segments
+                    .iter()
+                    .any(|existing_segment| existing_segment == segment)
+            {
+                continue;
+            }
+            path_segments.push(segment.to_string());
+        }
+    };
+
+    if let Some(path) = current_path {
+        append_path_segments(path);
+    }
+    if let Some(path) = shell_path {
+        append_path_segments(path);
+    }
+    for path in ["/usr/local/bin", "/usr/local/sbin"] {
+        append_path_segments(path);
+    }
+    #[cfg(target_os = "macos")]
+    for path in ["/opt/homebrew/bin", "/opt/homebrew/sbin"] {
+        append_path_segments(path);
+    }
+
+    (!path_segments.is_empty()).then(|| path_segments.join(":"))
+}
+
 impl CodexProvider {
     /// Create a new CodexProvider.
     pub fn new(
@@ -621,7 +676,7 @@ impl CodexProvider {
             drop(s); // Release lock before spawning process
             info!("Launching codex app-server: {executable}");
 
-            let mut command = Command::new(executable);
+            let mut command = codex_command(executable);
             command
                 .arg("app-server")
                 .stdin(std::process::Stdio::piped())
@@ -1690,6 +1745,25 @@ mod tests {
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_dir(&self.directory);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn builds_runtime_path_for_gui_processes() {
+        let runtime_path =
+            build_codex_runtime_path(Some("/usr/bin:/bin"), Some("/Users/test/.npm-global/bin"))
+                .unwrap();
+
+        assert!(
+            runtime_path
+                .split(':')
+                .any(|segment| segment == "/Users/test/.npm-global/bin")
+        );
+        assert!(
+            runtime_path
+                .split(':')
+                .any(|segment| segment == "/opt/homebrew/bin")
+        );
     }
 
     #[cfg(unix)]

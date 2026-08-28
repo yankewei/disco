@@ -143,16 +143,16 @@ pub fn list_providers(
 
 /// 返回 Provider 的模型目录。
 ///
-/// - OpenCode：从当前 runtime 的本地 server API 刷新读取，结果写入运行时元数据缓存。
+/// - OpenCode：通过进程级共享 server manager 刷新读取，结果写入运行时元数据缓存。
 /// - API Key 类服务商：带凭据时用 Rig `list_models()` 实时查询，失败回退内置目录。
 /// - 其他：内置默认目录。
 pub async fn list_provider_models(
     app: &Arc<AppState>,
     params: disco_protocol::ProviderModelsParams,
 ) -> Result<Vec<ModelCatalogEntry>, ProviderError> {
-    let provider_id = resolve_provider_id(params.provider_id, params.vendor)?;
+    resolve_provider_id(params.provider_id, params.vendor)?;
     match params.vendor {
-        Vendor::OpenCode => opencode_model_catalog(app, provider_id, params.workspace_path).await,
+        Vendor::OpenCode => opencode_model_catalog(app, params.workspace_path).await,
         Vendor::Codex => {
             let executable = CodexProvider::find_codex();
             codex_app_server_models(&executable).await
@@ -276,30 +276,28 @@ fn is_chat_capable_model(model: &ModelEntry) -> bool {
         .any(|marker| normalized_id.contains(marker))
 }
 
-/// 返回 OpenCode 模型目录：每次验证都通过当前 runtime 的 server API 读取真实列表。
+/// 返回 OpenCode 模型目录：通过进程级共享 server manager 读取真实列表。
 ///
 /// server 不可用或未返回模型列表时返回错误（让设置页验证如实失败），
 /// 不缓存失败结果。
 async fn opencode_model_catalog(
     app: &Arc<AppState>,
-    provider_id: ProviderId,
     workspace_path: Option<String>,
 ) -> Result<Vec<ModelCatalogEntry>, ProviderError> {
-    // None 仅用于兼容旧客户端；新客户端总是传当前会话所属项目目录。
+    // None 仅用于兼容旧客户端；新客户端总是传当前项目目录。
     let cache_key = workspace_path
         .as_deref()
         .filter(|path| !path.trim().is_empty())
         .unwrap_or("__daemon_current_directory__")
         .to_string();
-    let backend = app.get_backend(&provider_id).await.ok_or_else(|| {
-        ProviderError::Internal(format!(
-            "Provider {} 当前没有可用的 OpenCode Backend",
-            provider_id
-        ))
-    })?;
-    let catalog = backend.list_models(workspace_path).await.map_err(|error| {
-        ProviderError::InvalidParams(format!("无法读取 OpenCode 模型列表：{error}"))
-    })?;
+    let adapter =
+        OpenCodeAdapter::new_with_server_manager(app.opencode_server_manager.clone(), None);
+    let catalog = adapter
+        .fetch_model_catalog(workspace_path.as_deref())
+        .await
+        .map_err(|error| {
+            ProviderError::InvalidParams(format!("无法读取 OpenCode 模型列表：{error}"))
+        })?;
     if catalog.is_empty() {
         return Err(ProviderError::InvalidParams(
             "OpenCode 没有返回可用的已连接模型，请先在 OpenCode CLI 中登录 provider。".to_string(),
@@ -564,6 +562,37 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ProviderError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn opencode_model_discovery_does_not_require_saved_backend() {
+        let (mut app, _session_id) = make_test_app(Arc::new(ScriptedBackend {
+            outputs: vec![],
+            backend_handle: None,
+        }));
+        Arc::get_mut(&mut app).unwrap().opencode_server_manager = Arc::new(
+            disco_backends::OpenCodeServerManager::new("/definitely/missing/opencode".to_string()),
+        );
+
+        let error = list_provider_models(
+            &app,
+            disco_protocol::ProviderModelsParams {
+                provider_id: Some(ProviderId::new(ProviderId::OPENCODE_APP_SERVER)),
+                vendor: Vendor::OpenCode,
+                base_url: None,
+                api_key: None,
+                workspace_path: Some("/tmp/disco-opencode".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::InvalidParams(message)
+                if message.contains("无法读取 OpenCode 模型列表")
+                    && !message.contains("没有可用的 OpenCode Backend")
+        ));
     }
 
     #[cfg(unix)]

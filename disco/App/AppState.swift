@@ -584,6 +584,32 @@ final class AppState: ObservableObject {
         refreshRuntimes(stopActiveStreams: true)
     }
 
+    func startConversationWithModel(_ model: String, for vendor: ProviderVendor) {
+        guard vendor.isAvailable,
+              let configuration = providerConfigs[vendor] else { return }
+
+        let previousConversation = selectedConversation
+        let selectionChanged = vendor != activeVendor || configuration.model != model
+        let sessionUsesSelectedProvider = previousConversation?.providerID
+            .map { $0 == vendor.daemonProviderID } ?? true
+        guard selectionChanged || !sessionUsesSelectedProvider else { return }
+
+        let shouldStartFreshSession = previousConversation?.store.hasDaemonSession == true
+            || previousConversation?.providerID != nil
+            || previousConversation?.store.messages.isEmpty == false
+
+        if vendor != activeVendor {
+            setActiveVendor(vendor)
+        }
+        setActiveModel(model, for: vendor)
+        guard shouldStartFreshSession else { return }
+
+        _ = createConversation(projectID: previousConversation?.projectID, forceNew: true)
+        if let previousConversation, previousConversation.store.messages.isEmpty {
+            deleteConversation(id: previousConversation.id)
+        }
+    }
+
     func setThinkingEnabled(_ enabled: Bool, for vendor: ProviderVendor) {
         guard var config = providerConfigs[vendor] else { return }
         let syncedEffort: String?
@@ -924,10 +950,11 @@ final class AppState: ObservableObject {
     // MARK: - 会话管理
 
     @discardableResult
-    func createConversation(projectID: UUID? = nil) -> ConversationSession.ID {
-        if let emptyConversation = conversations.first(where: {
-            $0.projectID == projectID && $0.store.messages.isEmpty
-        }) {
+    func createConversation(projectID: UUID? = nil, forceNew: Bool = false) -> ConversationSession.ID {
+        if !forceNew,
+           let emptyConversation = conversations.first(where: {
+               $0.projectID == projectID && $0.store.messages.isEmpty
+           }) {
             selectedConversationID = emptyConversation.id
             return emptyConversation.id
         }
