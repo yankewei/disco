@@ -1977,6 +1977,14 @@ private struct ModelDrawer: View {
     /// 抽屉内当前高亮的服务商；打开时默认跟随当前服务商
     @State private var selectedVendor: ProviderVendor?
 
+    private struct PendingModelSelection {
+        let vendor: ProviderVendor
+        let model: String
+    }
+
+    @State private var pendingModelSelection: PendingModelSelection?
+    @State private var isConfirmingModelSwitch = false
+
     /// 已配置 API Key 的服务商
     private var vendors: [ProviderVendor] {
         ProviderVendor.allCases.filter {
@@ -2018,6 +2026,33 @@ private struct ModelDrawer: View {
         }
         .frame(width: 460, height: 300)
         .onAppear { selectedVendor = appState.activeVendor }
+        .confirmationDialog(
+            "切换服务商或模型？",
+            isPresented: $isConfirmingModelSwitch,
+            titleVisibility: .visible
+        ) {
+            Button("新建对话") {
+                guard let pendingModelSelection else { return }
+                appState.startConversationWithModel(
+                    pendingModelSelection.model,
+                    for: pendingModelSelection.vendor
+                )
+                self.pendingModelSelection = nil
+                dismiss()
+            }
+            Button("取消", role: .cancel) {
+                pendingModelSelection = nil
+            }
+        } message: {
+            if let pendingModelSelection {
+                Text(
+                    "当前对话已开始，切换到 \(pendingModelSelection.vendor.title) · "
+                        + "\(pendingModelSelection.model) 后会新建对话，原对话会保留。"
+                )
+            } else {
+                Text("切换后会新建对话，原对话会保留。")
+            }
+        }
     }
 
     // MARK: 左列：服务商
@@ -2157,12 +2192,24 @@ private struct ModelDrawer: View {
         .buttonStyle(.plain)
     }
 
-    /// 选中模型：跨服务商时先切换服务商，再设置模型并关闭抽屉
+    /// Select a model and start a fresh session when the current session is bound.
     private func selectModel(_ vendor: ProviderVendor, _ name: String) {
-        if vendor != appState.activeVendor {
-            appState.setActiveVendor(vendor)
+        let selectionChanged = vendor != appState.activeVendor || name != appState.model
+        let sessionProviderMismatch = appState.selectedConversation?.providerID
+            .map { $0 != vendor.daemonProviderID } ?? false
+        guard selectionChanged || sessionProviderMismatch else {
+            dismiss()
+            return
         }
-        appState.setActiveModel(name, for: vendor)
+
+        if let conversation = appState.selectedConversation,
+           !conversation.store.messages.isEmpty {
+            pendingModelSelection = PendingModelSelection(vendor: vendor, model: name)
+            isConfirmingModelSwitch = true
+            return
+        }
+
+        appState.startConversationWithModel(name, for: vendor)
         dismiss()
     }
 }

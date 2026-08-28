@@ -268,6 +268,92 @@ final class AppStateTests: XCTestCase {
         XCTAssertTrue(appState.hasAPIKey)
     }
 
+    func testSwitchingProviderStartsNewSessionForBoundConversation() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let appState = try makeAppState(defaults: defaults)
+
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+        try appState.saveProviderConfig(
+            vendor: .opencode,
+            baseURL: "",
+            apiKey: "",
+            model: "opencode-go/deepseek-v4-flash",
+            models: ["opencode-go/deepseek-v4-flash"]
+        )
+
+        let previousConversation = try XCTUnwrap(appState.selectedConversation)
+        previousConversation.store.restoreMessages([
+            ChatMessage(role: .user, text: "分析这个项目"),
+        ])
+        let previousConversationID = previousConversation.id
+
+        appState.startConversationWithModel(
+            "opencode-go/deepseek-v4-flash",
+            for: .opencode
+        )
+
+        XCTAssertEqual(appState.activeVendor, .opencode)
+        XCTAssertEqual(appState.model, "opencode-go/deepseek-v4-flash")
+        XCTAssertNotEqual(appState.selectedConversation?.id, previousConversationID)
+        XCTAssertEqual(previousConversation.store.messages.count, 1)
+    }
+
+    func testSelectingActiveProviderStartsNewSessionForRestoredConversation() throws {
+        let suiteName = "\(#function)-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
+        let restoredConversationID = UUID()
+        try persistence.saveConversation(
+            ConversationSnapshot(
+                id: restoredConversationID,
+                createdAt: .now,
+                updatedAt: .now,
+                messages: [ChatMessage(role: .user, text: "分析这个项目")],
+                threadID: nil,
+                providerID: ProviderVendor.chatgpt.daemonProviderID,
+                runtimeKind: .codexAppServer
+            )
+        )
+        let appState = AppState(
+            keychain: InMemoryAuthStore(),
+            defaults: defaults,
+            persistence: persistence
+        )
+        try appState.saveProviderConfig(
+            vendor: .chatgpt,
+            baseURL: "",
+            apiKey: "",
+            model: "gpt-5.6",
+            models: ["gpt-5.6"]
+        )
+        try appState.saveProviderConfig(
+            vendor: .opencode,
+            baseURL: "",
+            apiKey: "",
+            model: "opencode-go/deepseek-v4-flash",
+            models: ["opencode-go/deepseek-v4-flash"]
+        )
+        appState.setActiveVendor(.opencode)
+
+        appState.startConversationWithModel(
+            "opencode-go/deepseek-v4-flash",
+            for: .opencode
+        )
+
+        XCTAssertEqual(appState.activeVendor, .opencode)
+        XCTAssertNotEqual(appState.selectedConversation?.id, restoredConversationID)
+        XCTAssertTrue(appState.conversations.contains { $0.id == restoredConversationID })
+    }
+
     func testThinkingEnabledIsPerProviderAndPersistsToggle() throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -302,7 +388,6 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(restored.config(for: .deepseek)?.thinkingEnabled, false)
         XCTAssertEqual(restored.config(for: .openai)?.thinkingEnabled, true)
     }
-
     func testDeepSeekReasoningEffortSupportsLevelsAndPersistsSelection() throws {
         let suiteName = "\(#function)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
