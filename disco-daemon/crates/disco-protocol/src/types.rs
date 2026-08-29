@@ -197,3 +197,14 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
+
+/// 后端持有的原生会话恢复游标。
+///
+/// 它不进入 App 协议；daemon 使用它确保原生会话只能交回创建它的 Provider。
+/// `handle` 保持不透明，以便具体 backend 自行演进其恢复所需的数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendResumeCursor {
+    pub provider_id: ProviderId,
+    pub handle: String,
+}

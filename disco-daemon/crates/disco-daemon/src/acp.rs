@@ -1092,8 +1092,11 @@ async fn load_session(
     })?;
     let backend_handle = app
         .db
-        .get_session_backend_handle(session.id)
-        .map_err(|error| internal_error(format!("无法读取 session backend handle：{error}")))?;
+        .get_session_backend_resume_cursor(session.id, &session.provider_id)
+        .map_err(|error| {
+            internal_error(format!("无法读取 session backend resume cursor：{error}"))
+        })?
+        .map(|cursor| cursor.handle);
     backend
         .load_session(
             &disco_core::BackendSession {

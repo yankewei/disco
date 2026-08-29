@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError, CompactionMode};
 use disco_persist::messages::{StoredMessage, StoredToolCall};
-use disco_protocol::types::TokenUsage;
+use disco_protocol::types::{BackendResumeCursor, TokenUsage};
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -101,8 +101,11 @@ pub async fn start_run(
             .collect::<Vec<_>>(),
     };
 
-    let backend_handle = match app.db.get_session_backend_handle(session_id) {
-        Ok(handle) => handle,
+    let backend_handle = match app
+        .db
+        .get_session_backend_resume_cursor(session_id, &session.provider_id)
+    {
+        Ok(cursor) => cursor.map(|cursor| cursor.handle),
         Err(error) => {
             app.run_coordinator.finish_run(run_id).await;
             return Err(StartRunError::Internal(error.to_string()));
@@ -142,7 +145,13 @@ pub async fn start_run(
 
         let backend_handle_result = if let Some(handle) = backend_run.backend_handle.as_deref() {
             let _state_guard = app.state_lock.lock().await;
-            let result = app.db.set_session_backend_handle(session_id, handle);
+            let result = app.db.set_session_backend_resume_cursor(
+                session_id,
+                &BackendResumeCursor {
+                    provider_id: session.provider_id.clone(),
+                    handle: handle.to_string(),
+                },
+            );
             if result.is_ok() {
                 app.bump_state_revision();
             }
@@ -635,11 +644,13 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert!(matches!(outputs[0], AgentOutput::TextDelta(ref text) if text == "hello"));
         assert!(matches!(outputs[1], AgentOutput::Completed));
+        let session = app.db.get_session(session_id).unwrap().unwrap();
         assert_eq!(
             app.db
-                .get_session_backend_handle(session_id)
+                .get_session_backend_resume_cursor(session_id, &session.provider_id)
                 .unwrap()
-                .as_deref(),
+                .as_ref()
+                .map(|cursor| cursor.handle.as_str()),
             Some("test-handle")
         );
         let messages = app.db.list_messages(session_id).unwrap();

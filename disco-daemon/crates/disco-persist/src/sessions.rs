@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use disco_protocol::types::{ProviderId, Session, Vendor};
+use disco_protocol::types::{BackendResumeCursor, ProviderId, Session, Vendor};
 use uuid::Uuid;
 
 use crate::Database;
@@ -149,32 +149,84 @@ impl Database {
         }
     }
 
-    /// 读取后端持有的原生会话句柄。该值只在 daemon 内部使用，不进入 App 协议 DTO。
-    pub fn get_session_backend_handle(&self, session_id: Uuid) -> Result<Option<String>> {
+    /// 读取后端持有的原生会话恢复游标。
+    ///
+    /// 旧数据库保存的是纯字符串 handle。读取时将其按 session 的 Provider 解释；下次成功
+    /// 运行写回时会自动升级为带 Provider 归属的 cursor。
+    pub fn get_session_backend_resume_cursor(
+        &self,
+        session_id: Uuid,
+        expected_provider_id: &ProviderId,
+    ) -> Result<Option<BackendResumeCursor>> {
         let conn = self.conn.lock().unwrap();
         let mut statement = conn
-            .prepare("SELECT backend_handle FROM sessions WHERE id = ?1")
-            .context("Failed to prepare backend handle query")?;
+            .prepare("SELECT provider_id, backend_handle FROM sessions WHERE id = ?1")
+            .context("Failed to prepare backend resume cursor query")?;
         let mut rows = statement
             .query(rusqlite::params![session_id.to_string()])
-            .context("Failed to query backend handle")?;
+            .context("Failed to query backend resume cursor")?;
         match rows.next().context("Failed to read backend handle row")? {
-            Some(row) => row.get(0).context("Failed to decode backend handle"),
+            Some(row) => {
+                let stored_provider_id = ProviderId::new(row.get::<_, String>(0)?);
+                if &stored_provider_id != expected_provider_id {
+                    anyhow::bail!(
+                        "会话 {session_id} 的 Provider {} 与恢复请求的 Provider {} 不一致",
+                        stored_provider_id,
+                        expected_provider_id
+                    );
+                }
+                let stored_value: Option<String> = row.get(1)?;
+                let Some(stored_value) = stored_value else {
+                    return Ok(None);
+                };
+                match serde_json::from_str::<BackendResumeCursor>(&stored_value) {
+                    Ok(cursor) => {
+                        if cursor.provider_id != *expected_provider_id {
+                            anyhow::bail!(
+                                "会话 {session_id} 的原生恢复游标属于 Provider {}，不能由 {} 恢复",
+                                cursor.provider_id,
+                                expected_provider_id
+                            );
+                        }
+                        Ok(Some(cursor))
+                    }
+                    Err(error) if stored_value.trim_start().starts_with('{') => {
+                        anyhow::bail!("会话 {session_id} 的原生恢复游标格式无效：{error}");
+                    }
+                    Err(_) => Ok(Some(BackendResumeCursor {
+                        provider_id: expected_provider_id.clone(),
+                        handle: stored_value,
+                    })),
+                }
+            }
             None => Ok(None),
         }
     }
 
-    /// 保存后端为 Disco 会话分配的不透明恢复句柄。
-    pub fn set_session_backend_handle(&self, session_id: Uuid, handle: &str) -> Result<()> {
+    /// 保存后端为 Disco 会话分配的原生恢复游标。
+    pub fn set_session_backend_resume_cursor(
+        &self,
+        session_id: Uuid,
+        cursor: &BackendResumeCursor,
+    ) -> Result<()> {
+        let serialized_cursor =
+            serde_json::to_string(cursor).context("Failed to serialize backend resume cursor")?;
         let conn = self.conn.lock().unwrap();
         let updated = conn
             .execute(
-                "UPDATE sessions SET backend_handle = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![handle, Self::now_iso8601(), session_id.to_string()],
+                "UPDATE sessions
+                 SET backend_handle = ?1, updated_at = ?2
+                 WHERE id = ?3 AND provider_id = ?4",
+                rusqlite::params![
+                    serialized_cursor,
+                    Self::now_iso8601(),
+                    session_id.to_string(),
+                    cursor.provider_id.as_str(),
+                ],
             )
-            .context("Failed to update backend handle")?;
+            .context("Failed to update backend resume cursor")?;
         if updated == 0 {
-            anyhow::bail!("会话 {session_id} 不存在");
+            anyhow::bail!("会话 {session_id} 不存在，或其 Provider 与原生恢复游标不一致");
         }
         Ok(())
     }
@@ -272,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_handle_is_internal_and_persists_for_resume() {
+    fn backend_resume_cursor_is_internal_and_persists_provider_ownership() {
         let db = temp_db();
         let project = db.create_project("Test", "/tmp/backend-handle").unwrap();
         let session = db
@@ -285,17 +337,128 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(db.get_session_backend_handle(session.id).unwrap(), None);
-        db.set_session_backend_handle(session.id, "thread-123")
-            .unwrap();
         assert_eq!(
-            db.get_session_backend_handle(session.id)
-                .unwrap()
-                .as_deref(),
-            Some("thread-123")
+            db.get_session_backend_resume_cursor(session.id, &session.provider_id)
+                .unwrap(),
+            None
+        );
+        db.set_session_backend_resume_cursor(
+            session.id,
+            &BackendResumeCursor {
+                provider_id: session.provider_id.clone(),
+                handle: "thread-123".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_session_backend_resume_cursor(session.id, &session.provider_id)
+                .unwrap(),
+            Some(BackendResumeCursor {
+                provider_id: session.provider_id.clone(),
+                handle: "thread-123".to_string(),
+            })
         );
 
         let serialized = serde_json::to_value(db.get_session(session.id).unwrap()).unwrap();
         assert!(serialized.get("backend_handle").is_none());
+    }
+
+    #[test]
+    fn legacy_handle_is_read_as_the_session_provider_cursor() {
+        let db = temp_db();
+        let project = db
+            .create_project("Test", "/tmp/legacy-backend-handle")
+            .unwrap();
+        let session = db
+            .create_session(
+                project.id,
+                ProviderId::new(ProviderId::CODEX_APP_SERVER),
+                Vendor::Codex,
+                "gpt-5-codex",
+                None,
+            )
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET backend_handle = ?1 WHERE id = ?2",
+                rusqlite::params!["legacy-thread", session.id.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.get_session_backend_resume_cursor(session.id, &session.provider_id)
+                .unwrap(),
+            Some(BackendResumeCursor {
+                provider_id: session.provider_id,
+                handle: "legacy-thread".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resume_cursor_from_another_provider_is_rejected() {
+        let db = temp_db();
+        let project = db
+            .create_project("Test", "/tmp/mismatched-backend-cursor")
+            .unwrap();
+        let session = db
+            .create_session(
+                project.id,
+                ProviderId::new(ProviderId::CODEX_APP_SERVER),
+                Vendor::Codex,
+                "gpt-5-codex",
+                None,
+            )
+            .unwrap();
+        let mismatched_cursor = serde_json::to_string(&BackendResumeCursor {
+            provider_id: ProviderId::new(ProviderId::CLAUDE_CODE),
+            handle: "claude-session".to_string(),
+        })
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET backend_handle = ?1 WHERE id = ?2",
+                rusqlite::params![mismatched_cursor, session.id.to_string()],
+            )
+            .unwrap();
+
+        let error = db
+            .get_session_backend_resume_cursor(session.id, &session.provider_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("不能由"));
+    }
+
+    #[test]
+    fn malformed_serialized_resume_cursor_is_rejected() {
+        let db = temp_db();
+        let project = db
+            .create_project("Test", "/tmp/malformed-backend-cursor")
+            .unwrap();
+        let session = db
+            .create_session(
+                project.id,
+                ProviderId::new(ProviderId::CODEX_APP_SERVER),
+                Vendor::Codex,
+                "gpt-5-codex",
+                None,
+            )
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET backend_handle = ?1 WHERE id = ?2",
+                rusqlite::params!["{not-valid-json", session.id.to_string()],
+            )
+            .unwrap();
+
+        let error = db
+            .get_session_backend_resume_cursor(session.id, &session.provider_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("格式无效"));
     }
 }

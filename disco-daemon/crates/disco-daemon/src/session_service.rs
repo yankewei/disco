@@ -71,8 +71,9 @@ pub async fn delete_session(
     }
     let backend_handle = app
         .db
-        .get_session_backend_handle(session.id)
-        .map_err(|error| SessionDeleteError::Internal(error.to_string()))?;
+        .get_session_backend_resume_cursor(session.id, &session.provider_id)
+        .map_err(|error| SessionDeleteError::Internal(error.to_string()))?
+        .map(|cursor| cursor.handle);
     let workspace_path = app
         .db
         .get_project(session.project_id)
