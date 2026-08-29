@@ -13,6 +13,8 @@ pub enum Vendor {
     KimiCode,
     Glm,
     Codex,
+    /// 本地 Claude Code CLI，由 daemon 通过 stream-json 会话接入。
+    Claude,
     /// 本地 OpenCode server（`opencode serve`），由 daemon 通过 REST + SSE 接入。
     #[serde(rename = "opencode")]
     OpenCode,
@@ -29,6 +31,7 @@ impl ProviderId {
     pub const CODEX_APP_SERVER: &'static str = "codex_app_server";
     pub const CODEX_API: &'static str = "codex_api";
     pub const OPENCODE_APP_SERVER: &'static str = "opencode_app_server";
+    pub const CLAUDE_CODE: &'static str = "claude_code";
 
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
@@ -43,6 +46,7 @@ impl ProviderId {
             Vendor::Glm => "glm_api",
             Vendor::Codex => Self::CODEX_APP_SERVER,
             Vendor::OpenCode => Self::OPENCODE_APP_SERVER,
+            Vendor::Claude => Self::CLAUDE_CODE,
         };
         Self::new(value)
     }
@@ -59,6 +63,7 @@ impl ProviderId {
             Self::CODEX_APP_SERVER => "codex_app_server",
             // 这里描述的是 Disco 对外的 ACP 运行时，不是 OpenCode 的内部 transport。
             Self::OPENCODE_APP_SERVER => "acp",
+            Self::CLAUDE_CODE => "claude_code",
             _ => "rig",
         }
     }
@@ -67,6 +72,23 @@ impl ProviderId {
 impl fmt::Display for ProviderId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::{ProviderId, Vendor};
+
+    #[test]
+    fn claude_code_uses_a_reserved_native_provider_id() {
+        assert_eq!(
+            ProviderId::legacy_default_for_vendor(Vendor::Claude).as_str(),
+            ProviderId::CLAUDE_CODE
+        );
+        assert_eq!(
+            ProviderId::legacy_default_for_vendor(Vendor::Claude).runtime_kind(),
+            "claude_code"
+        );
     }
 }
 

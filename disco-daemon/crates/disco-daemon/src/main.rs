@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use daemon::{AppState, ProviderRuntime, api_key_provider_runtime};
-use disco_backends::{CodexAdapter, OpenCodeAdapter, OpenCodeServerManager};
+use disco_backends::{ClaudeCodeAdapter, CodexAdapter, OpenCodeAdapter, OpenCodeServerManager};
 use disco_core::RunCoordinator;
 use disco_persist::{Database, default_db_path};
 use disco_protocol::types::{ProviderId, Vendor};
@@ -121,6 +121,16 @@ async fn main() {
                         )),
                         compaction_provider: Arc::new(UnavailableModelProvider::new(
                             "OpenCode provider 不支持上下文压缩",
+                        )),
+                    }
+                } else if config.provider_id.as_str() == ProviderId::CLAUDE_CODE {
+                    ProviderRuntime {
+                        backend: Arc::new(ClaudeCodeAdapter::new(
+                            ClaudeCodeAdapter::find_executable(),
+                            config.reasoning_effort.clone(),
+                        )),
+                        compaction_provider: Arc::new(UnavailableModelProvider::new(
+                            "Claude Code provider 不支持 Disco 发起的本地上下文压缩",
                         )),
                     }
                 } else {

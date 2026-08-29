@@ -660,12 +660,10 @@ private struct VendorDetailPanel: View {
                 .background(DiscoTheme.accent.opacity(0.1), in: RoundedRectangle(cornerRadius: DiscoRadius.small))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(vendor == .opencode ? "使用本机 OpenCode CLI" : "使用 Codex (OpenAI) 登录")
+                Text(subscriptionTitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(vendor == .opencode
-                    ? "无需 API Key：认证与模型由 opencode CLI 管理（opencode auth login）。"
-                    : "无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。")
+                Text(subscriptionDetail)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -676,6 +674,22 @@ private struct VendorDetailPanel: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(DiscoTheme.surface, in: RoundedRectangle(cornerRadius: DiscoRadius.small))
+    }
+
+    private var subscriptionTitle: String {
+        switch vendor {
+        case .opencode: "使用本机 OpenCode CLI"
+        case .claudeCode: "使用本机 Claude Code 登录"
+        default: "使用 Codex (OpenAI) 登录"
+        }
+    }
+
+    private var subscriptionDetail: String {
+        switch vendor {
+        case .opencode: "无需 API Key：认证与模型由 opencode CLI 管理（opencode auth login）。"
+        case .claudeCode: "无需 API Key：登录态由本机 claude CLI 管理（claude auth login）。"
+        default: "无需 API Key：登录态由本机 codex CLI 管理（~/.codex）。"
+        }
     }
 
     /// Key 行三态：已保存（掩码，可查看/更换）、查看明文、输入新 Key

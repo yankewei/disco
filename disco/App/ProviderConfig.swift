@@ -11,6 +11,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     case zhipu
     case chatgpt
     case opencode
+    case claudeCode
     case anthropic
     case gemini
 
@@ -26,6 +27,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .zhipu: "glm"
         case .chatgpt: "codex"
         case .opencode: "opencode"
+        case .claudeCode: "claude"
         case .anthropic: "anthropic"
         case .gemini: "gemini"
         }
@@ -37,6 +39,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .openai: "codex_api"
         case .chatgpt: "codex_app_server"
         case .opencode: "opencode_app_server"
+        case .claudeCode: "claude_code"
         default: "\(daemonVendor)_api"
         }
     }
@@ -50,6 +53,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .zhipu: "智谱 GLM"
         case .chatgpt: "Codex (OpenAI)"
         case .opencode: "OpenCode"
+        case .claudeCode: "Claude Code"
         case .anthropic: "Anthropic Claude"
         case .gemini: "Google Gemini"
         }
@@ -64,6 +68,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .zhipu: "智谱清言 GLM API，兼容 OpenAI 接口"
         case .chatgpt: "使用 Codex (OpenAI) 订阅额度（codex app-server）"
         case .opencode: "本地 opencode server，经 REST + SSE 驱动（模型由 opencode 自身管理）"
+        case .claudeCode: "本地 Claude Code CLI，经 stream-json 长期会话驱动"
         case .anthropic: "Anthropic 官方 Claude API"
         case .gemini: "Google Gemini API"
         }
@@ -78,6 +83,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .zhipu: "brain.head.profile"
         case .chatgpt: "bubble.left.and.bubble.right.fill"
         case .opencode: "terminal"
+        case .claudeCode: "terminal.badge.checkmark"
         case .anthropic: "rays"
         case .gemini: "sparkles"
         }
@@ -90,6 +96,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .kimiCode: "brand.kimiCode"
         case .chatgpt: "brand.codex"
         case .opencode: "brand.opencode"
+        case .claudeCode: "brand.claudeCode"
         default: nil
         }
     }
@@ -104,17 +111,18 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .zhipu: "https://open.bigmodel.cn/api/paas/v4"
         case .chatgpt: ""
         case .opencode: ""
+        case .claudeCode: ""
         case .anthropic: ""
         case .gemini: ""
         }
     }
 
-    /// 是否需要 API Key。false 表示订阅登录类服务商（ChatGPT/Codex），
+    /// 是否需要 API Key。false 表示由本地 CLI 管理登录态的服务商，
     /// 登录态由 codex CLI 管理（ADR-003：应用不读取 ~/.codex/auth.json）。
     /// OpenCode 同理：认证由 opencode CLI 自身管理（`opencode auth login`）。
     var requiresAPIKey: Bool {
         switch self {
-        case .chatgpt, .opencode: false
+        case .chatgpt, .opencode, .claudeCode: false
         default: true
         }
     }
@@ -122,7 +130,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     /// 当前是否已实现接入（OpenAI 兼容接口与 ChatGPT 订阅已可用，其余待实现）
     var isAvailable: Bool {
         switch self {
-        case .deepseek, .openai, .moonshot, .kimiCode, .zhipu, .chatgpt, .opencode: true
+        case .deepseek, .openai, .moonshot, .kimiCode, .zhipu, .chatgpt, .opencode, .claudeCode: true
         case .anthropic, .gemini: false
         }
     }
@@ -135,6 +143,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
         case .openai, .moonshot, .zhipu: ["none", "high"]
         // OpenCode 的 effort 能力按模型由 server 返回，不能用供应商级静态列表兜底。
         case .opencode: []
+        case .claudeCode: ["low", "medium", "high"]
         default: []
         }
     }
@@ -222,7 +231,7 @@ enum ProviderVendor: String, CaseIterable, Identifiable {
     var verifiedAtDefaultsKey: String { "provider.\(rawValue).verifiedAt" }
 
     /// 判断该服务商是否已经具备可用配置。
-    /// API Key 服务商需要 Key 和模型；订阅服务商不需要 Key，模型和验证记录即可。
+    /// API Key 服务商需要 Key 和模型；本地 CLI 服务商不需要 Key，模型和验证记录即可。
     func isConfigured(_ config: ProviderConfig?) -> Bool {
         guard let config else { return false }
         if requiresAPIKey {

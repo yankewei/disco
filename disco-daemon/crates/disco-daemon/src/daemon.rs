@@ -163,6 +163,7 @@ pub fn api_key_provider_runtime(
         }
         // OpenCode 走本地 server backend，不会经过 API Key runtime。
         Vendor::OpenCode => anyhow::bail!("OpenCode 使用 server backend，不走 API Key runtime"),
+        Vendor::Claude => anyhow::bail!("Claude Code 使用本地 CLI backend，不走 API Key runtime"),
     };
     Ok(ProviderRuntime {
         backend: runtime.backend,

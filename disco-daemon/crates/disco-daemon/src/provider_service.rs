@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use disco_backends::{CodexAdapter, ModelEntry, OpenCodeAdapter};
+use disco_backends::{ClaudeCodeAdapter, CodexAdapter, ModelEntry, OpenCodeAdapter};
 use disco_protocol::types::{ModelCatalogEntry, ProviderId, Vendor};
 use disco_providers::{CodexProvider, UnavailableModelProvider};
 
@@ -45,6 +45,7 @@ pub fn resolve_provider_id(
         ProviderId::CODEX_APP_SERVER => vendor == Vendor::Codex,
         ProviderId::CODEX_API => vendor == Vendor::Openai,
         ProviderId::OPENCODE_APP_SERVER => vendor == Vendor::OpenCode,
+        ProviderId::CLAUDE_CODE => vendor == Vendor::Claude,
         _ => true,
     };
     if !vendor_matches_reserved_id {
@@ -96,6 +97,22 @@ pub async fn configure_provider(
         // 配置更新后清除模型目录缓存，下次请求重新从 server 拉取。
         app.opencode_model_catalog.lock().await.clear();
         runtime
+    } else if config.provider_id.as_str() == ProviderId::CLAUDE_CODE {
+        let executable = ClaudeCodeAdapter::find_executable();
+        ClaudeCodeAdapter::validate_installation(&executable)
+            .await
+            .map_err(|error| {
+                ProviderError::InvalidParams(format!("无法验证 Claude Code：{error}"))
+            })?;
+        ProviderRuntime {
+            backend: Arc::new(ClaudeCodeAdapter::new(
+                executable,
+                params.reasoning_effort.clone(),
+            )),
+            compaction_provider: Arc::new(UnavailableModelProvider::new(
+                "Claude Code provider 不支持 Disco 发起的本地上下文压缩",
+            )),
+        }
     } else {
         api_key_provider_runtime(
             params.vendor,
@@ -156,6 +173,15 @@ pub async fn list_provider_models(
         Vendor::Codex => {
             let executable = CodexProvider::find_codex();
             codex_app_server_models(&executable).await
+        }
+        Vendor::Claude => {
+            let executable = ClaudeCodeAdapter::find_executable();
+            ClaudeCodeAdapter::validate_installation(&executable)
+                .await
+                .map_err(|error| {
+                    ProviderError::InvalidParams(format!("无法验证 Claude Code：{error}"))
+                })?;
+            Ok(get_default_models(Vendor::Claude))
         }
         Vendor::Deepseek
         | Vendor::Openai
@@ -384,6 +410,30 @@ pub fn get_default_models(vendor: Vendor) -> Vec<ModelCatalogEntry> {
             ]),
             default_reasoning_effort: Some("medium".to_string()),
         }],
+        Vendor::Claude => vec![
+            ModelCatalogEntry {
+                id: "sonnet".to_string(),
+                display_name: Some("Claude Sonnet".to_string()),
+                context_window: Some(200_000),
+                supported_reasoning_efforts: Some(vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                ]),
+                default_reasoning_effort: Some("medium".to_string()),
+            },
+            ModelCatalogEntry {
+                id: "opus".to_string(),
+                display_name: Some("Claude Opus".to_string()),
+                context_window: Some(200_000),
+                supported_reasoning_efforts: Some(vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                ]),
+                default_reasoning_effort: Some("medium".to_string()),
+            },
+        ],
         // OpenCode 模型目录来自本地 server API，不使用静态兜底列表。
         Vendor::OpenCode => Vec::new(),
     }

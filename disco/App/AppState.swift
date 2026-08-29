@@ -1415,7 +1415,7 @@ final class AppState: ObservableObject {
             }
             if let existingSession {
                 let fallbackCompactionMode = switch existingSession.runtimeKind {
-                case .acp, .codexAppServer: "native"
+                case .acp, .codexAppServer, .claudeCode: "native"
                 default: "local"
                 }
                 conversation.store.setCompactionMode(
@@ -1470,6 +1470,7 @@ final class AppState: ObservableObject {
                 conversation.store.setCompactionMode(
                     vendor.daemonProviderID == "opencode_app_server"
                         || vendor.daemonProviderID == "codex_app_server"
+                        || vendor.daemonProviderID == "claude_code"
                         ? "native"
                         : "local"
                 )

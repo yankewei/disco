@@ -4,6 +4,7 @@ import SwiftData
 enum SessionRuntimeKind: String, Codable, Sendable {
     case acp
     case codexAppServer = "codex_app_server"
+    case claudeCode = "claude_code"
     case rig
     case unknown
 
@@ -11,6 +12,7 @@ enum SessionRuntimeKind: String, Codable, Sendable {
         switch providerID {
         case "opencode_app_server": .acp
         case "codex_app_server": .codexAppServer
+        case "claude_code": .claudeCode
         case nil: nil
         default: .rig
         }
