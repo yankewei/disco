@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -61,7 +61,7 @@ impl OpenCodeServer {
 
         let username = "opencode".to_string();
         let password = Uuid::new_v4().as_simple().to_string();
-        let child = Command::new(binary)
+        let child = disco_tools::command_env::std_command(binary)
             .args([
                 "serve",
                 "--hostname",

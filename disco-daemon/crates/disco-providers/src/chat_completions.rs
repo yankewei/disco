@@ -68,10 +68,7 @@ impl ChatCompletionsProvider {
         &self,
         options: StreamOptions<'_>,
     ) -> Result<impl Stream<Item = Result<ProviderEvent>>> {
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         // Build messages array
         let msgs: Vec<serde_json::Value> = options
@@ -215,10 +212,7 @@ pub fn parse_chat_completion_chunk(data: &str) -> Result<Vec<ProviderEvent>> {
     }
 
     // Extract delta from choices[0]
-    if let Some(choice) = json["choices"]
-        .as_array()
-        .and_then(|arr| arr.first())
-    {
+    if let Some(choice) = json["choices"].as_array().and_then(|arr| arr.first()) {
         let delta = &choice["delta"];
 
         // Check for reasoning_content (Kimi-specific) first
@@ -246,10 +240,7 @@ pub fn parse_chat_completion_chunk(data: &str) -> Result<Vec<ProviderEvent>> {
             for tc in tool_calls {
                 let index = tc["index"].as_u64().unwrap_or(0);
                 let call_id = tc["id"].as_str().unwrap_or("").to_string();
-                let name = tc["function"]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let arguments = tc["function"]["arguments"]
                     .as_str()
                     .unwrap_or("")
@@ -300,17 +291,13 @@ fn parse_chat_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .or_else(|| {
-            usage.get("cached_tokens").and_then(|v| v.as_i64())
-        });
+        .or_else(|| usage.get("cached_tokens").and_then(|v| v.as_i64()));
 
     let reasoning_output = usage
         .get("completion_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_i64())
-        .or_else(|| {
-            usage.get("reasoning_tokens").and_then(|v| v.as_i64())
-        });
+        .or_else(|| usage.get("reasoning_tokens").and_then(|v| v.as_i64()));
 
     Some(TokenUsage {
         input,
@@ -353,7 +340,10 @@ pub async fn fetch_model_catalog(
         context_length: Option<i64>,
     }
 
-    let list: ModelList = response.json().await.context("Failed to parse model list")?;
+    let list: ModelList = response
+        .json()
+        .await
+        .context("Failed to parse model list")?;
 
     let mut entries: Vec<_> = list
         .data
@@ -411,7 +401,8 @@ mod tests {
 
     #[test]
     fn parse_finish_reason_stop() {
-        let data = r#"{"id":"chatcmpl-123","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let data =
+            r#"{"id":"chatcmpl-123","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
         let events = parse_chat_completion_chunk(data).unwrap();
         assert!(events.iter().any(|e| matches!(e, ProviderEvent::Completed)));
     }
@@ -589,7 +580,11 @@ mod tests {
         assert_eq!(full_args, "echo hello");
 
         // Verify completion
-        assert!(events3.iter().any(|e| matches!(e, ProviderEvent::Completed)));
+        assert!(
+            events3
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Completed))
+        );
     }
 
     #[test]
@@ -655,7 +650,9 @@ mod tests {
         }"#;
         let events = parse_chat_completion_chunk(data).unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], ProviderEvent::TextDelta(d) if d == "Let me run that for you."));
+        assert!(
+            matches!(&events[0], ProviderEvent::TextDelta(d) if d == "Let me run that for you.")
+        );
         assert!(matches!(&events[1], ProviderEvent::ToolCallDelta { name, .. } if name == "shell"));
     }
 }

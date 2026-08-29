@@ -86,8 +86,9 @@ impl ToolExecutor for ShellExecutor {
             command, timeout_secs, context.run_id
         );
 
-        // Build the command
-        let mut cmd = tokio::process::Command::new("/bin/zsh");
+        // Build the command。用补全后的 PATH（含用户 shell 配置目录），
+        // 使 GUI 启动的 daemon 也能在 shell 中找到用户工具链（bun 等）。
+        let mut cmd = crate::command_env::command("/bin/zsh");
         cmd.arg("-c").arg(command);
 
         // Set working directory
@@ -266,6 +267,27 @@ mod tests {
             run_id: Uuid::new_v4(),
             workspace_path: workspace.map(String::from),
         }
+    }
+
+    #[tokio::test]
+    async fn shell_child_inherits_enriched_path() {
+        let Ok(home) = std::env::var("HOME") else {
+            return; // 无 HOME 的环境（罕见）跳过断言
+        };
+        let executor = ShellExecutor::new();
+        let call = ToolCall {
+            call_id: "tc_path".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"printf '%s' \"$PATH\""}"#.to_string(),
+        };
+        let context = make_context(None);
+        let result = executor.execute(&call, &context).await.unwrap();
+        // command_env 补全的 PATH 应包含 ~/.local/bin 等用户目录
+        assert!(
+            result.output.contains(&format!("{home}/.local/bin")),
+            "shell 子进程应继承补全后的 PATH（含 ~/.local/bin），实际: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

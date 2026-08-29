@@ -127,7 +127,7 @@ async fn run_rg(
     search_path: &Path,
     file_pattern: Option<&str>,
 ) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("rg");
+    let mut cmd = crate::command_env::command("rg");
     cmd.arg("--line-number")
         .arg("--no-heading")
         .arg("--color=never")
@@ -180,7 +180,7 @@ async fn run_grep(
     search_path: &Path,
     file_pattern: Option<&str>,
 ) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("grep");
+    let mut cmd = crate::command_env::command("grep");
     cmd.arg("-rn")
         .arg("--color=never")
         .arg(pattern)
@@ -193,9 +193,7 @@ async fn run_grep(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("grep not found: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("grep not found: {e}"))?;
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
@@ -249,20 +247,29 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("disco_search_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&tmp).await.unwrap();
 
-        fs::write(tmp.join("hello.rs"), "fn main() {\n    println!(\"hello\");\n}\n")
-            .await
-            .unwrap();
-        fs::write(tmp.join("world.rs"), "fn world() {\n    println!(\"world\");\n}\n")
-            .await
-            .unwrap();
+        fs::write(
+            tmp.join("hello.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            tmp.join("world.rs"),
+            "fn world() {\n    println!(\"world\");\n}\n",
+        )
+        .await
+        .unwrap();
         fs::write(tmp.join("notes.txt"), "hello world\nsome notes\n")
             .await
             .unwrap();
 
         fs::create_dir_all(tmp.join("sub")).await.unwrap();
-        fs::write(tmp.join("sub").join("deep.rs"), "fn deep() { /* hello */ }\n")
-            .await
-            .unwrap();
+        fs::write(
+            tmp.join("sub").join("deep.rs"),
+            "fn deep() { /* hello */ }\n",
+        )
+        .await
+        .unwrap();
 
         (TempDir(tmp), SearchExecutor::new())
     }
@@ -369,10 +376,12 @@ mod tests {
         let def = tool_definition();
         assert_eq!(def.name, "search");
         assert!(def.input_schema["properties"]["pattern"].is_object());
-        assert!(def.input_schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str() == Some("pattern")));
+        assert!(
+            def.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("pattern"))
+        );
     }
 }

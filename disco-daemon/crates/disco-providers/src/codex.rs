@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, sleep, timeout};
 use tokio_stream::StreamExt;
@@ -281,7 +280,7 @@ pub struct CodexProvider {
 /// `model/list`，拿到结果即断开，不创建 thread。失败返回明确错误（CLI 缺失、
 /// 启动失败、握手失败或模型列表不可用）。
 pub async fn list_codex_models(executable: &str) -> Result<Vec<CodexModelEntry>> {
-    let mut child = codex_command(executable)
+    let mut child = disco_tools::command_env::command(executable)
         .arg("app-server")
         .kill_on_drop(true)
         .stdin(Stdio::piped())
@@ -387,143 +386,6 @@ async fn recv_jsonrpc_response(
     .map_err(|_| anyhow::anyhow!("等待 codex app-server 响应超时"))?
 }
 
-/// 在给定的 PATH 中查找第一个存在的 codex 可执行文件。
-fn find_codex_in_path(path: &str) -> Option<String> {
-    for dir in path.split(':') {
-        let dir = dir.trim();
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = format!("{dir}/codex");
-        if std::path::Path::new(&candidate).exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// 解析登录 shell 配置文件，提取真实的 PATH。
-///
-/// 解析登录 shell 配置文件，还原真实 PATH。
-///
-/// GUI 会话启动的进程 PATH 很精简（不含 Homebrew / npm-global 等安装目录），
-/// 从用户 shell 配置里读 PATH 才能覆盖这些位置。zsh 常见的写法是
-/// `export PATH="$HOME/.npm-global/bin:$PATH"`，因此按执行顺序收集每行的
-/// 前置目录段，最后拼接上当前进程 PATH 作基底。
-fn login_shell_path() -> Option<String> {
-    static RC_FILES: &[&str] = &[
-        "~/.zshenv",
-        "~/.zprofile",
-        "~/.zshrc",
-        "~/.bash_profile",
-        "~/.profile",
-    ];
-    let home = std::env::var("HOME").ok()?;
-    let base_path = std::env::var("PATH").unwrap_or_default();
-    let mut segments: Vec<String> = Vec::new();
-
-    for rc_file in RC_FILES {
-        let path = rc_file.replace('~', &home);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        for line in content.lines() {
-            let line = line.trim();
-            let Some(rest) = line
-                .strip_prefix("export PATH=")
-                .or_else(|| line.strip_prefix("PATH="))
-            else {
-                continue;
-            };
-            let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            if value.is_empty() {
-                continue;
-            }
-            // 取 `$PATH` / `${PATH}` 之前的目录段（zsh 通常用它引用旧值）
-            let prefix = value.split("$PATH").next().unwrap_or(value).to_string();
-            let prefix = if prefix != value {
-                prefix
-            } else {
-                value.split("${PATH}").next().unwrap_or(value).to_string()
-            };
-            if prefix.is_empty() {
-                continue;
-            }
-            let prefix = prefix
-                .replace("${HOME}", &home)
-                .replace("$HOME", &home)
-                .replace('~', &home)
-                .trim_end_matches(':')
-                .to_string();
-            if !prefix.is_empty() {
-                segments.push(prefix);
-            }
-        }
-    }
-
-    if segments.is_empty() {
-        return None;
-    }
-    segments.push(base_path);
-    Some(segments.join(":"))
-}
-
-/// Build a Codex command with the tool paths available to the user's login shell.
-///
-/// GUI-launched processes often inherit a minimal PATH. The npm Codex launcher
-/// uses `#!/usr/bin/env node`, so finding the launcher is not enough; its child
-/// process must receive a PATH that can resolve Node as well.
-fn codex_command(executable: &str) -> Command {
-    let mut command = Command::new(executable);
-    if let Some(runtime_path) = codex_runtime_path() {
-        command.env("PATH", runtime_path);
-    }
-    command
-}
-
-fn codex_runtime_path() -> Option<String> {
-    let current_path = std::env::var("PATH").ok();
-    let shell_path = login_shell_path();
-    build_codex_runtime_path(current_path.as_deref(), shell_path.as_deref())
-}
-
-fn build_codex_runtime_path(
-    current_path: Option<&str>,
-    shell_path: Option<&str>,
-) -> Option<String> {
-    let mut path_segments: Vec<String> = Vec::new();
-    let mut append_path_segments = |path: &str| {
-        for segment in path.split(':') {
-            let segment = segment.trim();
-            if segment.is_empty()
-                || path_segments
-                    .iter()
-                    .any(|existing_segment| existing_segment == segment)
-            {
-                continue;
-            }
-            path_segments.push(segment.to_string());
-        }
-    };
-
-    if let Some(path) = current_path {
-        append_path_segments(path);
-    }
-    if let Some(path) = shell_path {
-        append_path_segments(path);
-    }
-    for path in ["/usr/local/bin", "/usr/local/sbin"] {
-        append_path_segments(path);
-    }
-    #[cfg(target_os = "macos")]
-    for path in ["/opt/homebrew/bin", "/opt/homebrew/sbin"] {
-        append_path_segments(path);
-    }
-
-    (!path_segments.is_empty()).then(|| path_segments.join(":"))
-}
-
 impl CodexProvider {
     /// Create a new CodexProvider.
     pub fn new(
@@ -546,45 +408,9 @@ impl CodexProvider {
 
     /// Find the codex executable in PATH or well-known locations.
     pub fn find_codex() -> String {
-        // 1. 当前进程 PATH
-        if let Ok(path) = std::env::var("PATH") {
-            if let Some(found) = find_codex_in_path(&path) {
-                return found;
-            }
-        }
-
-        // 2. 从 app bundle 启动的 daemon 继承的 PATH 很精简（不含 Homebrew /
-        //    npm-global 等），回退解析登录 shell 的 PATH 再找一遍。
-        if let Some(shell_path) = login_shell_path() {
-            if let Some(found) = find_codex_in_path(&shell_path) {
-                return found;
-            }
-        }
-
-        // 3. home 目录下的常见安装位置
-        if let Ok(home) = std::env::var("HOME") {
-            let home_candidates = [
-                format!("{home}/.npm-global/bin/codex"),
-                format!("{home}/.cargo/bin/codex"),
-                format!("{home}/.local/bin/codex"),
-                format!("{home}/.codex/bin/codex"),
-            ];
-            for c in &home_candidates {
-                if std::path::Path::new(c).exists() {
-                    return c.clone();
-                }
-            }
-        }
-
-        // 4. 系统级安装位置
-        for c in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] {
-            if std::path::Path::new(c).exists() {
-                return c.to_string();
-            }
-        }
-
-        // 兜底裸命令名（启动时如仍找不到会给出明确错误）
-        "codex".to_string()
+        disco_tools::command_env::find_executable("codex")
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "codex".to_string())
     }
 
     /// 流式执行一个 turn，并保留 Codex 的审批与 item 生命周期语义。
@@ -681,7 +507,7 @@ impl CodexProvider {
             drop(s); // Release lock before spawning process
             info!("Launching codex app-server: {executable}");
 
-            let mut command = codex_command(executable);
+            let mut command = disco_tools::command_env::command(executable);
             command
                 .arg("app-server")
                 .stdin(std::process::Stdio::piped())
@@ -1771,25 +1597,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn builds_runtime_path_for_gui_processes() {
-        let runtime_path =
-            build_codex_runtime_path(Some("/usr/bin:/bin"), Some("/Users/test/.npm-global/bin"))
-                .unwrap();
-
-        assert!(
-            runtime_path
-                .split(':')
-                .any(|segment| segment == "/Users/test/.npm-global/bin")
-        );
-        assert!(
-            runtime_path
-                .split(':')
-                .any(|segment| segment == "/opt/homebrew/bin")
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn list_codex_models_parses_model_list() {
@@ -2126,22 +1933,5 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
                 .unwrap()
                 .contains("approval/request")
         );
-    }
-}
-
-#[cfg(test)]
-mod temp_gui_repro {
-    use super::*;
-
-    #[tokio::test]
-    async fn gui_lean_path_repro() {
-        // 模拟 GUI 启动的 daemon：PATH 精简，靠 login_shell_path 回退
-        unsafe { std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin") };
-        let exe = CodexProvider::find_codex();
-        eprintln!("==> find_codex() = {exe}");
-        match list_codex_models(&exe).await {
-            Ok(models) => eprintln!("OK: {} models", models.len()),
-            Err(e) => eprintln!("ERR: {e}"),
-        }
     }
 }

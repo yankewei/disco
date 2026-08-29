@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod command_env;
 pub mod file_edit;
 pub mod search;
 pub mod shell;

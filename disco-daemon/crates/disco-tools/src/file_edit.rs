@@ -134,7 +134,12 @@ impl FileEditExecutor {
             .ok_or_else(|| "No workspace path set".to_string())?;
 
         let resolved = resolve_safe_path(workspace, rel_path)?;
-        debug!("write_file: {} -> {} ({} bytes)", rel_path, resolved.display(), content.len());
+        debug!(
+            "write_file: {} -> {} ({} bytes)",
+            rel_path,
+            resolved.display(),
+            content.len()
+        );
 
         // Create parent directories
         if let Some(parent) = resolved.parent() {
@@ -145,25 +150,17 @@ impl FileEditExecutor {
 
         // Atomic write: write to temp file, then rename
         let tmp_path = resolved.with_extension("tmp");
-        fs::write(&tmp_path, content)
-            .await
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("Failed to write temp file: {e}")
-            })?;
+        fs::write(&tmp_path, content).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to write temp file: {e}")
+        })?;
 
-        fs::rename(&tmp_path, &resolved)
-            .await
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                format!("Failed to rename temp file: {e}")
-            })?;
+        fs::rename(&tmp_path, &resolved).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("Failed to rename temp file: {e}")
+        })?;
 
-        let output = format!(
-            "Successfully wrote {} bytes to {}",
-            content.len(),
-            rel_path
-        );
+        let output = format!("Successfully wrote {} bytes to {}", content.len(), rel_path);
 
         Ok(ToolResult {
             call_id: call.call_id.clone(),
@@ -200,10 +197,7 @@ fn resolve_safe_path(workspace: &str, rel_path: &str) -> Result<PathBuf, String>
             .canonicalize()
             .map_err(|e| format!("Cannot resolve path: {e}"))?;
         if !canonical.starts_with(&canonical_workspace) {
-            return Err(format!(
-                "Path '{}' escapes workspace directory",
-                rel_path
-            ));
+            return Err(format!("Path '{}' escapes workspace directory", rel_path));
         }
         return Ok(canonical);
     }
@@ -216,10 +210,7 @@ fn resolve_safe_path(workspace: &str, rel_path: &str) -> Result<PathBuf, String>
                 .canonicalize()
                 .map_err(|e| format!("Cannot resolve parent path: {e}"))?;
             if !canonical_parent.starts_with(&canonical_workspace) {
-                return Err(format!(
-                    "Path '{}' escapes workspace directory",
-                    rel_path
-                ));
+                return Err(format!("Path '{}' escapes workspace directory", rel_path));
             }
         }
     }
@@ -228,10 +219,7 @@ fn resolve_safe_path(workspace: &str, rel_path: &str) -> Result<PathBuf, String>
     let joined_str = normalized.to_string_lossy();
     let workspace_str = canonical_workspace.to_string_lossy();
     if !joined_str.starts_with(workspace_str.as_ref()) {
-        return Err(format!(
-            "Path '{}' escapes workspace directory",
-            rel_path
-        ));
+        return Err(format!("Path '{}' escapes workspace directory", rel_path));
     }
 
     Ok(normalized)

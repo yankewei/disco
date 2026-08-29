@@ -16,7 +16,7 @@ use disco_core::{
 use disco_protocol::types::ApprovalDecision;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -49,14 +49,25 @@ enum ClaudeEvent {
 }
 
 impl ClaudeCodeAdapter {
-    /// Claude Code 默认通过 PATH 发现；测试或受管部署可用 CLAUDE_PATH 覆盖。
+    /// 优先使用显式配置；否则在 PATH 和常见的用户级安装位置中寻找 Claude Code。
+    ///
+    /// macOS GUI App 从 LaunchServices 启动时，PATH 通常不包含 `~/.local/bin`。
+    /// 而 Claude Code 的原生安装器默认会将 CLI 安装在这个目录，因此不能只依赖 PATH。
     pub fn find_executable() -> String {
-        std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string())
+        if let Ok(executable) = std::env::var("CLAUDE_PATH")
+            && !executable.trim().is_empty()
+        {
+            return executable;
+        }
+
+        disco_tools::command_env::find_executable("claude")
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     /// 只验证 CLI 是否可启动，不触发模型请求或读取登录凭据。
     pub async fn validate_installation(executable: &str) -> Result<()> {
-        let output = Command::new(executable)
+        let output = disco_tools::command_env::command(executable)
             .arg("--version")
             .output()
             .await
@@ -213,7 +224,7 @@ fn spawn_session(
     effort: Option<&str>,
     workspace_path: Option<&str>,
 ) -> Result<ClaudeSession> {
-    let mut command = Command::new(executable);
+    let mut command = disco_tools::command_env::command(executable);
     command.args([
         "-p",
         "--input-format",
