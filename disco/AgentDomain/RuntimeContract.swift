@@ -28,7 +28,7 @@ enum AgentRunState: Sendable, Equatable {
 
 // MARK: - 上下文状态契约
 
-/// 一次上下文占用快照。`source` 标记数据来源，UI 据此标注“服务商返回 / 本地估算”。
+/// 一次上下文占用快照。
 struct ContextUsageSnapshot: Codable, Sendable, Equatable {
     enum Source: String, Codable, Sendable {
         case provider
@@ -36,7 +36,9 @@ struct ContextUsageSnapshot: Codable, Sendable, Equatable {
         case estimate
     }
 
-    /// 当前占用（最近一次 daemon 上报的 usage）。
+    /// 当前上下文窗口占用（最近一次 daemon 上报的快照）。
+    let tokens: Int
+    /// 最近一次请求的 token 明细；provider 未提供明细时为上下文快照的合成值。
     let current: TokenUsageSnapshot
     /// 累计用量；无累计概念时为 nil。
     let accumulated: TokenUsageSnapshot?
@@ -45,11 +47,13 @@ struct ContextUsageSnapshot: Codable, Sendable, Equatable {
     let source: Source
 
     init(
+        tokens: Int,
         current: TokenUsageSnapshot,
         accumulated: TokenUsageSnapshot? = nil,
         contextWindow: Int? = nil,
         source: Source
     ) {
+        self.tokens = tokens
         self.current = current
         self.accumulated = accumulated
         self.contextWindow = contextWindow
@@ -151,12 +155,16 @@ struct ContextCompactionUpdate: Sendable, Equatable {
 struct ConversationContextState: Sendable, Equatable {
     var checkpoint: ContextCheckpoint?
     var lastSuccessfulCompaction: ContextCompactionSnapshot?
+    /// 最近一次 daemon 上报的上下文占用，用于重载会话后恢复显示。
+    var lastContextUsage: ContextUsageSnapshot?
 
     nonisolated init(
         checkpoint: ContextCheckpoint? = nil,
-        lastSuccessfulCompaction: ContextCompactionSnapshot? = nil
+        lastSuccessfulCompaction: ContextCompactionSnapshot? = nil,
+        lastContextUsage: ContextUsageSnapshot? = nil
     ) {
         self.checkpoint = checkpoint
         self.lastSuccessfulCompaction = lastSuccessfulCompaction
+        self.lastContextUsage = lastContextUsage
     }
 }

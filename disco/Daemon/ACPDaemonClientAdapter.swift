@@ -152,19 +152,25 @@ enum ACPDaemonEventMapper {
         guard let current else {
             return nil
         }
+        let contextTokens = fields["used"]?.numberValue
+            .map(Int.init)
+            .flatMap { $0 > 0 ? $0 : nil }
+            ?? current.total
         let accumulated = usageMeta.flatMap { tokenUsage(from: $0["accumulated"]) }
         let contextWindow = fields["size"]?.numberValue
             .map(Int.init)
             .flatMap { $0 > 0 ? $0 : nil }
+        let source = usageMeta?["source"]?.stringValue ?? "provider"
         return makeEvent(
             "context.usage",
             DaemonContextUsageData(
                 runId: runID.uuidString,
                 sessionId: sessionID,
+                contextTokens: contextTokens,
                 current: current,
                 accumulated: accumulated,
                 contextWindow: contextWindow,
-                source: "provider"
+                source: source
             )
         )
     }

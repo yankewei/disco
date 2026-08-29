@@ -1266,25 +1266,34 @@ async fn bridge_prompt(
                 )
                 .await?;
             }
-            AgentOutput::ContextUsage { used, size } => {
+            AgentOutput::ContextUsage { tokens, window } => {
                 let usage = TokenUsage {
-                    input: used,
+                    input: tokens,
                     output: 0,
-                    total: used,
+                    total: tokens,
                     cached_input: None,
                     reasoning_output: None,
                 };
                 let mut meta = Meta::new();
+                let source = if runtime_kind == "codex_app_server" {
+                    "codex"
+                } else {
+                    "provider"
+                };
                 meta.insert(
                     "disco/usage".to_string(),
-                    serde_json::json!({ "current": usage }),
+                    serde_json::json!({ "current": usage, "source": source }),
                 );
                 send_session_update(
                     &app,
                     &connection,
                     session_id.clone(),
                     SessionUpdate::UsageUpdate(
-                        UsageUpdate::new(used.max(0) as u64, size.max(0) as u64).meta(meta),
+                        UsageUpdate::new(
+                            tokens.max(0) as u64,
+                            window.unwrap_or_default().max(0) as u64,
+                        )
+                        .meta(meta),
                     ),
                 )
                 .await?;
@@ -1723,8 +1732,8 @@ mod tests {
                     reasoning_output: None,
                 }),
                 AgentOutput::ContextUsage {
-                    used: 53_000,
-                    size: 200_000,
+                    tokens: 53_000,
+                    window: Some(200_000),
                 },
                 AgentOutput::CompactionUpdate(CompactionUpdate {
                     id: "wire-compaction".to_string(),

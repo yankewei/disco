@@ -136,6 +136,8 @@ struct DaemonReasoningDeltaData: Codable, Sendable {
 struct DaemonContextUsageData: Codable, Sendable {
     let runId: String
     let sessionId: String
+    /// 当前上下文窗口占用；与 current 的单次请求明细分开。
+    let contextTokens: Int
     let current: DaemonTokenUsage
     let accumulated: DaemonTokenUsage?
     let contextWindow: Int?

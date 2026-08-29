@@ -157,8 +157,9 @@ struct ChatView: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            ZStack {
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                ZStack {
                 DiscoTheme.canvas
                     .ignoresSafeArea()
 
@@ -230,14 +231,13 @@ struct ChatView: View {
                                 .frame(height: 1)
                                 .id(Self.latestMessageAnchor)
                         }
-                        .frame(maxWidth: 760)
-                        .padding(.horizontal, 28)
+                        .frame(maxWidth: DiscoLayout.conversationContentMaxWidth)
+                        .padding(.horizontal, 42)
                         .padding(.top, 36)
                         .padding(.bottom, 20)
                         .frame(maxWidth: .infinity)
                     }
-                    .scrollIndicators(.hidden)
-                    .background(DiscoScrollIndicatorHider())
+                    .scrollIndicators(.automatic)
                     .onScrollGeometryChange(for: Bool.self) { geometry in
                         geometry.visibleRect.maxY >= geometry.contentSize.height - 24
                     } action: { _, isAtLatest in
@@ -292,20 +292,24 @@ struct ChatView: View {
                         }
                     }
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if let selectedToolCall {
-                ToolInspectorPanel(call: selectedToolCall) {
-                    withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
-                        selectedToolCallID = nil
-                    }
                 }
-                .transition(
-                    reduceMotion
-                        ? .opacity
-                        : .move(edge: .trailing).combined(with: .opacity)
-                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if let selectedToolCall {
+                    ToolInspectorPanel(
+                        call: selectedToolCall,
+                        availableWidth: geometry.size.width
+                    ) {
+                        withAnimation(reduceMotion ? nil : DiscoMotion.spring) {
+                            selectedToolCallID = nil
+                        }
+                    }
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .move(edge: .trailing).combined(with: .opacity)
+                    )
+                }
             }
         }
         .background(DiscoTheme.canvas.ignoresSafeArea())
@@ -324,7 +328,7 @@ struct ChatView: View {
                             store.respondToApproval(decision: "decline")
                         }
                     )
-                    .frame(maxWidth: 760)
+                    .frame(maxWidth: DiscoLayout.conversationContentMaxWidth)
                     .padding(.horizontal, 20)
                     .padding(.top, 10)
                     .padding(.bottom, 8)
@@ -341,7 +345,7 @@ struct ChatView: View {
                     isConfigured: canUseConversation,
                     projectUnavailable: projectUnavailable
                 )
-                .frame(maxWidth: 760)
+                .frame(maxWidth: DiscoLayout.conversationContentMaxWidth)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 18)
                 .frame(maxWidth: .infinity)
@@ -421,6 +425,7 @@ struct ChatView: View {
 }
 private struct ToolInspectorPanel: View {
     let call: ChatMessage.ToolCallSnapshot
+    let availableWidth: CGFloat
     let dismiss: () -> Void
 
     /// 宽度跨会话持久化：拖拽调整后写入 UserDefaults，重开会话/重启应用保持。
@@ -432,8 +437,16 @@ private struct ToolInspectorPanel: View {
     private static let maxWidth: CGFloat = 560
     private static let resizeHandleWidth: CGFloat = 10
 
+    private var maximumWidth: CGFloat {
+        min(Self.maxWidth, max(Self.minWidth, availableWidth * 0.45))
+    }
+
+    private var panelWidth: CGFloat {
+        min(max(width, Self.minWidth), maximumWidth)
+    }
+
     private var contentWidth: CGFloat {
-        frozenContentWidth ?? max(width - Self.resizeHandleWidth, 1)
+        frozenContentWidth ?? max(panelWidth - Self.resizeHandleWidth, 1)
     }
 
     var body: some View {
@@ -441,14 +454,20 @@ private struct ToolInspectorPanel: View {
             ToolInspectorResizeHandle(
                 isDragging: dragStartWidth != nil,
                 onChanged: { translation in
-                    let startWidth = dragStartWidth ?? width
+                    let startWidth = dragStartWidth ?? panelWidth
                     if dragStartWidth == nil {
                         dragStartWidth = startWidth
                         frozenContentWidth = max(startWidth - Self.resizeHandleWidth, 1)
                     }
                     width = min(
                         max(startWidth - translation, Self.minWidth),
-                        Self.maxWidth
+                        maximumWidth
+                    )
+                },
+                onAdjust: { adjustment in
+                    width = min(
+                        max(width + adjustment, Self.minWidth),
+                        maximumWidth
                     )
                 },
                 onEnded: {
@@ -462,15 +481,15 @@ private struct ToolInspectorPanel: View {
                 .frame(width: contentWidth, alignment: .leading)
         }
         .background(DiscoTheme.surface)
-        .frame(width: width)
+        .frame(width: panelWidth)
         .clipped()
-        .frame(width: Self.maxWidth, alignment: .trailing)
     }
 }
 
 private struct ToolInspectorResizeHandle: View {
     let isDragging: Bool
     let onChanged: (CGFloat) -> Void
+    let onAdjust: (CGFloat) -> Void
     let onEnded: () -> Void
 
     @State private var isHovering = false
@@ -501,6 +520,9 @@ private struct ToolInspectorResizeHandle: View {
             .help("左右拖动调整工具详情宽度")
             .accessibilityLabel("工具详情宽度调节")
             .accessibilityHint("左右拖动调整右侧工具详情宽度")
+            .accessibilityAdjustableAction { direction in
+                onAdjust(direction == .increment ? 24 : -24)
+            }
     }
 
     private func updateCursor(isHovering: Bool, isDragging: Bool) {
@@ -509,6 +531,167 @@ private struct ToolInspectorResizeHandle: View {
         } else {
             NSCursor.arrow.set()
         }
+    }
+}
+
+/// 宽屏时常驻的会话侧栏：把上下文和最近工具活动从聊天正文中分离出来。
+private struct ChatContextRail: View {
+    @ObservedObject var store: ConversationStore
+    let model: String
+    let toolCalls: [ChatMessage.ToolCallSnapshot]
+    let selectedToolCallID: String?
+    let selectToolCall: (String) -> Void
+    let dismissToolCall: () -> Void
+
+    private var selectedToolCall: ChatMessage.ToolCallSnapshot? {
+        toolCalls.first { $0.id == selectedToolCallID }
+    }
+
+    private var recentToolCalls: [ChatMessage.ToolCallSnapshot] {
+        Array(toolCalls.suffix(5).reversed())
+    }
+
+    private var contextProgress: Double? {
+        contextUsageProgress(
+            tokens: store.contextUsage?.tokens,
+            limit: store.contextUsage?.contextWindow
+        )
+    }
+
+    private var contextSummary: String {
+        guard let tokens = store.contextUsage?.tokens else { return "等待数据" }
+        guard let limit = store.contextUsage?.contextWindow else {
+            return formatCompactTokenCount(tokens)
+        }
+        return "\(formatCompactTokenCount(tokens)) / \(formatCompactTokenCount(limit))"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("上下文")
+                        .font(.headline.weight(.semibold))
+                    Spacer()
+                    Image(systemName: "ellipsis")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 20)
+                .padding(.bottom, 14)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(contextUsagePercentage(contextProgress))
+                            .font(.title3.monospacedDigit().weight(.semibold))
+                        Spacer()
+                        Text(contextSummary)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ContextUsageProgressBar(
+                        progress: contextProgress,
+                        color: contextUsageColor(
+                            tokens: store.contextUsage?.tokens,
+                            limit: store.contextUsage?.contextWindow
+                        )
+                    )
+                    .frame(height: 5)
+
+                    Text(model.isEmpty ? "当前会话" : model)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 20)
+
+                Divider()
+
+                HStack {
+                    Text("工具活动")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("\(toolCalls.count)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 18)
+                .padding(.bottom, 10)
+
+                if let selectedToolCall {
+                    ToolCallInspector(call: selectedToolCall, dismiss: dismissToolCall)
+                        .frame(maxHeight: 360)
+                } else if recentToolCalls.isEmpty {
+                    Text("工具执行记录会显示在这里")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 18)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(recentToolCalls, id: \.id) { call in
+                            ContextRailToolRow(call: call) {
+                                selectToolCall(call.id)
+                            }
+                            if call.id != recentToolCalls.last?.id {
+                                Divider()
+                                    .padding(.leading, 18)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .scrollIndicators(.automatic)
+        .background(DiscoTheme.surface)
+        .overlay(alignment: .leading) {
+            Divider()
+        }
+    }
+}
+
+private struct ContextRailToolRow: View {
+    let call: ChatMessage.ToolCallSnapshot
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack(alignment: .top, spacing: 9) {
+                Circle()
+                    .fill(call.isCompleted ? .green : .orange)
+                    .frame(width: 7, height: 7)
+                    .padding(.top, 5)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(call.name)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Text(call.isCompleted ? "执行完成" : "正在执行")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 4)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(DiscoPressButtonStyle())
+        .accessibilityLabel("\(call.name)，\(call.isCompleted ? "执行完成" : "正在执行")")
+        .accessibilityHint("查看工具详情")
     }
 }
 
@@ -561,7 +744,7 @@ private struct ProjectUnavailableBanner: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 8)
-        .frame(maxWidth: 760)
+        .frame(maxWidth: DiscoLayout.conversationContentMaxWidth)
         .frame(maxWidth: .infinity)
         .background(.regularMaterial)
         .overlay(alignment: .bottom) {
@@ -657,20 +840,12 @@ private struct TurnActivitySummaryRow: View {
 
     var body: some View {
         Button(action: toggle) {
-            HStack(spacing: 9) {
-                Rectangle()
-                    .fill(Color.primary.opacity(0.12))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 1)
-
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.secondary)
-
-                Text("已完成")
+            HStack(spacing: 8) {
+                Text("已处理")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
 
-                Text("· " + String(activityCount) + " 个步骤")
+                Text(String(activityCount) + " 个步骤")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
 
@@ -733,10 +908,10 @@ private struct MessageRow: View {
                             .font(.body)
                             .lineSpacing(4)
                             .textSelection(.enabled)
-                            .padding(.horizontal, 15)
-                            .padding(.vertical, 11)
-                            .background(DiscoTheme.accent.opacity(0.11))
-                            .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous))
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 13)
+                            .background(Color.primary.opacity(0.055))
+                            .clipShape(RoundedRectangle(cornerRadius: DiscoRadius.large, style: .continuous))
 
                         if !message.text.isEmpty {
                             HStack(spacing: 4) {
@@ -756,6 +931,13 @@ private struct MessageRow: View {
             } else {
                 HStack(alignment: .top, spacing: 13) {
                     VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            DiscoMark(size: 20, isActive: isStreaming)
+                            Text("Disco")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+
                         // 无 reasoning 内容的生成中用扫光占位；有 reasoning 时由活动轨道承担状态展示。
                         if message.isEmpty && isStreaming && !message.parts.contains(where: { part in
                             if case .reasoning = part { return true }
@@ -821,16 +1003,7 @@ private struct MessageRow: View {
                             .opacity(isHovered ? 1 : 0.55)
                         }
                     }
-                    .frame(maxWidth: 680, alignment: .leading)
-                    .overlay(alignment: .leading) {
-                        if !message.parts.isEmpty || (message.isEmpty && isStreaming) {
-                            Rectangle()
-                                .fill(Color.primary.opacity(0.10))
-                                .frame(width: 1)
-                                .padding(.leading, 10.5)
-                                .padding(.vertical, 10)
-                        }
-                    }
+                    .frame(maxWidth: DiscoLayout.conversationContentMaxWidth, alignment: .leading)
 
                     Spacer(minLength: 40)
                 }
@@ -848,7 +1021,11 @@ private struct MessageRow: View {
                         retry: retry,
                         dismiss: dismissError
                     )
-                    .frame(maxWidth: message.role == .user ? 520 : 680)
+                    .frame(
+                        maxWidth: message.role == .user
+                            ? DiscoLayout.userMessageMaxWidth
+                            : DiscoLayout.conversationContentMaxWidth
+                    )
 
                     if message.role == .assistant {
                         Spacer(minLength: 40)
@@ -1066,8 +1243,7 @@ private struct ReasoningDisclosure: View {
                                     .padding(10)
                             }
                             .frame(maxHeight: 240)
-                            .scrollIndicators(.hidden)
-                            .background(DiscoScrollIndicatorHider())
+                            .scrollIndicators(.automatic)
                             .onChange(of: reasoning.count) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
@@ -1293,9 +1469,6 @@ private struct ComposerView: View {
 
     @State private var isModelDrawerPresented = false
     @State private var isReasoningSettingsPresented = false
-    @State private var isContextUsagePresented = false
-    @State private var isModelTriggerHovered = false
-    @State private var isReasoningTriggerHovered = false
     /// 大编辑态：展开输入框便于编写长 prompt / 粘贴代码。
     @State private var isExpanded = false
     @FocusState private var isFocused: Bool
@@ -1303,7 +1476,7 @@ private struct ComposerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             TextField(
-                "",
+                "输入消息，Enter 发送，Shift-Enter 换行",
                 text: $store.draft,
                 axis: .vertical
             )
@@ -1313,6 +1486,7 @@ private struct ComposerView: View {
             .frame(minHeight: isExpanded ? 120 : 0, alignment: .top)
             .focused($isFocused)
             .disabled(!isConfigured)
+            .accessibilityLabel("消息输入框")
             .onKeyPress(.return, phases: .down) { keyPress in
                 // 输入法（拼音等）组字期间，回车属于输入法（确认候选词），
                 // 放行给文本系统处理，避免误发送。
@@ -1378,9 +1552,13 @@ private struct ComposerView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        .padding(15)
+        .padding(18)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: DiscoRadius.large, style: .continuous))
-        .shadow(color: .black.opacity(0.12), radius: 18, y: 7)
+        .overlay {
+            RoundedRectangle(cornerRadius: DiscoRadius.large, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.07), radius: 12, y: 4)
         .onAppear {
             if isConfigured {
                 isFocused = true
@@ -1418,46 +1596,31 @@ private struct ComposerView: View {
 
     /// 模型入口直接打开双栏选择器，不再经过综合设置菜单。
     private var modelDrawerTrigger: some View {
-        let backgroundOpacity: Double
-        let borderOpacity: Double
-        if isModelDrawerPresented {
-            backgroundOpacity = 0.20
-            borderOpacity = 0.52
-        } else if isModelTriggerHovered {
-            backgroundOpacity = 0.16
-            borderOpacity = 0.40
-        } else {
-            backgroundOpacity = 0.11
-            borderOpacity = 0.28
-        }
-
         return Button {
             isModelDrawerPresented = true
         } label: {
             HStack(spacing: 6) {
                 VendorBrandIcon(vendor: appState.activeVendor)
                 Text(modelLabel)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(DiscoTheme.accent)
+                    .foregroundStyle(.tertiary)
             }
             .contentTransition(.opacity)
             .font(.caption.weight(.medium))
-            .padding(.horizontal, 11)
-            .frame(minHeight: 30)
-            .background(DiscoTheme.accent.opacity(backgroundOpacity), in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(DiscoTheme.accent.opacity(borderOpacity), lineWidth: 1)
-            }
+            .padding(.horizontal, 5)
+            .frame(minHeight: 28)
+            .background(
+                isModelDrawerPresented ? Color.primary.opacity(0.07) : .clear,
+                in: Capsule()
+            )
         }
         .buttonStyle(DiscoPressButtonStyle())
         .disabled(store.isStreaming)
         .opacity(store.isStreaming ? 0.52 : 1)
-        .onHover { isModelTriggerHovered = $0 }
         .help(store.isStreaming ? "回复完成后可切换模型" : "选择服务商与模型")
         .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: modelLabel)
         .popover(isPresented: $isModelDrawerPresented, arrowEdge: .bottom) {
@@ -1473,19 +1636,6 @@ private struct ComposerView: View {
                 .supportedReasoningEfforts == nil
         let title = reasoningSelectionTitle(appState: appState, vendor: vendor)
         let isDisabled = store.isStreaming || (efforts.isEmpty && vendor != .chatgpt)
-        let backgroundOpacity: Double
-        let borderOpacity: Double
-        if isReasoningSettingsPresented {
-            backgroundOpacity = 0.20
-            borderOpacity = 0.54
-        } else if isReasoningTriggerHovered {
-            backgroundOpacity = 0.16
-            borderOpacity = 0.42
-        } else {
-            backgroundOpacity = 0.11
-            borderOpacity = 0.30
-        }
-
         return Button {
             isReasoningSettingsPresented = true
         } label: {
@@ -1503,19 +1653,17 @@ private struct ComposerView: View {
                     .font(.system(size: 8, weight: .semibold))
             }
             .font(.caption.weight(.medium))
-            .foregroundStyle(DiscoTheme.reasoningAccent)
-            .padding(.horizontal, 10)
-            .frame(minHeight: 30)
-            .background(DiscoTheme.reasoningAccent.opacity(backgroundOpacity), in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(DiscoTheme.reasoningAccent.opacity(borderOpacity), lineWidth: 1)
-            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .frame(minHeight: 28)
+            .background(
+                isReasoningSettingsPresented ? Color.primary.opacity(0.07) : .clear,
+                in: Capsule()
+            )
         }
         .buttonStyle(DiscoPressButtonStyle())
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.52 : 1)
-        .onHover { isReasoningTriggerHovered = $0 }
         .help(store.isStreaming ? "回复完成后可调整推理设置" : "调整推理设置")
         .popover(isPresented: $isReasoningSettingsPresented, arrowEdge: .bottom) {
             ReasoningSettingsPopover(dismiss: { isReasoningSettingsPresented = false })
@@ -1528,56 +1676,23 @@ private struct ComposerView: View {
             for: appState.activeVendor,
             model: appState.model
         )
-        let limit = configuredLimit ?? usage?.contextWindow
-        let current = usage?.current.inputTokens
-        let usageColor = contextUsageColor(estimate: current, limit: limit)
-
-        return Button {
-            isContextUsagePresented = true
-        } label: {
-            HStack(spacing: 7) {
-                ContextUsageRing(estimate: current, limit: limit, color: usageColor)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("上下文")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Text(contextUsageSummary(current: current, limit: limit))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.primary.opacity(0.045), in: Capsule())
-        }
-        .buttonStyle(DiscoPressButtonStyle())
+        let overrideLimit = appState.contextWindowOverride(
+            for: appState.activeVendor,
+            model: appState.model
+        )
+        let limit = overrideLimit ?? usage?.contextWindow ?? configuredLimit
+        let contextTokens = usage?.tokens
+        let usageColor = contextUsageColor(tokens: contextTokens, limit: limit)
+        return ContextUsageRing(tokens: contextTokens, limit: limit, color: usageColor)
         .help("查看上下文占用")
         .accessibilityLabel("查看上下文占用")
-        .popover(isPresented: $isContextUsagePresented, arrowEdge: .bottom) {
-            ContextUsagePopover(
-                store: store,
-                vendor: appState.activeVendor,
-                model: appState.model,
-                usage: usage,
-                limit: limit
-            )
-        }
+        .accessibilityValue(contextUsageSummary(tokens: contextTokens, limit: limit))
     }
 
-    private func contextUsageColor(estimate: Int?, limit: Int?) -> Color {
-        guard let estimate, let limit, limit > 0 else { return .secondary }
-        let ratio = Double(estimate) / Double(limit)
-        if ratio > 0.75 { return .red }
-        if ratio >= 0.60 { return .orange }
-        return .green
-    }
-
-    private func contextUsageSummary(current: Int?, limit: Int?) -> String {
-        let currentText = current.map(formatCompactTokenCount) ?? "—"
-        guard let limit else { return current == nil ? "等待数据" : currentText }
-        return "\(currentText) / \(formatCompactTokenCount(limit))"
+    private func contextUsageSummary(tokens: Int?, limit: Int?) -> String {
+        let tokenText = tokens.map(formatCompactTokenCount) ?? "—"
+        guard let limit else { return tokens == nil ? "等待数据" : tokenText }
+        return "\(tokenText) / \(formatCompactTokenCount(limit))"
     }
 
     /// 当前选择文案：服务商 · 模型（未选模型时只显示服务商）
@@ -1613,7 +1728,7 @@ private struct ComposerView: View {
                 Image(systemName: "stop.fill")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 40, height: 40)
+                    .frame(width: 28, height: 28)
                     .background(Color.primary.opacity(0.72), in: Circle())
             }
             .buttonStyle(DiscoPressButtonStyle())
@@ -1623,7 +1738,7 @@ private struct ComposerView: View {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 40, height: 40)
+                    .frame(width: 28, height: 28)
                     .background(DiscoTheme.accent, in: Circle())
             }
             .buttonStyle(DiscoPressButtonStyle())
@@ -1637,30 +1752,28 @@ private struct ComposerView: View {
 }
 
 private struct ContextUsageRing: View {
-    let estimate: Int?
+    let tokens: Int?
     let limit: Int?
     let color: Color
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
 
     private var progress: Double? {
-        guard let estimate, let limit, limit > 0 else { return nil }
-        return min(1, max(0, Double(estimate) / Double(limit)))
+        contextUsageProgress(tokens: tokens, limit: limit)
     }
 
     private var percentage: String {
-        guard let progress else { return "?" }
-        if progress < 0.01 { return "<1%" }
-        return "\(Int((progress * 100).rounded()))%"
+        contextUsagePercentage(progress)
     }
 
     private var helpText: String {
-        guard let progress, let estimate else { return "上下文占用：等待数据" }
-        let current = formatCompactTokenCount(estimate)
+        guard let tokens else { return "上下文占用：等待数据" }
+        let formattedTokens = formatCompactTokenCount(tokens)
         if let limit {
             let total = formatCompactTokenCount(limit)
-            let remaining = formatCompactTokenCount(max(0, limit - estimate))
-            return "上下文占用 \(percentage) · 当前 \(current) / \(total) tokens\n剩余约 \(remaining) tokens"
+            let remaining = formatCompactTokenCount(max(0, limit - tokens))
+            return "上下文占用 \(percentage) · 当前 \(formattedTokens) / \(total) tokens\n剩余约 \(remaining) tokens"
         }
         return "上下文占用 \(percentage)"
     }
@@ -1668,128 +1781,85 @@ private struct ContextUsageRing: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.primary.opacity(0.13), lineWidth: 2)
+                .fill(color.opacity(progress == nil ? 0.06 : 0.10))
+            Circle()
+                .stroke(Color.primary.opacity(0.12), lineWidth: 2.5)
             if let progress {
                 Circle()
                     .trim(from: 0, to: progress)
                     .stroke(
-                        color.opacity(isHovered ? 1 : 0.85),
-                        style: StrokeStyle(lineWidth: isHovered ? 2.5 : 2, lineCap: .round)
+                        color,
+                        style: StrokeStyle(lineWidth: isHovered ? 3 : 2.5, lineCap: .round)
                     )
                     .rotationEffect(.degrees(-90))
+            } else {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
             }
             Text(percentage)
                 .font(.system(size: 7, weight: .semibold, design: .monospaced))
                 .foregroundStyle(isHovered ? .primary : .secondary)
                 .minimumScaleFactor(0.7)
         }
-        .frame(width: 30, height: 30)
+        .frame(width: 28, height: 28)
         .contentShape(Circle())
         .onHover { isHovered = $0 }
-        .animation(.easeOut(duration: 0.15), value: isHovered)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isHovered)
         .help(helpText)
     }
 }
 
-private struct ContextUsagePopover: View {
-    @ObservedObject var store: ConversationStore
-    let vendor: ProviderVendor
-    let model: String
-    let usage: ContextUsageSnapshot?
-    let limit: Int?
-
-    private var isCodex: Bool { vendor == .chatgpt }
-    private var current: Int { usage?.current.inputTokens ?? 0 }
-    private var sourceTitle: String {
-        switch usage?.source {
-        case .provider: "服务商返回"
-        case .codex: "Codex 服务端返回"
-        default: "本地估算"
-        }
-    }
+private struct ContextUsageProgressBar: View {
+    let progress: Double?
+    let color: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("上下文占用")
-                    .font(.headline)
-                Text("\(vendor.title) · \(model)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.10))
 
-            usageRow(label: "当前占用（\(sourceTitle)）", value: "约 \(formatCompactTokenCount(current)) tokens")
-            usageRow(
-                label: "模型窗口",
-                value: limit.map { "\(formatCompactTokenCount($0)) tokens" } ?? "未知"
-            )
-            if let limit {
-                usageRow(
-                    label: "剩余",
-                    value: "约 \(formatCompactTokenCount(max(0, limit - current)) ) tokens"
-                )
-            }
-
-            if store.activeCompaction != nil {
-                Label("正在压缩上下文…", systemImage: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
-            } else if let compaction = store.lastSuccessfulCompaction {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("最近一次压缩")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Text("\(compaction.trigger == .manual ? "手动" : "自动") · \(compaction.startedAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                    if let before = compaction.beforeTokens, let after = compaction.afterTokens {
-                        Text("约 \(formatCompactTokenCount(before)) → \(formatCompactTokenCount(after)) tokens")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
+                if let progress {
+                    Capsule()
+                        .fill(color)
+                        .frame(width: max(4, proxy.size.width * progress))
+                } else {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.42))
+                        .frame(width: 14)
                 }
             }
-
-            Button {
-                store.compactContext()
-            } label: {
-                Label("立即压缩", systemImage: "arrow.triangle.2.circlepath")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!store.canCompactContext || store.isStreaming)
-
-            Text(isCodex
-                ? "Codex 由服务端维护历史上下文和自动压缩。"
-                : store.usesNativeCompaction
-                    ? "当前 Agent 会自行维护上下文和自动压缩。"
-                    : "本地估算只用于阈值决策；原始聊天记录不会被删除。")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(16)
-        .frame(width: 300, alignment: .leading)
+        .clipShape(Capsule())
     }
+}
 
-    private func usageRow(label: String, value: String) -> some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 8)
-            Text(value)
-                .font(.callout.monospacedDigit())
-        }
-    }
+private func contextUsageProgress(tokens: Int?, limit: Int?) -> Double? {
+    guard let tokens, let limit, limit > 0 else { return nil }
+    return min(1, max(0, Double(tokens) / Double(limit)))
+}
+
+private func contextUsagePercentage(_ progress: Double?) -> String {
+    guard let progress else { return "—" }
+    if progress < 0.01 { return "<1%" }
+    return "\(Int((progress * 100).rounded()))%"
+}
+
+private func contextUsageColor(tokens: Int?, limit: Int?) -> Color {
+    guard let progress = contextUsageProgress(tokens: tokens, limit: limit) else { return .secondary }
+    if progress > 0.75 { return .red }
+    if progress >= 0.60 { return .orange }
+    return .green
 }
 
 private func formatCompactTokenCount(_ count: Int) -> String {
     let value = Double(max(0, count))
     if value >= 1_000_000 {
-        return formatCompactUnit(value / 1_000_000, suffix: "M")
+        return formatCompactUnit(value / 1_000_000, suffix: "m")
     }
     if value >= 1_000 {
-        return formatCompactUnit(value / 1_000, suffix: "K")
+        return formatCompactUnit(value / 1_000, suffix: "k")
     }
     return String(Int(value))
 }
@@ -1976,6 +2046,7 @@ private struct ModelDrawer: View {
 
     /// 抽屉内当前高亮的服务商；打开时默认跟随当前服务商
     @State private var selectedVendor: ProviderVendor?
+    @State private var modelSearch = ""
 
     private struct PendingModelSelection {
         let vendor: ProviderVendor
@@ -1994,6 +2065,12 @@ private struct ModelDrawer: View {
 
     private var highlightedVendor: ProviderVendor {
         selectedVendor ?? appState.activeVendor
+    }
+
+    private func filteredModels(from models: [String]) -> [String] {
+        let query = modelSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return models }
+        return models.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -2076,8 +2153,7 @@ private struct ModelDrawer: View {
                 }
                 .padding(6)
             }
-            .scrollIndicators(.hidden)
-            .background(DiscoScrollIndicatorHider())
+            .scrollIndicators(.automatic)
         }
         .frame(width: 168)
     }
@@ -2087,6 +2163,7 @@ private struct ModelDrawer: View {
             // 切换服务商后，右侧模型栏随之更新
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
                 selectedVendor = vendor
+                modelSearch = ""
             }
         } label: {
             HStack(spacing: 8) {
@@ -2113,6 +2190,7 @@ private struct ModelDrawer: View {
     private var modelPane: some View {
         let vendor = highlightedVendor
         let models = appState.config(for: vendor)?.models ?? []
+        let matchingModels = filteredModels(from: models)
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
@@ -2120,6 +2198,19 @@ private struct ModelDrawer: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                if models.count > 6 {
+                    HStack(spacing: 5) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("筛选模型", text: $modelSearch)
+                            .textFieldStyle(.plain)
+                            .frame(width: 100)
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.quaternary, in: Capsule())
+                }
                 if appState.reasoningEfforts(for: vendor).count > 2 {
                     Label("支持推理强度", systemImage: "brain")
                         .font(.caption2)
@@ -2144,13 +2235,22 @@ private struct ModelDrawer: View {
                     .frame(maxWidth: .infinity)
                     .padding(14)
                 Spacer()
+            } else if matchingModels.isEmpty {
+                Spacer()
+                Text("没有匹配“\(modelSearch)”的模型")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(14)
+                Spacer()
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(models, id: \.self) { name in
+                        ForEach(matchingModels, id: \.self) { name in
                             modelRow(name, vendor: vendor)
 
-                            if name != models.last {
+                            if name != matchingModels.last {
                                 Divider()
                                     .padding(.leading, 14)
                             }
@@ -2158,8 +2258,7 @@ private struct ModelDrawer: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .scrollIndicators(.hidden)
-                .background(DiscoScrollIndicatorHider())
+                .scrollIndicators(.automatic)
             }
         }
         .transition(.asymmetric(

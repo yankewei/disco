@@ -78,6 +78,58 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertNil(store.errorMessage)
     }
 
+    func testContextUsageUsesTheLatestReportedWindow() async throws {
+        let sessionID = UUID()
+        let runID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: runID)
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+        store.draft = "查看上下文"
+
+        store.send()
+        for _ in 0..<100 where client.startedRuns.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        store.handleDaemonNotification(daemonEvent(
+            "context.usage",
+            runID: runID,
+            sessionID: sessionID,
+            fields: [
+                "contextTokens": .number(150),
+                "current": .object([
+                    "input": .number(100),
+                    "output": .number(50),
+                    "total": .number(150),
+                ]),
+                "contextWindow": .number(200_000),
+                "source": .string("codex"),
+            ]
+        ))
+        XCTAssertEqual(store.contextUsage?.current.totalTokens, 150)
+        XCTAssertEqual(store.contextUsage?.contextWindow, 200_000)
+        XCTAssertEqual(store.contextUsage?.source, .codex)
+
+        store.handleDaemonNotification(daemonEvent(
+            "context.usage",
+            runID: runID,
+            sessionID: sessionID,
+            fields: [
+                "contextTokens": .number(200),
+                "current": .object([
+                    "input": .number(160),
+                    "output": .number(40),
+                    "total": .number(200),
+                ]),
+                "contextWindow": .null,
+                "source": .string("codex"),
+            ]
+        ))
+        XCTAssertEqual(store.contextUsage?.current.totalTokens, 200)
+        XCTAssertNil(store.contextUsage?.contextWindow)
+    }
+
     func testToolExecutionsRemainVisibleAfterDaemonRunCompletes() async throws {
         let sessionID = UUID()
         let runID = UUID()

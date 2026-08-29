@@ -190,6 +190,7 @@ final class ACPTransportTests: XCTestCase {
         )
         XCTAssertEqual(usageEvents.map(\.eventName), ["context.usage"])
         let usageData = try usageEvents[0].decoded(as: DaemonContextUsageData.self)
+        XCTAssertEqual(usageData.contextTokens, 150)
         XCTAssertEqual(usageData.current.input, 100)
         XCTAssertEqual(usageData.current.total, 150)
         XCTAssertEqual(usageData.source, "provider")
@@ -211,6 +212,7 @@ final class ACPTransportTests: XCTestCase {
         let standardUsageData = try standardUsageEvents[0].decoded(
             as: DaemonContextUsageData.self
         )
+        XCTAssertEqual(standardUsageData.contextTokens, 53_000)
         XCTAssertEqual(standardUsageData.current.total, 53_000)
         XCTAssertEqual(standardUsageData.contextWindow, 200_000)
         XCTAssertNil(standardUsageData.accumulated)

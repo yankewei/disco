@@ -731,8 +731,8 @@ fn outputs_for_session_update(
             outputs_for_tool_update(tool_call, tool_title_by_id)
         }
         SessionUpdate::UsageUpdate(usage) => vec![AgentOutput::ContextUsage {
-            used: i64::try_from(usage.used).unwrap_or(i64::MAX),
-            size: i64::try_from(usage.size).unwrap_or(i64::MAX),
+            tokens: i64::try_from(usage.used).unwrap_or(i64::MAX),
+            window: i64::try_from(usage.size).ok().filter(|window| *window > 0),
         }],
         _ => Vec::new(),
     }
@@ -1050,8 +1050,8 @@ mod tests {
         assert!(matches!(
             outputs.as_slice(),
             [AgentOutput::ContextUsage {
-                used: 53_000,
-                size: 200_000
+                tokens: 53_000,
+                window: Some(200_000)
             }]
         ));
     }

@@ -16,6 +16,9 @@ use uuid::Uuid;
 /// 模型目录未收录上下文窗口时的默认值（128k tokens）。
 pub const DEFAULT_CONTEXT_WINDOW: i64 = 128_000;
 
+const ASCII_CHARACTERS_PER_TOKEN: usize = 4;
+const MESSAGE_OVERHEAD_TOKENS: i64 = 4;
+
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
@@ -50,21 +53,23 @@ impl ContextCompactor {
         }
     }
 
-    /// Check if compaction is needed based on estimated token count.
+    /// 根据估算的 token 数判断是否需要压缩上下文。
     ///
-    /// Uses a simple character-based estimation: ~4 characters per token.
+    /// 服务商尚未上报用量时，使用与服务商无关的启发式估算。
     pub fn should_compact(&self, messages: &[ChatMessage]) -> bool {
         let estimated_tokens = self.estimate_tokens(messages);
         let threshold = (self.context_window as f64 * self.soft_threshold) as i64;
         estimated_tokens > threshold
     }
 
-    /// Estimate the token count of messages.
+    /// 服务商尚未上报用量时，估算消息所占的 token 数。
     ///
-    /// Uses a simple heuristic: ~4 characters per token.
+    /// ASCII 文本按约四个字符一个 token 估算，非 ASCII 字符按字符计数，避免中文和
+    /// emoji 因 UTF-8 字节长度而被严重低估；消息封装、推理、工具调用和工具结果也会计入。
     pub fn estimate_tokens(&self, messages: &[ChatMessage]) -> i64 {
-        let total_chars: usize = messages.iter().map(|m| m.text.len()).sum();
-        (total_chars / 4) as i64
+        messages.iter().fold(0_i64, |total, message| {
+            total.saturating_add(estimate_message_tokens(message))
+        })
     }
 
     /// Compact the conversation by summarizing it.
@@ -97,7 +102,7 @@ impl ContextCompactor {
         // Build the summarization request
         let conversation_text = messages
             .iter()
-            .map(|m| format!("{}: {}", m.role, m.text))
+            .map(format_message_for_summary)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -203,6 +208,55 @@ impl ContextCompactor {
     }
 }
 
+fn estimate_message_tokens(message: &ChatMessage) -> i64 {
+    let mut tokens = MESSAGE_OVERHEAD_TOKENS
+        .saturating_add(estimate_text_tokens(&message.role))
+        .saturating_add(estimate_text_tokens(&message.text));
+
+    if let Some(reasoning) = &message.reasoning_content {
+        tokens = tokens.saturating_add(estimate_text_tokens(reasoning));
+    }
+    if let Some(tool_calls) = &message.tool_calls {
+        for tool_call in tool_calls {
+            tokens = tokens
+                .saturating_add(estimate_text_tokens(&tool_call.call_id))
+                .saturating_add(estimate_text_tokens(&tool_call.name))
+                .saturating_add(estimate_text_tokens(&tool_call.arguments));
+        }
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        tokens = tokens.saturating_add(estimate_text_tokens(tool_call_id));
+    }
+    if let Some(tool_name) = &message.tool_name {
+        tokens = tokens.saturating_add(estimate_text_tokens(tool_name));
+    }
+
+    tokens
+}
+
+fn format_message_for_summary(message: &ChatMessage) -> String {
+    serde_json::to_string(message).unwrap_or_else(|_| format!("{}: {}", message.role, message.text))
+}
+
+fn estimate_text_tokens(text: &str) -> i64 {
+    let mut tokens = 0_usize;
+    let mut ascii_run = 0_usize;
+
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii_run += 1;
+            continue;
+        }
+
+        tokens += ascii_run.div_ceil(ASCII_CHARACTERS_PER_TOKEN);
+        ascii_run = 0;
+        tokens += 1;
+    }
+
+    tokens += ascii_run.div_ceil(ASCII_CHARACTERS_PER_TOKEN);
+    i64::try_from(tokens).unwrap_or(i64::MAX)
+}
+
 /// Apply compaction: replace message history with a summary checkpoint.
 ///
 /// Returns a new message list with the summary as a system message
@@ -236,6 +290,7 @@ pub fn apply_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disco_providers::openai_responses::ToolCallInfo;
 
     #[test]
     fn estimate_tokens_basic() {
@@ -256,10 +311,35 @@ mod tests {
         ];
 
         let tokens = compactor.estimate_tokens(&messages);
-        // "Hello, how are you?" = 20 chars, "I'm doing well, thank you!" = 27 chars
-        // Total = 47 chars / 4 = ~11 tokens
         assert!(tokens > 0);
         assert!(tokens < 100);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_non_ascii_text_by_character() {
+        assert_eq!(estimate_text_tokens("中"), 1);
+        assert_eq!(estimate_text_tokens("你好世界"), 4);
+        assert!(estimate_text_tokens("你好世界") > estimate_text_tokens("abcd"));
+    }
+
+    #[test]
+    fn estimate_tokens_includes_reasoning_and_tool_payloads() {
+        let plain_message = ChatMessage {
+            role: "assistant".to_string(),
+            text: "完成".to_string(),
+            ..Default::default()
+        };
+        let rich_message = ChatMessage {
+            reasoning_content: Some("先检查状态".to_string()),
+            tool_calls: Some(vec![ToolCallInfo {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                arguments: r#"{"command":"cargo test"}"#.to_string(),
+            }]),
+            ..plain_message.clone()
+        };
+
+        assert!(estimate_message_tokens(&rich_message) > estimate_message_tokens(&plain_message));
     }
 
     #[test]

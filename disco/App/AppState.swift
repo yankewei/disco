@@ -25,6 +25,8 @@ struct ProviderSyncError: Equatable {
 extension Notification.Name {
     /// 菜单栏“对话 > 清空当前对话”发出的请求，由 ChatView 弹出确认
     static let discoRequestClearConversation = Notification.Name("discoRequestClearConversation")
+    /// 菜单栏“对话 > 删除当前对话”发出的请求，由 ContentView 弹出确认
+    static let discoRequestDeleteConversation = Notification.Name("discoRequestDeleteConversation")
     /// 菜单栏“添加项目”发出的请求，由 ContentView 展示目录选择器
     static let discoRequestOpenProject = Notification.Name("discoRequestOpenProject")
     /// 菜单栏“搜索对话”发出的请求，由 ConversationSidebar 聚焦搜索框

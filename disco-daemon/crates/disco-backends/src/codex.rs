@@ -127,6 +127,9 @@ impl AgentBackend for CodexAdapter {
                             Some(Ok(CodexProviderEvent::TextDelta(delta))) => AgentOutput::TextDelta(delta),
                             Some(Ok(CodexProviderEvent::ReasoningDelta(delta))) => AgentOutput::ReasoningDelta(delta),
                             Some(Ok(CodexProviderEvent::Usage(usage))) => AgentOutput::Usage(usage),
+                            Some(Ok(CodexProviderEvent::ContextUsage { tokens, window })) => {
+                                AgentOutput::ContextUsage { tokens, window }
+                            }
                             Some(Ok(CodexProviderEvent::Compaction(update))) => {
                                 AgentOutput::CompactionUpdate(CompactionUpdate {
                                     id: update.id,

@@ -9,13 +9,13 @@ pub enum AgentOutput {
     TextDelta(String),
     ReasoningDelta(String),
     Usage(TokenUsage),
-    /// ACP 标准 `usage_update` 的当前上下文占用和窗口大小。
+    /// Provider 报告的当前上下文占用和窗口大小。
     ///
-    /// 这与 `Usage` 的请求 token 统计不同：ACP 的 `used` 是上下文快照，
-    /// 不能被当作累计用量再次相加。
+    /// 这与 `Usage` 的请求 token 统计不同：`tokens` 是当前上下文快照，
+    /// 不能被当作累计用量再次相加。窗口未知时仍然转发 token 数。
     ContextUsage {
-        used: i64,
-        size: i64,
+        tokens: i64,
+        window: Option<i64>,
     },
     /// 上下文压缩生命周期事件。压缩由具体 Backend 负责，daemon 只转发。
     CompactionUpdate(CompactionUpdate),

@@ -107,6 +107,11 @@ pub enum CodexProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
     Usage(TokenUsage),
+    /// Codex app-server 的当前上下文占用；与累计请求用量分开传递。
+    ContextUsage {
+        tokens: i64,
+        window: Option<i64>,
+    },
     Compaction(CodexCompactionUpdate),
     ToolStarted(CodexToolCall),
     ToolCompleted(CodexToolResult),
@@ -1059,9 +1064,20 @@ impl CodexProvider {
             }
             "thread/tokenUsage/updated" => {
                 if let Some(usage) = parse_codex_usage(params) {
+                    let context_window = parse_codex_context_window(params);
                     let s = state.lock().await;
                     if let Some(active) = &s.active_turn {
-                        let _ = active.sender.send(CodexProviderEvent::Usage(usage)).await;
+                        let _ = active
+                            .sender
+                            .send(CodexProviderEvent::Usage(usage.clone()))
+                            .await;
+                        let _ = active
+                            .sender
+                            .send(CodexProviderEvent::ContextUsage {
+                                tokens: usage.total,
+                                window: context_window,
+                            })
+                            .await;
                     }
                 }
             }
@@ -1551,6 +1567,7 @@ impl ModelProvider for CodexProvider {
                     CodexProviderEvent::Usage(usage) => {
                         yield ProviderEvent::Usage(usage);
                     }
+                    CodexProviderEvent::ContextUsage { .. } => {}
                     CodexProviderEvent::Compaction(_) => {}
                     CodexProviderEvent::ApprovalRequested(request) => {
                         self.respond_to_approval(&request, CodexApprovalDecision::Decline).await?;
@@ -1596,6 +1613,13 @@ fn parse_codex_usage(params: &serde_json::Value) -> Option<TokenUsage> {
         cached_input,
         reasoning_output,
     })
+}
+
+fn parse_codex_context_window(params: &serde_json::Value) -> Option<i64> {
+    params
+        .pointer("/tokenUsage/modelContextWindow")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|window| *window > 0)
 }
 
 /// 兼容不同 Codex app-server 版本的原生压缩通知命名。
@@ -1976,7 +2000,8 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
                     "inputTokens": 500,
                     "outputTokens": 200,
                     "totalTokens": 700
-                }
+                },
+                "modelContextWindow": 200000
             }
         });
         let usage = parse_codex_usage(&params).unwrap();
@@ -1985,6 +2010,7 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
         assert_eq!(usage.total, 150);
         assert_eq!(usage.cached_input, Some(30));
         assert_eq!(usage.reasoning_output, Some(20));
+        assert_eq!(parse_codex_context_window(&params), Some(200_000));
     }
 
     #[test]

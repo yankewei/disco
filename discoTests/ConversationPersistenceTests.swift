@@ -3,6 +3,40 @@ import XCTest
 
 @MainActor
 final class ConversationPersistenceTests: XCTestCase {
+    func testContextUsagePersistsAcrossSaveAndLoad() throws {
+        let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
+        let usage = ContextUsageSnapshot(
+            tokens: 8_700,
+            current: TokenUsageSnapshot(inputTokens: 8_200, outputTokens: 500, totalTokens: 8_700),
+            contextWindow: 1_000_000,
+            source: .provider
+        )
+
+        try persistence.saveConversation(
+            ConversationSnapshot(
+                id: UUID(),
+                createdAt: .now,
+                updatedAt: .now,
+                messages: [ChatMessage(role: .user, text: "测试")],
+                threadID: nil,
+                contextState: ConversationContextState(lastContextUsage: usage)
+            )
+        )
+
+        let restored = try XCTUnwrap(persistence.loadConversations().first)
+        XCTAssertEqual(restored.contextState?.lastContextUsage, usage)
+    }
+
+    func testVersionOneContextStateStillLoads() throws {
+        let data = Data(
+            "{\"version\":1,\"checkpoint\":null,\"lastSuccessfulCompaction\":null}".utf8
+        )
+
+        let restored = PersistedConversationContextState.decode(data)
+        XCTAssertNotNil(restored)
+        XCTAssertNil(restored?.lastContextUsage)
+    }
+
     func testRepeatedStreamingSavesUpdateMessagesWithoutDuplicates() throws {
         let persistence = try ConversationPersistence(isStoredInMemoryOnly: true)
         let conversationID = UUID()

@@ -902,38 +902,49 @@ fn context_usage_output(
     workspace: &Path,
     properties: &Value,
 ) -> Option<AgentOutput> {
-    let info = properties.get("info")?;
-    if info.get("role").and_then(Value::as_str) != Some("assistant") {
+    let assistant_info = properties.get("info")?;
+    if assistant_info.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
-    let tokens = info.get("tokens")?;
-    let used = tokens
+    let context_tokens = opencode_context_tokens(assistant_info)?;
+    let workspace = workspace.to_string_lossy().into_owned();
+    let context_window = assistant_info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .zip(assistant_info.get("modelID").and_then(Value::as_str))
+        .and_then(|(provider, model)| {
+            server.context_windows.lock().ok().and_then(|windows| {
+                windows
+                    .get(&(workspace, format!("{provider}/{model}")))
+                    .copied()
+            })
+        })
+        .filter(|window| *window > 0);
+    Some(AgentOutput::ContextUsage {
+        tokens: context_tokens,
+        window: context_window,
+    })
+}
+
+fn opencode_context_tokens(assistant_info: &Value) -> Option<i64> {
+    let token_fields = assistant_info.get("tokens")?;
+    token_fields
         .get("total")
         .and_then(Value::as_i64)
+        .filter(|total_tokens| *total_tokens > 0)
         .or_else(|| {
             [
-                tokens.get("input"),
-                tokens.get("output"),
-                tokens.pointer("/cache/read"),
-                tokens.pointer("/cache/write"),
+                token_fields.get("input"),
+                token_fields.get("output"),
+                token_fields.pointer("/cache/read"),
+                token_fields.pointer("/cache/write"),
             ]
             .into_iter()
             .flatten()
             .filter_map(Value::as_i64)
             .try_fold(0_i64, i64::checked_add)
+            .filter(|total_tokens| *total_tokens > 0)
         })
-        .filter(|used| *used > 0)?;
-    let provider = info.get("providerID").and_then(Value::as_str)?;
-    let model = info.get("modelID").and_then(Value::as_str)?;
-    let workspace = workspace.to_string_lossy().into_owned();
-    let model = format!("{provider}/{model}");
-    let size = server
-        .context_windows
-        .lock()
-        .ok()?
-        .get(&(workspace, model))
-        .copied()?;
-    Some(AgentOutput::ContextUsage { used, size })
 }
 
 fn cache_context_windows(server: &OpenCodeServer, workspace: &Path, catalog: &[ModelCatalogEntry]) {
@@ -1298,5 +1309,19 @@ mod tests {
             [AgentOutput::ToolCompleted { output, .. }] if output == "ok"
         ));
         assert!(tool_outputs(&completed, &mut tools).is_empty());
+    }
+
+    #[test]
+    fn context_tokens_fall_back_to_components_when_total_is_zero() {
+        let info = json!({
+            "tokens": {
+                "total": 0,
+                "input": 100,
+                "output": 20,
+                "cache": {"read": 3, "write": 2}
+            }
+        });
+
+        assert_eq!(opencode_context_tokens(&info), Some(125));
     }
 }

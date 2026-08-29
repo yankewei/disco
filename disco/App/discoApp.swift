@@ -99,9 +99,10 @@ struct DiscoApp: App {
                 Divider()
 
                 Button("删除当前对话") {
-                    if let id = appState.selectedConversation?.id {
-                        appState.deleteConversation(id: id)
-                    }
+                    NotificationCenter.default.post(
+                        name: .discoRequestDeleteConversation,
+                        object: nil
+                    )
                 }
                 .disabled(appState.selectedConversation == nil)
             }

@@ -24,11 +24,20 @@ struct ToolExecutionView: View {
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .top, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: presentation.systemImage)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(call.isCompleted ? .green : .orange)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        (call.isCompleted ? Color.green : Color.orange).opacity(0.10),
+                        in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+                    )
+
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(presentation.toolTitle)
-                            .font(.caption.weight(.semibold))
+                            .font(.callout.weight(.semibold))
                             .foregroundStyle(.primary)
 
                         if presentation.shouldShowToolIdentifier {
@@ -43,12 +52,6 @@ struct ToolExecutionView: View {
                         Text(call.isCompleted ? "已完成" : "执行中")
                             .font(.caption2.weight(.medium))
                             .foregroundStyle(call.isCompleted ? .green : .orange)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(
-                                (call.isCompleted ? Color.green : Color.orange).opacity(0.10),
-                                in: Capsule()
-                            )
                     }
 
                     if let actionSummary = presentation.actionSummary {
@@ -84,19 +87,18 @@ struct ToolExecutionView: View {
                 }
             }
             .contentShape(Rectangle())
-            .padding(.horizontal, 11)
-            .padding(.vertical, 8)
+            .padding(14)
         }
         .buttonStyle(.plain)
         .disabled(!presentation.hasDetails)
         .background(
             isSelected
                 ? DiscoTheme.accent.opacity(0.10)
-                : DiscoTheme.surface.opacity(0.56),
-            in: RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+                : DiscoTheme.elevatedSurface,
+            in: RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: DiscoRadius.small, style: .continuous)
+            RoundedRectangle(cornerRadius: DiscoRadius.medium, style: .continuous)
                 .stroke(
                     isSelected ? DiscoTheme.accent.opacity(0.45) : Color.primary.opacity(0.07),
                     lineWidth: 1
@@ -201,8 +203,7 @@ struct ToolCallInspector: View, Equatable {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(16)
             }
-            .scrollIndicators(.hidden)
-            .background(DiscoScrollIndicatorHider())
+            .scrollIndicators(.automatic)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DiscoTheme.surface)
@@ -335,6 +336,25 @@ private struct ToolCallPresentation {
         case "search", "grep": return "搜索代码"
         case "list_files", "glob": return "浏览文件"
         default: return call.name
+        }
+    }
+
+    var systemImage: String {
+        if isCommandTool { return "terminal" }
+
+        switch normalizedToolKind {
+        case "read", "fetch": return "doc.text"
+        case "edit", "delete", "move": return "doc.badge.gearshape"
+        case "search": return "magnifyingglass"
+        default: break
+        }
+
+        switch normalizedToolName {
+        case "read_file", "read": return "doc.text"
+        case "write_file", "write", "edit_file", "edit", "apply_patch": return "doc.badge.gearshape"
+        case "search", "grep": return "magnifyingglass"
+        case "list_files", "glob": return "folder"
+        default: return "wrench.and.screwdriver"
         }
     }
 

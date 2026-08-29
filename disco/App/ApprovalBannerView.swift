@@ -58,8 +58,7 @@ struct ApprovalPromptView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 92)
-            .scrollIndicators(.hidden)
-            .background(DiscoScrollIndicatorHider())
+            .scrollIndicators(.automatic)
             .background(Color.primary.opacity(0.05), in: RoundedRectangle(
                 cornerRadius: DiscoRadius.small,
                 style: .continuous
@@ -175,8 +174,7 @@ struct ApprovalPromptView: View {
                     ApprovalDiffView(diff: diff)
                 }
                 .frame(maxHeight: 120)
-                .scrollIndicators(.hidden)
-                .background(DiscoScrollIndicatorHider())
+                .scrollIndicators(.automatic)
                 .background(DiscoTheme.surface)
                 .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
             }

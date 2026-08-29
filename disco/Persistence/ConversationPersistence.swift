@@ -393,23 +393,28 @@ private final class PersistedProject {
 }
 
 /// 会话上下文状态的持久化线格式（计划《上下文压缩 v1》§2）。
-/// 显式 version 避免依赖合成编码格式；解码失败统一返回 nil（丢弃 checkpoint，不动消息）。
+/// 显式 version 避免依赖合成编码格式；解码失败统一返回 nil（丢弃派生状态，不动消息）。
 struct PersistedConversationContextState: Codable {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     let version: Int
     let checkpoint: ContextCheckpoint?
     let lastSuccessfulCompaction: ContextCompactionSnapshot?
+    let lastContextUsage: ContextUsageSnapshot?
 
     static func encode(_ state: ConversationContextState?) throws -> Data? {
-        guard let state, state.checkpoint != nil || state.lastSuccessfulCompaction != nil else {
+        guard let state,
+              state.checkpoint != nil
+                  || state.lastSuccessfulCompaction != nil
+                  || state.lastContextUsage != nil else {
             return nil
         }
         return try JSONEncoder().encode(
             PersistedConversationContextState(
                 version: currentVersion,
                 checkpoint: state.checkpoint,
-                lastSuccessfulCompaction: state.lastSuccessfulCompaction
+                lastSuccessfulCompaction: state.lastSuccessfulCompaction,
+                lastContextUsage: state.lastContextUsage
             )
         )
     }
@@ -417,12 +422,13 @@ struct PersistedConversationContextState: Codable {
     static func decode(_ data: Data?) -> ConversationContextState? {
         guard let data,
               let decoded = try? JSONDecoder().decode(PersistedConversationContextState.self, from: data),
-              decoded.version == currentVersion else {
+              (1...currentVersion).contains(decoded.version) else {
             return nil
         }
         return ConversationContextState(
             checkpoint: decoded.checkpoint,
-            lastSuccessfulCompaction: decoded.lastSuccessfulCompaction
+            lastSuccessfulCompaction: decoded.lastSuccessfulCompaction,
+            lastContextUsage: decoded.lastContextUsage
         )
     }
 }

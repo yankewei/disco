@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use disco_core::ContextCompactor;
 use disco_protocol::types::{CompactionStatus, Vendor};
-use disco_providers::openai_responses::ChatMessage;
 use uuid::Uuid;
 
 use crate::daemon::AppState;
+use crate::run_service::stored_message_to_chat_message;
 
 /// 上下文压缩的协议无关错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,13 +54,9 @@ pub async fn compact_session_with_id(
         ));
     }
 
-    let chat_messages: Vec<ChatMessage> = stored_messages
+    let chat_messages: Vec<_> = stored_messages
         .iter()
-        .map(|message| ChatMessage {
-            role: message.role.clone(),
-            text: message.text.clone(),
-            ..Default::default()
-        })
+        .map(stored_message_to_chat_message)
         .collect();
 
     let session = app

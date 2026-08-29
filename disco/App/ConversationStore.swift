@@ -71,6 +71,7 @@ final class ConversationStore: ObservableObject {
         self.threadID = threadID
         self.contextState = contextState
         self.lastSuccessfulCompaction = contextState.lastSuccessfulCompaction
+        self.contextUsage = contextState.lastContextUsage
         self.onMessagesChanged = onMessagesChanged
     }
 
@@ -296,11 +297,14 @@ final class ConversationStore: ObservableObject {
             default: source = .provider
             }
             contextUsage = ContextUsageSnapshot(
+                tokens: data.contextTokens,
                 current: currentUsage,
                 accumulated: accumulatedUsage,
                 contextWindow: data.contextWindow,
                 source: source
             )
+            contextState.lastContextUsage = contextUsage
+            schedulePersistence()
 
         case "context.compaction":
             break

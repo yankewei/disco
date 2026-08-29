@@ -227,7 +227,9 @@ pub async fn start_run(
 }
 
 /// 将持久化的消息转换为模型历史。
-fn stored_message_to_chat_message(message: &disco_persist::messages::StoredMessage) -> ChatMessage {
+pub(crate) fn stored_message_to_chat_message(
+    message: &disco_persist::messages::StoredMessage,
+) -> ChatMessage {
     ChatMessage {
         role: message.role.clone(),
         text: message.text.clone(),
