@@ -7,10 +7,11 @@ DerivedData/
 *.profraw
 dist/
 
-# Rust daemon 构建产物
-disco-daemon/target/
-
-# 旧架构 Xcode 构建产物
+# Electron 客户端构建与依赖产物
+node_modules/
+dist-node/
+dist-renderer/
+release/
 macos/build/
+
 .alma-snapshots
-scripts/acp_dump.txt
