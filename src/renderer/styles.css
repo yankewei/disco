@@ -471,6 +471,31 @@ button:active {
 .message-text {
   text-wrap: pretty;
 }
+.timeline-items {
+  display: grid;
+  gap: 10px;
+}
+.timeline-item {
+  min-width: 0;
+}
+.timeline-item-meta,
+.item-block summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #76736e;
+  font-size: 11px;
+}
+.timeline-item-meta span:last-child,
+.item-block summary span:last-child {
+  flex: 0 0 auto;
+  color: #9a9792;
+  font-size: 10px;
+}
+.timeline-item-text .message-text {
+  margin-top: 4px;
+}
 .message details {
   margin-bottom: 11px;
 }
@@ -500,6 +525,18 @@ button:active {
   color: #76736e;
   cursor: pointer;
   font-size: 12px;
+}
+.timeline-items .reasoning-block {
+  margin-bottom: 0;
+}
+.timeline-items .reasoning-block summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.timeline-items .reasoning-block summary span:last-child {
+  color: #9a9792;
+  font-size: 10px;
 }
 .tool-block {
   margin: 12px 0;
@@ -534,6 +571,85 @@ button:active {
   background: #fffefc !important;
   border: 1px solid #ece9e5;
   border-radius: 6px;
+}
+.timeline-items .tool-block {
+  margin: 0;
+}
+.item-block {
+  padding: 10px 12px;
+  border: 1px solid #ece9e5;
+  border-radius: 10px;
+  background: #f7f6f5;
+}
+.item-block summary {
+  cursor: pointer;
+  list-style-position: inside;
+}
+.item-list {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  color: #55524e;
+  font-size: 12px;
+}
+.item-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.item-list code {
+  overflow-wrap: anywhere;
+  color: #3f3d39;
+  font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.change-kind {
+  flex: 0 0 auto;
+  color: #77746f;
+  font-size: 10px;
+}
+.change-kind.add,
+.todo-done {
+  color: #2e9a52;
+}
+.change-kind.delete,
+.item-error-text {
+  color: #b4493f;
+}
+.item-detail-grid {
+  display: grid;
+  gap: 9px;
+  margin-top: 10px;
+}
+.item-detail-label {
+  display: block;
+  margin-bottom: 4px;
+  color: #8a8781;
+  font-size: 10px;
+}
+.item-detail-grid pre {
+  margin: 0;
+}
+.item-inline-value {
+  margin-top: 4px;
+  color: #55524e;
+  overflow-wrap: anywhere;
+}
+.todo-open {
+  color: #9a9792;
+}
+.item-error-block {
+  background: #fff6f3;
+  border-color: #f0d7d0;
+}
+.item-error-block .timeline-item-meta {
+  color: #a1443c;
+}
+.item-error-text {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
 }
 .composer {
   width: min(850px, calc(100% - 88px));

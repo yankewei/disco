@@ -118,12 +118,20 @@ export class AgentHost {
     let assistantText = "";
     let reasoning = "";
     const toolCalls: NonNullable<StoredMessage["toolCalls"]> = [];
+    const items: NonNullable<StoredMessage["items"]> = [];
 
     const handleBackendEvent = (event: BackendEvent): void => {
       if (event.type === "text") {
         assistantText += event.text;
       } else if (event.type === "reasoning") {
         reasoning += event.text;
+      } else if (event.type === "item") {
+        const itemIndex = items.findIndex((item) => item.id === event.item.id);
+        if (itemIndex === -1) {
+          items.push(event.item);
+        } else {
+          items[itemIndex] = event.item;
+        }
       } else {
         const toolCall = toolCalls.find((item) => item.id === event.id);
         if (toolCall) {
@@ -191,13 +199,19 @@ export class AgentHost {
       });
       this.store.updateSession(sessionId, backendSessionId);
 
-      if (assistantText || reasoning || toolCalls.length > 0) {
+      if (
+        assistantText ||
+        reasoning ||
+        toolCalls.length > 0 ||
+        items.length > 0
+      ) {
         this.store.appendMessage(sessionId, {
           id: randomUUID(),
           role: "assistant",
           text: assistantText,
           reasoning: reasoning || undefined,
           toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          items: items.length > 0 ? items : undefined,
           createdAt: new Date().toISOString(),
         });
       }

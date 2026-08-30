@@ -1,8 +1,13 @@
-import type { ApprovalDecision, RunMode } from "../../shared/types.js";
+import type {
+  ApprovalDecision,
+  MessageItem,
+  RunMode,
+} from "../../shared/types.js";
 
 export type BackendEvent =
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
+  | { type: "item"; item: MessageItem }
   | {
       type: "tool";
       id: string;

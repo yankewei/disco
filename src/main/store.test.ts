@@ -44,6 +44,20 @@ describe("DiscoStore", () => {
           output: "README.md",
         },
       ],
+      items: [
+        {
+          id: "item-text",
+          type: "text",
+          text: "完成",
+          state: "completed",
+        },
+        {
+          id: "item-file",
+          type: "file_change",
+          changes: [{ path: "README.md", kind: "update" }],
+          state: "completed",
+        },
+      ],
       createdAt: project.createdAt,
     });
 
@@ -61,6 +75,20 @@ describe("DiscoStore", () => {
             name: "读取文件",
             status: "completed",
             output: "README.md",
+          },
+        ],
+        items: [
+          {
+            id: "item-text",
+            type: "text",
+            text: "完成",
+            state: "completed",
+          },
+          {
+            id: "item-file",
+            type: "file_change",
+            changes: [{ path: "README.md", kind: "update" }],
+            state: "completed",
           },
         ],
         createdAt: project.createdAt,

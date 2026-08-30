@@ -14,6 +14,7 @@ interface StoredMessageRow {
   text: string;
   reasoning: string | null;
   toolsJson: string | null;
+  itemsJson: string | null;
   createdAt: string;
 }
 
@@ -46,9 +47,16 @@ export class DiscoStore {
         text TEXT NOT NULL,
         reasoning TEXT,
         tools_json TEXT,
+        items_json TEXT,
         created_at TEXT NOT NULL
       );
     `);
+    const messageColumns = this.database
+      .prepare("PRAGMA table_info(messages)")
+      .all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === "items_json")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN items_json TEXT");
+    }
   }
 
   listProjects(): ProjectInfo[] {
@@ -127,8 +135,8 @@ export class DiscoStore {
     this.database
       .prepare(
         `INSERT INTO messages (
-          id, session_id, role, text, reasoning, tools_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          id, session_id, role, text, reasoning, tools_json, items_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         message.id,
@@ -137,6 +145,7 @@ export class DiscoStore {
         message.text,
         message.reasoning ?? null,
         message.toolCalls ? JSON.stringify(message.toolCalls) : null,
+        message.items ? JSON.stringify(message.items) : null,
         message.createdAt,
       );
     this.database
@@ -153,6 +162,7 @@ export class DiscoStore {
           text,
           reasoning,
           tools_json AS toolsJson,
+          items_json AS itemsJson,
           created_at AS createdAt
         FROM messages
         WHERE session_id = ?
@@ -160,10 +170,13 @@ export class DiscoStore {
       )
       .all(sessionId) as StoredMessageRow[];
 
-    return rows.map(({ toolsJson, reasoning, ...message }) => ({
+    return rows.map(({ toolsJson, itemsJson, reasoning, ...message }) => ({
       ...message,
       reasoning: reasoning ?? undefined,
       toolCalls: toolsJson ? (JSON.parse(toolsJson) as ToolCall[]) : undefined,
+      ...(itemsJson
+        ? { items: JSON.parse(itemsJson) as StoredMessage["items"] }
+        : {}),
     }));
   }
 

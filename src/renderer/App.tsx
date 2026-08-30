@@ -46,6 +46,7 @@ function updateLatestAssistant(
           toolCalls: lastMessage.toolCalls?.map((toolCall) => ({
             ...toolCall,
           })),
+          items: lastMessage.items?.map((item) => ({ ...item })),
         }
       : createAssistantMessage();
   update(assistantMessage);
@@ -301,6 +302,25 @@ function Workspace({ onOpenSettings }: { onOpenSettings: () => void }): JSX.Elem
       case "text":
       case "reasoning":
         appendAssistantText(event.type, event.text);
+        break;
+      case "item":
+        setMessages((current) =>
+          updateLatestAssistant(current, (assistantMessage) => {
+            const itemIndex = assistantMessage.items?.findIndex(
+              (item) => item.id === event.item.id,
+            ) ?? -1;
+            if (itemIndex === -1) {
+              assistantMessage.items = [
+                ...(assistantMessage.items ?? []),
+                event.item,
+              ];
+            } else {
+              assistantMessage.items = assistantMessage.items?.map(
+                (item, index) => (index === itemIndex ? event.item : item),
+              );
+            }
+          }),
+        );
         break;
       case "tool":
         setMessages((current) =>

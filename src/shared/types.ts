@@ -25,18 +25,82 @@ export interface ToolCall {
   output?: string;
 }
 
+export type MessageItemState = "started" | "updated" | "completed";
+
+export interface FileChange {
+  path: string;
+  kind: "add" | "delete" | "update";
+}
+
+export type MessageItem =
+  | {
+      id: string;
+      type: "text";
+      text: string;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "reasoning";
+      text: string;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "command_execution";
+      command: string;
+      output: string;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "file_change";
+      changes: FileChange[];
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "mcp_tool_call";
+      server: string;
+      tool: string;
+      arguments: unknown;
+      result?: unknown;
+      error?: string;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "web_search";
+      query: string;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "todo_list";
+      items: Array<{ text: string; completed: boolean }>;
+      state: MessageItemState;
+    }
+  | {
+      id: string;
+      type: "error";
+      message: string;
+      state: MessageItemState;
+    };
+
 export interface StoredMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
   reasoning?: string;
   toolCalls?: ToolCall[];
+  items?: MessageItem[];
   createdAt: string;
 }
 
 export type AgentEvent =
   | { type: "text"; sessionId: string; text: string }
   | { type: "reasoning"; sessionId: string; text: string }
+  | { type: "item"; sessionId: string; item: MessageItem }
   | {
       type: "tool";
       sessionId: string;
