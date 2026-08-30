@@ -10,6 +10,8 @@ protocol DiscoDaemonClient: AnyObject {
     func closeSession(sessionID: UUID) async throws
     func deleteSession(sessionID: UUID) async throws
     func compactContext(sessionID: UUID) async throws
+    func collaborationModes(sessionID: UUID) async throws -> [ConversationCollaborationMode]
+    func setCollaborationMode(_ mode: ConversationCollaborationMode, sessionID: UUID) async throws
 }
 
 /// 将 ACP session update 转换为公共 `DaemonEvent`。
@@ -530,6 +532,17 @@ final class ACPDaemonClientAdapter: DiscoDaemonClient {
 
     func compactContext(sessionID: UUID) async throws {
         _ = try await client.compactSession(sessionID: sessionID.uuidString)
+    }
+
+    func collaborationModes(sessionID: UUID) async throws -> [ConversationCollaborationMode] {
+        try await client.collaborationModes(sessionID: sessionID.uuidString)
+    }
+
+    func setCollaborationMode(
+        _ mode: ConversationCollaborationMode,
+        sessionID: UUID
+    ) async throws {
+        try await client.setCollaborationMode(mode, sessionID: sessionID.uuidString)
     }
 
     private func startEventRouting() {

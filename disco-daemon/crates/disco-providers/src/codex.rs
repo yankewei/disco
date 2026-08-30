@@ -104,6 +104,7 @@ pub struct CodexReasoningEffort {
 #[derive(Debug, Clone)]
 pub enum CodexProviderEvent {
     TextDelta(String),
+    PlanUpdate(CodexPlanUpdate),
     ReasoningDelta(String),
     Usage(TokenUsage),
     /// Codex app-server 的当前上下文占用；与累计请求用量分开传递。
@@ -118,6 +119,19 @@ pub enum CodexProviderEvent {
     Completed,
     Cancelled,
     Failed(String),
+}
+
+/// Codex app-server 返回的完整计划快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPlanUpdate {
+    pub explanation: Option<String>,
+    pub steps: Vec<CodexPlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPlanStep {
+    pub step: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +185,12 @@ pub enum CodexApprovalDecision {
     Cancel,
 }
 
+/// Codex app-server 已协商的协作模式名称。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexCollaborationMode {
+    pub id: String,
+}
+
 impl CodexApprovalDecision {
     fn wire_value(self) -> &'static str {
         match self {
@@ -193,6 +213,7 @@ struct PendingRequest {
 struct ActiveTurn {
     sender: mpsc::Sender<CodexProviderEvent>,
     turn_id: Option<String>,
+    plan_update: Option<CodexPlanUpdate>,
 }
 
 /// 事件流被取消时同步终止尚未完成的 turn/start 任务，避免留下 detached turn。
@@ -304,7 +325,9 @@ pub async fn list_codex_models(executable: &str) -> Result<Vec<CodexModelEntry>>
                     "title": "Disco",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": null,
+                "capabilities": {
+                    "experimentalApi": true
+                },
             }
         }),
     )
@@ -437,6 +460,7 @@ impl CodexProvider {
         self.state.lock().await.active_turn = Some(ActiveTurn {
             sender: event_tx,
             turn_id: None,
+            plan_update: None,
         });
         let state = self.state.clone();
         let reasoning_effort = self.reasoning_effort.clone();
@@ -581,7 +605,9 @@ impl CodexProvider {
                         "title": "Disco",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "capabilities": null
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
                 }
             });
 
@@ -888,6 +914,14 @@ impl CodexProvider {
                     }
                 }
             }
+            "turn/plan/updated" => {
+                if let Some(plan_update) = parse_codex_plan_update(params) {
+                    let mut state = state.lock().await;
+                    if let Some(active) = &mut state.active_turn {
+                        active.plan_update = Some(plan_update);
+                    }
+                }
+            }
             "thread/tokenUsage/updated" => {
                 if let Some(usage) = parse_codex_usage(params) {
                     let context_window = parse_codex_context_window(params);
@@ -934,8 +968,14 @@ impl CodexProvider {
                     _ => CodexProviderEvent::Completed,
                 };
 
-                let mut s = state.lock().await;
-                if let Some(active) = s.active_turn.take() {
+                let active = state.lock().await.active_turn.take();
+                if let Some(active) = active {
+                    if let Some(plan_update) = active.plan_update {
+                        let _ = active
+                            .sender
+                            .send(CodexProviderEvent::PlanUpdate(plan_update))
+                            .await;
+                    }
                     let _ = active.sender.send(event).await;
                 }
             }
@@ -1015,6 +1055,44 @@ impl CodexProvider {
             .thread_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Codex thread 初始化后仍缺少 thread ID"))
+    }
+
+    /// 从运行中的 Codex app-server 查询可用协作预设，不能依据 CLI 版本静态猜测。
+    pub async fn collaboration_modes(&self) -> Result<Vec<CodexCollaborationMode>> {
+        self.ensure_session().await?;
+        let response =
+            Self::send_request(&self.state, "collaborationMode/list", serde_json::json!({}))
+                .await?;
+        Ok(response["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["mode"].as_str())
+            .map(|mode| CodexCollaborationMode {
+                id: mode.to_string(),
+            })
+            .collect())
+    }
+
+    /// 使用 Codex 原生预设更新当前 thread 的后续 turn 配置。
+    pub async fn set_collaboration_mode(&self, mode: &str) -> Result<()> {
+        let thread_id = self.ensure_session().await?;
+        Self::send_request(
+            &self.state,
+            "thread/settings/update",
+            serde_json::json!({
+                "threadId": thread_id,
+                "collaborationMode": {
+                    "mode": mode,
+                    "settings": {
+                        "model": self.model,
+                        "developer_instructions": null,
+                    },
+                },
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// 发送需要响应的 JSON-RPC 请求，并集中处理 request ID、超时和 pending 清理。
@@ -1387,6 +1465,18 @@ impl ModelProvider for CodexProvider {
                     CodexProviderEvent::TextDelta(delta) => {
                         yield ProviderEvent::TextDelta(delta);
                     }
+                    CodexProviderEvent::PlanUpdate(plan) => {
+                        let explanation = plan.explanation.unwrap_or_default();
+                        let steps = plan
+                            .steps
+                            .into_iter()
+                            .map(|step| format!("- [{}] {}", step.status, step.step))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        yield ProviderEvent::TextDelta(format!(
+                            "## 计划\n\n{explanation}\n\n{steps}"
+                        ));
+                    }
                     CodexProviderEvent::ReasoningDelta(delta) => {
                         yield ProviderEvent::ReasoningDelta(delta);
                     }
@@ -1415,6 +1505,23 @@ impl ModelProvider for CodexProvider {
             }
         }))
     }
+}
+
+fn parse_codex_plan_update(params: &serde_json::Value) -> Option<CodexPlanUpdate> {
+    let steps = params["plan"]
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            Some(CodexPlanStep {
+                step: entry["step"].as_str()?.to_string(),
+                status: entry["status"].as_str().unwrap_or("pending").to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!steps.is_empty()).then(|| CodexPlanUpdate {
+        explanation: params["explanation"].as_str().map(ToString::to_string),
+        steps,
+    })
 }
 
 /// Parse Codex token usage from notification params.
@@ -1631,6 +1738,57 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
         assert!(err.to_string().contains("initialize"), "{err}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collaboration_modes_are_discovered_and_applied_natively() {
+        let fake = FakeCodex::new(
+            r###"#!/bin/sh
+read -r initialize
+printf '%s\n' '{"id":0,"result":{}}'
+read -r initialized
+read -r thread_start
+case "$thread_start" in
+  *'"method":"thread/start"'*) ;;
+  *) exit 81 ;;
+esac
+printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-plan"}}}'
+read -r list_modes
+case "$list_modes" in
+  *'"id":2'*'"method":"collaborationMode/list"'*) ;;
+  *) exit 82 ;;
+esac
+printf '%s\n' '{"id":2,"result":{"data":[{"name":"Agent","mode":"default"},{"name":"Plan","mode":"plan"}]}}'
+read -r update_settings
+case "$update_settings" in
+  *'"id":3'*'"method":"thread/settings/update"'*) ;;
+  *) exit 83 ;;
+esac
+case "$update_settings" in *'"threadId":"thread-plan"'*) ;; *) exit 84 ;; esac
+case "$update_settings" in *'"mode":"plan"'*) ;; *) exit 85 ;; esac
+case "$update_settings" in *'"developer_instructions":null'*) ;; *) exit 86 ;; esac
+printf '%s\n' '{"id":3,"result":{}}'
+while read -r ignored; do :; done
+"###,
+        );
+        let provider = CodexProvider::new(
+            fake.path(),
+            "gpt-5-codex".to_string(),
+            None,
+            None,
+            Some("/tmp/codex-workspace".to_string()),
+        );
+
+        let modes = provider.collaboration_modes().await.unwrap();
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| mode.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "plan"]
+        );
+        provider.set_collaboration_mode("plan").await.unwrap();
+    }
+
     #[test]
     fn encode_initialize_request() {
         let json = encode_rpc_request(
@@ -1641,13 +1799,15 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
                     "name": "disco",
                     "title": "Disco",
                     "version": "0.1.0"
-                }
+                },
+                "capabilities": { "experimentalApi": true }
             }),
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["id"], 0);
         assert_eq!(parsed["method"], "initialize");
         assert!(parsed["params"]["clientInfo"]["name"].as_str() == Some("disco"));
+        assert_eq!(parsed["params"]["capabilities"]["experimentalApi"], true);
     }
 
     #[test]
@@ -1788,6 +1948,23 @@ printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-so
             CodexProviderEvent::ToolCompleted(CodexToolResult { id, output, .. })
                 if id == "command-1" && output == "ok\n"
         ));
+    }
+
+    #[test]
+    fn parses_plan_update_snapshot() {
+        let update = parse_codex_plan_update(&serde_json::json!({
+            "explanation": "先确认范围",
+            "plan": [
+                {"step": "检查现状", "status": "completed"},
+                {"step": "实现方案", "status": "pending"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(update.explanation.as_deref(), Some("先确认范围"));
+        assert_eq!(update.steps.len(), 2);
+        assert_eq!(update.steps[1].step, "实现方案");
+        assert_eq!(update.steps[1].status, "pending");
     }
 
     #[test]

@@ -48,6 +48,8 @@ ACP v1 将自定义方法限制为以下划线开头，因此 facade 的实际 w
 - `_disco/provider/models`
 - `_disco/session/messages`
 - `_disco/session/compact`
+- `_disco/session/collaboration-modes`：查询当前 Agent 实际提供的协作模式；只有返回 `plan` 时客户端才可展示计划模式。
+- `_disco/session/collaboration-mode`：切换当前 session 后续 turn 的协作模式；当前仅 Codex app-server 映射为其原生 collaboration mode。
 - `_disco/state/snapshot`：返回 daemon revision、Provider、project 和 session 快照；Swift
   侧以此作为重连后的权威状态入口。
 - `_disco/event/replay`：按 session 的 epoch 和 sequence 重放连接短暂中断期间的 session

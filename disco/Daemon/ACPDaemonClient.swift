@@ -172,6 +172,14 @@ struct ACPCompactionResult: Decodable, Sendable {
     let compaction: ACPCompactionInfo
 }
 
+private struct ACPCollaborationModesResult: Decodable, Sendable {
+    let modes: [ConversationCollaborationMode]
+}
+
+private struct ACPCollaborationModeResult: Decodable, Sendable {
+    let mode: ConversationCollaborationMode
+}
+
 struct ACPCompactionInfo: Decodable, Sendable {
     let id: String
     let status: String
@@ -328,6 +336,11 @@ private struct ACPEventReplayParams: Encodable, Sendable {
 
 private struct ACPSessionIDParams: Encodable, Sendable {
     let sessionId: String
+}
+
+private struct ACPCollaborationModeParams: Encodable, Sendable {
+    let sessionId: String
+    let mode: String
 }
 
 private struct ACPTextContent: Encodable, Sendable {
@@ -597,6 +610,26 @@ final class ACPDaemonClient {
             "_disco/session/compact",
             params: ACPSessionIDParams(sessionId: sessionID),
             as: ACPCompactionResult.self
+        )
+    }
+
+    func collaborationModes(sessionID: String) async throws -> [ConversationCollaborationMode] {
+        let result = try await request(
+            "_disco/session/collaboration-modes",
+            params: ACPSessionIDParams(sessionId: sessionID),
+            as: ACPCollaborationModesResult.self
+        )
+        return result.modes
+    }
+
+    func setCollaborationMode(
+        _ mode: ConversationCollaborationMode,
+        sessionID: String
+    ) async throws {
+        _ = try await request(
+            "_disco/session/collaboration-mode",
+            params: ACPCollaborationModeParams(sessionId: sessionID, mode: mode.rawValue),
+            as: ACPCollaborationModeResult.self
         )
     }
 

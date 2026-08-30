@@ -1475,6 +1475,12 @@ private struct ComposerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if store.collaborationMode == .plan {
+                Label("计划模式：Codex 将先分析并提出方案，不直接执行修改。", systemImage: "checklist")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             TextField(
                 "输入消息，Enter 发送，Shift-Enter 换行",
                 text: $store.draft,
@@ -1510,6 +1516,7 @@ private struct ComposerView: View {
                 if isConfigured {
                     modelDrawerTrigger
                     reasoningSettingsTrigger
+                    collaborationModeTrigger
                 } else if projectUnavailable {
                     Image(systemName: "folder.badge.questionmark")
                     Text("项目目录不可用")
@@ -1611,8 +1618,9 @@ private struct ComposerView: View {
             }
             .contentTransition(.opacity)
             .font(.caption.weight(.medium))
-            .padding(.horizontal, 5)
-            .frame(minHeight: 28)
+            .padding(.horizontal, 8)
+            .frame(minHeight: 32)
+            .contentShape(Capsule())
             .background(
                 isModelDrawerPresented ? Color.primary.opacity(0.07) : .clear,
                 in: Capsule()
@@ -1667,6 +1675,36 @@ private struct ComposerView: View {
         .help(store.isStreaming ? "回复完成后可调整推理设置" : "调整推理设置")
         .popover(isPresented: $isReasoningSettingsPresented, arrowEdge: .bottom) {
             ReasoningSettingsPopover(dismiss: { isReasoningSettingsPresented = false })
+        }
+    }
+
+    @ViewBuilder
+    private var collaborationModeTrigger: some View {
+        if store.supportsPlanMode {
+            Menu {
+                ForEach(store.collaborationModes, id: \.self) { mode in
+                    Button {
+                        store.setCollaborationMode(mode)
+                    } label: {
+                        if mode == store.collaborationMode {
+                            Label(mode.title, systemImage: "checkmark")
+                        } else {
+                            Text(mode.title)
+                        }
+                    }
+                }
+            } label: {
+                Label(store.collaborationMode.title, systemImage: "checklist")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(store.collaborationMode == .plan ? DiscoTheme.accent : .secondary)
+                    .padding(.horizontal, 8)
+                    .frame(minHeight: 32)
+                    .contentShape(Capsule())
+            }
+            .menuStyle(.borderlessButton)
+            .disabled(store.isStreaming)
+            .opacity(store.isStreaming ? 0.52 : 1)
+            .help(store.isStreaming ? "回复完成后可切换协作模式" : "选择 Agent 或 Plan 模式")
         }
     }
 
@@ -2211,11 +2249,7 @@ private struct ModelDrawer: View {
                     .padding(.vertical, 5)
                     .background(.quaternary, in: Capsule())
                 }
-                if appState.reasoningEfforts(for: vendor).count > 2 {
-                    Label("支持推理强度", systemImage: "brain")
-                        .font(.caption2)
-                        .foregroundStyle(DiscoTheme.accent)
-                } else if models.isEmpty {
+                if models.isEmpty {
                     Text("尚未加载模型列表")
                         .font(.caption)
                         .foregroundStyle(.tertiary)

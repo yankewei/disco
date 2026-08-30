@@ -199,6 +199,19 @@ enum DaemonRunErrorCode: String, Codable, Sendable, Equatable {
     case contextCompactionFailed = "context_compaction_failed"
 }
 
+/// Agent 通过 daemon 协商出的会话协作模式。
+enum ConversationCollaborationMode: String, Codable, Sendable, CaseIterable, Hashable {
+    case `default`
+    case plan
+
+    var title: String {
+        switch self {
+        case .default: "Agent"
+        case .plan: "Plan"
+        }
+    }
+}
+
 /// `run.failed` 中的错误对象。
 struct DaemonRunError: Codable, Sendable {
     let code: DaemonRunErrorCode

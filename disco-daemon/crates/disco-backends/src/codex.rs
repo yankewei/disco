@@ -6,7 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use disco_core::{
     AgentBackend, AgentOutput, ApprovalManager, ApprovalRequest, BackendCapabilities, BackendRun,
-    BackendRunRequest, BackendSession, CompactionMode, CompactionUpdate, PreparedApproval,
+    BackendRunRequest, BackendSession, CollaborationMode, CompactionMode, CompactionUpdate,
+    PlanStep, PreparedApproval,
 };
 use disco_protocol::types::{ApprovalDecision, ApprovalImpact};
 #[cfg(test)]
@@ -70,6 +71,40 @@ impl AgentBackend for CodexAdapter {
         }
     }
 
+    async fn collaboration_modes(
+        &self,
+        session: &BackendSession,
+        workspace_path: Option<String>,
+    ) -> Result<Vec<CollaborationMode>> {
+        let provider = self.provider_for(session, workspace_path).await;
+        let modes = provider.collaboration_modes().await?;
+        Ok(modes
+            .into_iter()
+            .filter_map(|mode| match mode.id.as_str() {
+                "default" => Some(CollaborationMode::Default),
+                "plan" => Some(CollaborationMode::Plan),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn set_collaboration_mode(
+        &self,
+        session: &BackendSession,
+        workspace_path: Option<String>,
+        mode: CollaborationMode,
+    ) -> Result<()> {
+        let provider = self.provider_for(session, workspace_path).await;
+        let supported_modes = provider.collaboration_modes().await?;
+        if !supported_modes
+            .iter()
+            .any(|candidate| candidate.id == mode.as_str())
+        {
+            anyhow::bail!("Codex 当前不提供 {} 模式", mode.as_str());
+        }
+        provider.set_collaboration_mode(mode.as_str()).await
+    }
+
     async fn load_session(
         &self,
         session: &BackendSession,
@@ -125,6 +160,13 @@ impl AgentBackend for CodexAdapter {
                     event = stream.next() => {
                         let output = match event {
                             Some(Ok(CodexProviderEvent::TextDelta(delta))) => AgentOutput::TextDelta(delta),
+                            Some(Ok(CodexProviderEvent::PlanUpdate(plan))) => AgentOutput::PlanUpdate {
+                                explanation: plan.explanation,
+                                steps: plan.steps.into_iter().map(|step| PlanStep {
+                                    step: step.step,
+                                    status: step.status,
+                                }).collect(),
+                            },
                             Some(Ok(CodexProviderEvent::ReasoningDelta(delta))) => AgentOutput::ReasoningDelta(delta),
                             Some(Ok(CodexProviderEvent::Usage(usage))) => AgentOutput::Usage(usage),
                             Some(Ok(CodexProviderEvent::ContextUsage { tokens, window })) => {
@@ -489,6 +531,7 @@ esac
 printf '%s\n' '{"id":2,"result":{}}'
 printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"type":"commandExecution","id":"tool-test","command":"echo hello","cwd":"/tmp/codex-workspace","status":"completed","aggregatedOutput":"hello\n","exitCode":0}}}'
 printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-test","turnId":"turn-test","delta":"已完成"}}'
+printf '%s\n' '{"method":"turn/plan/updated","params":{"threadId":"thread-test","turnId":"turn-test","explanation":"先确认范围","plan":[{"step":"检查现状","status":"completed"},{"step":"实现方案","status":"pending"}]}}'
 printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
 read -r thread_delete
 case "$thread_delete" in
@@ -536,7 +579,15 @@ while read -r ignored; do :; done
             matches!(&events[3], AgentOutput::ToolCompleted { output, .. } if output == "hello\n")
         );
         assert!(matches!(&events[4], AgentOutput::TextDelta(text) if text == "已完成"));
-        assert!(matches!(&events[5], AgentOutput::Completed));
+        assert!(matches!(
+            &events[5],
+            AgentOutput::PlanUpdate { explanation: Some(explanation), steps }
+                if explanation == "先确认范围"
+                    && steps.len() == 2
+                    && steps[0].step == "检查现状"
+                    && steps[0].status == "completed"
+        ));
+        assert!(matches!(&events[6], AgentOutput::Completed));
 
         adapter
             .delete_session(

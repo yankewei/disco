@@ -23,7 +23,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{
     Agent, Client, ConnectTo, ConnectionTo, JsonRpcNotification, Responder, Stdio,
 };
-use disco_core::{AgentOutput, CompactionUpdate};
+use disco_core::{AgentOutput, BackendSession, CollaborationMode, CompactionUpdate};
 use disco_protocol::types::{CompactionStatus, TokenUsage};
 use disco_protocol::{ApprovalKind, ApprovalRequestedData};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,8 @@ const ACP_PROVIDER_LIST_METHOD: &str = "disco/provider/list";
 const ACP_PROVIDER_MODELS_METHOD: &str = "disco/provider/models";
 const ACP_SESSION_MESSAGES_METHOD: &str = "disco/session/messages";
 const ACP_SESSION_COMPACT_METHOD: &str = "disco/session/compact";
+const ACP_SESSION_COLLABORATION_MODES_METHOD: &str = "disco/session/collaboration-modes";
+const ACP_SESSION_COLLABORATION_MODE_METHOD: &str = "disco/session/collaboration-mode";
 const ACP_STATE_SNAPSHOT_METHOD: &str = "disco/state/snapshot";
 const ACP_EVENT_REPLAY_METHOD: &str = "disco/event/replay";
 const META_APPROVAL_ID: &str = "disco/approvalId";
@@ -231,6 +233,8 @@ where
             "disco/provider/models",
             "disco/session/messages",
             "disco/session/compact",
+            "disco/session/collaboration-modes",
+            "disco/session/collaboration-mode",
             "disco/state/snapshot",
             "disco/event/replay",
         ]),
@@ -467,8 +471,27 @@ struct AcpProviderModelsResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AcpSessionMessagesParams {
+struct AcpSessionReferenceParams {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSessionCollaborationModeParams {
+    session_id: String,
+    mode: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSessionCollaborationModesResult {
+    modes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSessionCollaborationModeResult {
+    mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,11 +552,107 @@ async fn handle_disco_extension(
         ACP_PROVIDER_MODELS_METHOD => list_provider_models(app, extension).await,
         ACP_SESSION_MESSAGES_METHOD => list_session_messages(app, extension).await,
         ACP_SESSION_COMPACT_METHOD => compact_session(app, extension, connection).await,
+        ACP_SESSION_COLLABORATION_MODES_METHOD => {
+            list_session_collaboration_modes(app, extension).await
+        }
+        ACP_SESSION_COLLABORATION_MODE_METHOD => {
+            set_session_collaboration_mode(app, extension).await
+        }
         ACP_STATE_SNAPSHOT_METHOD => state_snapshot(app).await,
         ACP_EVENT_REPLAY_METHOD => replay_events(app, extension).await,
         method => Err(agent_client_protocol::Error::method_not_found()
             .data(format!("未知的 Disco ACP extension：{method}"))),
     }
+}
+
+async fn session_backend_context(
+    app: &Arc<AppState>,
+    session_id: Uuid,
+) -> agent_client_protocol::Result<(
+    Arc<dyn disco_core::AgentBackend>,
+    BackendSession,
+    Option<String>,
+)> {
+    let session = app
+        .db
+        .get_session(session_id)
+        .map_err(|error| internal_error(error.to_string()))?
+        .ok_or_else(|| invalid_params(format!("session {session_id} 不存在")))?;
+    let workspace_path = app
+        .db
+        .get_project(session.project_id)
+        .map_err(|error| internal_error(error.to_string()))?
+        .map(|project| project.path);
+    let backend_handle = app
+        .db
+        .get_session_backend_resume_cursor(session_id, &session.provider_id)
+        .map_err(|error| internal_error(error.to_string()))?
+        .map(|cursor| cursor.handle);
+    let backend = app.get_backend(&session.provider_id).await.ok_or_else(|| {
+        internal_error(format!(
+            "Provider {} 当前没有可用的 Agent Backend。",
+            session.provider_id
+        ))
+    })?;
+    Ok((
+        backend,
+        BackendSession {
+            id: session.id,
+            model: session.model,
+            backend_handle,
+        },
+        workspace_path,
+    ))
+}
+
+async fn list_session_collaboration_modes(
+    app: &Arc<AppState>,
+    extension: &ExtRequest,
+) -> agent_client_protocol::Result<serde_json::Value> {
+    let params: AcpSessionReferenceParams = decode_extension_params(extension)?;
+    let session_id = Uuid::parse_str(&params.session_id)
+        .map_err(|_| invalid_params(format!("无效的 session ID：{}", params.session_id)))?;
+    let (backend, session, workspace_path) = session_backend_context(app, session_id).await?;
+    let modes = backend
+        .collaboration_modes(&session, workspace_path)
+        .await
+        .map_err(|error| internal_error(format!("无法读取 Agent 协作模式：{error}")))?
+        .into_iter()
+        .map(|mode| mode.as_str().to_string())
+        .collect();
+    serde_json::to_value(AcpSessionCollaborationModesResult { modes })
+        .map_err(|error| internal_error(format!("无法编码协作模式：{error}")))
+}
+
+async fn set_session_collaboration_mode(
+    app: &Arc<AppState>,
+    extension: &ExtRequest,
+) -> agent_client_protocol::Result<serde_json::Value> {
+    let params: AcpSessionCollaborationModeParams = decode_extension_params(extension)?;
+    let session_id = Uuid::parse_str(&params.session_id)
+        .map_err(|_| invalid_params(format!("无效的 session ID：{}", params.session_id)))?;
+    if app
+        .run_coordinator
+        .active_run_id(session_id)
+        .await
+        .is_some()
+    {
+        return Err(invalid_params("Agent 正在运行，完成后才能切换协作模式"));
+    }
+    let mode = match params.mode.as_str() {
+        "default" => CollaborationMode::Default,
+        "plan" => CollaborationMode::Plan,
+        _ => return Err(invalid_params(format!("未知协作模式：{}", params.mode))),
+    };
+    let (backend, session, workspace_path) = session_backend_context(app, session_id).await?;
+    backend
+        .set_collaboration_mode(&session, workspace_path, mode)
+        .await
+        .map_err(|error| invalid_params(format!("无法切换协作模式：{error}")))?;
+    serde_json::to_value(AcpSessionCollaborationModeResult {
+        mode: mode.as_str().to_string(),
+    })
+    .map_err(|error| internal_error(format!("无法编码协作模式：{error}")))
 }
 
 async fn configure_provider(
@@ -582,7 +701,7 @@ async fn list_session_messages(
     app: &Arc<AppState>,
     extension: &ExtRequest,
 ) -> agent_client_protocol::Result<serde_json::Value> {
-    let params: AcpSessionMessagesParams = decode_extension_params(extension)?;
+    let params: AcpSessionReferenceParams = decode_extension_params(extension)?;
     let session_id = Uuid::parse_str(&params.session_id)
         .map_err(|_| invalid_params(format!("无效的 Disco session ID：{}", params.session_id)))?;
     let stored_messages = app
@@ -697,7 +816,7 @@ async fn compact_session(
     extension: &ExtRequest,
     connection: &ConnectionTo<Client>,
 ) -> agent_client_protocol::Result<serde_json::Value> {
-    let params: AcpSessionMessagesParams = decode_extension_params(extension)?;
+    let params: AcpSessionReferenceParams = decode_extension_params(extension)?;
     let session_id = Uuid::parse_str(&params.session_id)
         .map_err(|_| invalid_params(format!("无效的 Disco session ID：{}", params.session_id)))?;
     let session = app
@@ -1240,6 +1359,25 @@ async fn bridge_prompt(
         match output {
             AgentOutput::TextDelta(delta) => {
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(delta)))
+                    .message_id(assistant_message_id.clone());
+                send_session_update(
+                    &app,
+                    &connection,
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                )
+                .await?;
+            }
+            AgentOutput::PlanUpdate { explanation, steps } => {
+                let mut markdown = "## 计划\n\n".to_string();
+                if let Some(explanation) = explanation {
+                    markdown.push_str(&explanation);
+                    markdown.push_str("\n\n");
+                }
+                for step in steps {
+                    markdown.push_str(&format!("- [{}] {}\n", step.status, step.step));
+                }
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(markdown)))
                     .message_id(assistant_message_id.clone());
                 send_session_update(
                     &app,

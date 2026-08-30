@@ -173,6 +173,19 @@ pub async fn start_run(
         while let Some(output) = events.next().await {
             match &output {
                 AgentOutput::TextDelta(delta) => full_response.push_str(delta),
+                AgentOutput::PlanUpdate { explanation, steps } => {
+                    if !full_response.is_empty() {
+                        full_response.push_str("\n\n");
+                    }
+                    full_response.push_str("## 计划\n\n");
+                    if let Some(explanation) = explanation {
+                        full_response.push_str(explanation);
+                        full_response.push_str("\n\n");
+                    }
+                    for step in steps {
+                        full_response.push_str(&format!("- [{}] {}\n", step.status, step.step));
+                    }
+                }
                 AgentOutput::ReasoningDelta(delta) => reasoning.push_str(delta),
                 AgentOutput::ToolStarted {
                     tool_call_id,

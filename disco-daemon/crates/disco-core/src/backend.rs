@@ -22,6 +22,24 @@ pub enum CompactionMode {
     Native,
 }
 
+/// Agent 与用户协作时采用的运行预设。
+///
+/// 该类型只表达 Disco 稳定的产品语义；具体 backend 自行映射到原生协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollaborationMode {
+    Default,
+    Plan,
+}
+
+impl CollaborationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+        }
+    }
+}
+
 /// 后端对 Disco 暴露的稳定能力。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCapabilities {
@@ -66,6 +84,30 @@ pub struct BackendRun {
 #[async_trait]
 pub trait AgentBackend: Send + Sync {
     fn capabilities(&self) -> BackendCapabilities;
+
+    /// 返回此 backend 在当前会话实际提供的协作模式。
+    ///
+    /// 默认只提供普通 Agent 模式，避免前端把未验证的提示词约定展示为原生能力。
+    async fn collaboration_modes(
+        &self,
+        _session: &BackendSession,
+        _workspace_path: Option<String>,
+    ) -> Result<Vec<CollaborationMode>> {
+        Ok(vec![CollaborationMode::Default])
+    }
+
+    /// 切换后续 turn 使用的协作模式。
+    async fn set_collaboration_mode(
+        &self,
+        _session: &BackendSession,
+        _workspace_path: Option<String>,
+        mode: CollaborationMode,
+    ) -> Result<()> {
+        if mode == CollaborationMode::Default {
+            return Ok(());
+        }
+        bail!("该 Agent Backend 不支持 {} 模式", mode.as_str())
+    }
 
     /// 恢复一个已经存在的原生会话。
     ///

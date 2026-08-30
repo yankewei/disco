@@ -7,6 +7,11 @@ use crate::approval::ApprovalRequest;
 #[derive(Debug, Clone)]
 pub enum AgentOutput {
     TextDelta(String),
+    /// Agent 提交的可展示计划快照。每次更新都代表完整计划，而非增量。
+    PlanUpdate {
+        explanation: Option<String>,
+        steps: Vec<PlanStep>,
+    },
     ReasoningDelta(String),
     Usage(TokenUsage),
     /// Provider 报告的当前上下文占用和窗口大小。
@@ -44,6 +49,13 @@ pub enum AgentOutput {
     Completed,
     Failed(String),
     Cancelled,
+}
+
+/// Agent 计划中的单个步骤。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: String,
 }
 
 /// Backend 报告的一次上下文压缩状态变化。

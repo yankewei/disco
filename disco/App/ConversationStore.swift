@@ -43,6 +43,9 @@ final class ConversationStore: ObservableObject {
     private(set) var contextState: ConversationContextState
     /// 原生 Agent 的上下文由其自身维护；只有 Rig 本地链路允许手动请求压缩。
     @Published private(set) var compactionMode = "local"
+    /// 仅包含 daemon 与当前 Agent 实际协商成功的模式。
+    @Published private(set) var collaborationModes: [ConversationCollaborationMode] = [.default]
+    @Published private(set) var collaborationMode: ConversationCollaborationMode = .default
 
     var hasRuntime: Bool {
         daemonRunsEnabled && daemonClient != nil && daemonSessionID != nil
@@ -148,6 +151,42 @@ final class ConversationStore: ObservableObject {
     func enableDaemonRuns(sessionID: UUID) {
         daemonSessionID = sessionID
         daemonRunsEnabled = true
+        refreshCollaborationModes()
+    }
+
+    var supportsPlanMode: Bool { collaborationModes.contains(.plan) }
+
+    func setCollaborationMode(_ mode: ConversationCollaborationMode) {
+        guard mode != collaborationMode,
+              !isStreaming,
+              let sessionID = daemonSessionID,
+              let client = daemonClient else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await client.setCollaborationMode(mode, sessionID: sessionID)
+                collaborationMode = mode
+            } catch {
+                errorMessage = "无法切换协作模式：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func refreshCollaborationModes() {
+        guard let sessionID = daemonSessionID, let client = daemonClient else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let modes = try await client.collaborationModes(sessionID: sessionID)
+                collaborationModes = modes.contains(.default) ? modes : [.default]
+                if !collaborationModes.contains(collaborationMode) {
+                    collaborationMode = .default
+                }
+            } catch {
+                collaborationModes = [.default]
+                collaborationMode = .default
+            }
+        }
     }
 
     func disableDaemonRuns() {

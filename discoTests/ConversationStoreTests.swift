@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class ConversationStoreTests: XCTestCase {
+    func testPlanModeIsOnlyAvailableWhenDaemonReportsIt() async throws {
+        let sessionID = UUID()
+        let client = RecordingDiscoDaemonClient(runID: UUID())
+        client.availableCollaborationModes = [.default, .plan]
+        let store = ConversationStore()
+        store.configure(daemonClient: client)
+        store.enableDaemonRuns(sessionID: sessionID)
+
+        for _ in 0..<100 where !store.supportsPlanMode {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(store.supportsPlanMode)
+
+        store.setCollaborationMode(.plan)
+        for _ in 0..<100 where client.selectedCollaborationModes.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(client.selectedCollaborationModes, [.plan])
+        XCTAssertEqual(store.collaborationMode, .plan)
+    }
+
     func testDaemonRunStreamsIntoTheConversationAndCompletes() async throws {
         let sessionID = UUID()
         let runID = UUID()
@@ -477,6 +498,8 @@ final class RecordingDiscoDaemonClient: DiscoDaemonClient {
     private(set) var closedSessionIDs: [UUID] = []
     private(set) var deletedSessionIDs: [UUID] = []
     private(set) var compactedSessionIDs: [UUID] = []
+    var availableCollaborationModes: [ConversationCollaborationMode] = [.default]
+    private(set) var selectedCollaborationModes: [ConversationCollaborationMode] = []
 
     init(runID: UUID) {
         self.runID = runID
@@ -510,6 +533,17 @@ final class RecordingDiscoDaemonClient: DiscoDaemonClient {
 
     func compactContext(sessionID: UUID) async throws {
         compactedSessionIDs.append(sessionID)
+    }
+
+    func collaborationModes(sessionID: UUID) async throws -> [ConversationCollaborationMode] {
+        availableCollaborationModes
+    }
+
+    func setCollaborationMode(
+        _ mode: ConversationCollaborationMode,
+        sessionID: UUID
+    ) async throws {
+        selectedCollaborationModes.append(mode)
     }
 }
 
