@@ -28,7 +28,12 @@
         "zip"
       ]
     },
-    "publish": [{ "provider": "generic", "url": "${DISCO_UPDATE_URL}" }],
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "${DISCO_UPDATE_URL}"
+      }
+    ],
     "dmg": {
       "sign": false
     }
@@ -36,12 +41,10 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.251",
     "@openai/codex-sdk": "^0.151.0",
-    "@vitejs/plugin-react": "latest",
     "better-sqlite3": "^13.0.3",
     "electron-updater": "^6.8.9",
     "react": "latest",
     "react-dom": "latest",
-    "vite": "latest",
     "zod": "^4.5.4"
   },
   "devDependencies": {
@@ -49,13 +52,13 @@
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "latest",
     "cross-env": "latest",
     "electron": "latest",
     "electron-builder": "^26.15.3",
-    "playwright": "^1.62.1",
     "typescript": "latest",
+    "vite": "^8.2.2",
     "vitest": "^4.1.11",
     "wait-on": "latest"
   }
