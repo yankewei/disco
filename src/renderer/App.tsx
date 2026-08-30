@@ -16,6 +16,32 @@ const providerIcons: Record<BackendKind, { glyph: string; tint: string }> = {
   opencode: { glyph: "◆", tint: "#6f6d69" },
 };
 
+interface ProjectTreeProps {
+  project: ProjectInfo;
+  expanded: boolean;
+  isActive: boolean;
+  sessions: SessionInfo[];
+  activeSessionId?: string;
+  onToggle: (id: string) => void;
+  onAddSession: (id: string) => void;
+  onSelectSession: (session: SessionInfo) => void;
+}
+
+function ProjectTree({ project, expanded, isActive, sessions, activeSessionId, onToggle, onAddSession, onSelectSession }: ProjectTreeProps) {
+  return <div className="project-tree">
+    <div className="project-item">
+      <button className={`project-row ${isActive ? "active" : ""}`} onClick={() => onToggle(project.id)}>
+        <span className={`project-caret${expanded ? " open" : ""}`}>▸</span>
+        <span>{project.name}</span>
+      </button>
+      <button className="project-add" aria-label="新建会话" title="新建会话" onClick={(event) => { event.stopPropagation(); onAddSession(project.id); }}>+</button>
+    </div>
+    {expanded && <nav className="session-tree">
+      {sessions.map((session) => <button key={session.sessionId} className={`session-tree-item ${activeSessionId === session.sessionId ? "active" : ""}`} onClick={() => onSelectSession(session)}><span>{session.title}</span></button>)}
+    </nav>}
+  </div>;
+}
+
 export function App() {
   const [settingsOnly] = useState(() => location.hash === "#settings");
   const [projects, setProjects] = useState<ProjectInfo[]>([]); const [sessionsByProject, setSessionsByProject] = useState<Map<string, SessionInfo[]>>(() => new Map()); const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -105,7 +131,17 @@ export function App() {
       <button className="new-session" onClick={() => void addSession()}>新对话</button>
       <button className="add-project" onClick={() => void addProject()}>添加项目</button>
       <div className="sidebar-scroll">
-        {projects.map((item) => { const expanded = expandedProjects.has(item.id); return <div key={item.id} className="project-tree"><div className="project-item"><button className={`project-row ${projectId === item.id ? "active" : ""}`} onClick={() => void toggleProject(item.id)}><span className={`project-caret${expanded ? " open" : ""}`}>▸</span><span>{item.name}</span></button><button className="project-add" aria-label="新建会话" title="新建会话" onClick={(event) => { event.stopPropagation(); void addSessionForProject(item.id); }}>+</button></div>{expanded && <nav className="session-tree">{(sessionsByProject.get(item.id) ?? []).map((s) => <button key={s.sessionId} className={`session-tree-item ${activeId === s.sessionId ? "active" : ""}`} onClick={() => void select(s)}><span>{s.title}</span></button>)}</nav>}</div>; })}
+        {projects.map((item) => <ProjectTree
+          key={item.id}
+          project={item}
+          expanded={expandedProjects.has(item.id)}
+          isActive={projectId === item.id}
+          sessions={sessionsByProject.get(item.id) ?? []}
+          activeSessionId={activeId}
+          onToggle={(id) => void toggleProject(id)}
+          onAddSession={(id) => void addSessionForProject(id)}
+          onSelectSession={(session) => void select(session)}
+        />)}
         {projects.length === 0 && <button className="sidebar-hint" onClick={() => void addProject()}>选择一个本地文件夹</button>}
       </div>
       <div className="sidebar-footer"><button className="settings-button" aria-label="Agent 设置" title="Agent 设置" onClick={() => { setShowSettings(true); void redetect(); }}>⚙</button></div>
