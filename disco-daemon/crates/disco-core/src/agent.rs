@@ -58,6 +58,16 @@ pub struct PlanStep {
     pub status: String,
 }
 
+impl disco_providers::PlanStepView for PlanStep {
+    fn step_text(&self) -> &str {
+        &self.step
+    }
+
+    fn status(&self) -> &str {
+        &self.status
+    }
+}
+
 /// Backend 报告的一次上下文压缩状态变化。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionUpdate {

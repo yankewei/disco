@@ -134,6 +134,38 @@ pub struct CodexPlanStep {
     pub status: String,
 }
 
+/// 计划步骤的公共字段视图，让不同层各自的计划步骤类型复用同一份 Markdown 渲染。
+pub trait PlanStepView {
+    fn step_text(&self) -> &str;
+    fn status(&self) -> &str;
+}
+
+impl PlanStepView for CodexPlanStep {
+    fn step_text(&self) -> &str {
+        &self.step
+    }
+
+    fn status(&self) -> &str {
+        &self.status
+    }
+}
+
+/// 把完整计划快照渲染为展示用 Markdown。
+///
+/// 协议输出、transcript 持久化和 Provider 兼容层共用的唯一渲染入口，
+/// 避免多处格式字符串各自演化。
+pub fn render_plan_markdown(explanation: Option<&str>, steps: &[impl PlanStepView]) -> String {
+    let mut markdown = "## 计划\n\n".to_string();
+    if let Some(explanation) = explanation.filter(|text| !text.is_empty()) {
+        markdown.push_str(explanation);
+        markdown.push_str("\n\n");
+    }
+    for step in steps {
+        markdown.push_str(&format!("- [{}] {}\n", step.status(), step.step_text()));
+    }
+    markdown
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCompactionUpdate {
     pub id: String,
@@ -1466,16 +1498,9 @@ impl ModelProvider for CodexProvider {
                         yield ProviderEvent::TextDelta(delta);
                     }
                     CodexProviderEvent::PlanUpdate(plan) => {
-                        let explanation = plan.explanation.unwrap_or_default();
-                        let steps = plan
-                            .steps
-                            .into_iter()
-                            .map(|step| format!("- [{}] {}", step.status, step.step))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        yield ProviderEvent::TextDelta(format!(
-                            "## 计划\n\n{explanation}\n\n{steps}"
-                        ));
+                        let markdown =
+                            render_plan_markdown(plan.explanation.as_deref(), &plan.steps);
+                        yield ProviderEvent::TextDelta(markdown);
                     }
                     CodexProviderEvent::ReasoningDelta(delta) => {
                         yield ProviderEvent::ReasoningDelta(delta);
@@ -1965,6 +1990,33 @@ while read -r ignored; do :; done
         assert_eq!(update.steps.len(), 2);
         assert_eq!(update.steps[1].step, "实现方案");
         assert_eq!(update.steps[1].status, "pending");
+    }
+
+    #[test]
+    fn renders_plan_markdown_snapshot() {
+        let steps = vec![
+            CodexPlanStep {
+                step: "检查现状".to_string(),
+                status: "completed".to_string(),
+            },
+            CodexPlanStep {
+                step: "实现方案".to_string(),
+                status: "pending".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            render_plan_markdown(Some("先确认范围"), &steps),
+            "## 计划\n\n先确认范围\n\n- [completed] 检查现状\n- [pending] 实现方案\n"
+        );
+        assert_eq!(
+            render_plan_markdown(None, &steps[..1]),
+            "## 计划\n\n- [completed] 检查现状\n"
+        );
+        assert_eq!(
+            render_plan_markdown(Some(""), &steps[..1]),
+            "## 计划\n\n- [completed] 检查现状\n"
+        );
     }
 
     #[test]

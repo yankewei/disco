@@ -6,7 +6,7 @@ pub use chat_completions::ChatCompletionsProvider;
 pub use codex::{
     CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexCompactionUpdate,
     CodexModelEntry, CodexProvider, CodexProviderEvent, CodexReasoningEffort, CodexToolCall,
-    CodexToolResult, list_codex_models,
+    CodexToolResult, PlanStepView, list_codex_models, render_plan_markdown,
 };
 pub use openai_responses::{ChatMessage, OpenAIResponsesProvider, ProviderEvent, StreamOptions};
 

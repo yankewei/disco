@@ -26,6 +26,7 @@ use agent_client_protocol::{
 use disco_core::{AgentOutput, BackendSession, CollaborationMode, CompactionUpdate};
 use disco_protocol::types::{CompactionStatus, TokenUsage};
 use disco_protocol::{ApprovalKind, ApprovalRequestedData};
+use disco_providers::render_plan_markdown;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -1369,14 +1370,7 @@ async fn bridge_prompt(
                 .await?;
             }
             AgentOutput::PlanUpdate { explanation, steps } => {
-                let mut markdown = "## 计划\n\n".to_string();
-                if let Some(explanation) = explanation {
-                    markdown.push_str(&explanation);
-                    markdown.push_str("\n\n");
-                }
-                for step in steps {
-                    markdown.push_str(&format!("- [{}] {}\n", step.status, step.step));
-                }
+                let markdown = render_plan_markdown(explanation.as_deref(), &steps);
                 let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(markdown)))
                     .message_id(assistant_message_id.clone());
                 send_session_update(

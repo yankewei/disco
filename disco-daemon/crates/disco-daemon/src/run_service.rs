@@ -4,6 +4,7 @@ use disco_core::{AgentOutput, BackendRunRequest, BackendSession, BeginRunError, 
 use disco_persist::messages::{StoredMessage, StoredToolCall};
 use disco_protocol::types::{BackendResumeCursor, TokenUsage};
 use disco_providers::openai_responses::{ChatMessage, ToolCallInfo};
+use disco_providers::render_plan_markdown;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -177,14 +178,7 @@ pub async fn start_run(
                     if !full_response.is_empty() {
                         full_response.push_str("\n\n");
                     }
-                    full_response.push_str("## 计划\n\n");
-                    if let Some(explanation) = explanation {
-                        full_response.push_str(explanation);
-                        full_response.push_str("\n\n");
-                    }
-                    for step in steps {
-                        full_response.push_str(&format!("- [{}] {}\n", step.status, step.step));
-                    }
+                    full_response.push_str(&render_plan_markdown(explanation.as_deref(), steps));
                 }
                 AgentOutput::ReasoningDelta(delta) => reasoning.push_str(delta),
                 AgentOutput::ToolStarted {
