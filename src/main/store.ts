@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
   ProjectInfo,
+  RunStatus,
   SessionInfo,
   StoredMessage,
   ToolCall,
@@ -15,11 +16,14 @@ interface StoredMessageRow {
   reasoning: string | null;
   toolsJson: string | null;
   itemsJson: string | null;
+  status: RunStatus | null;
+  error: string | null;
   createdAt: string;
 }
 
 export class DiscoStore {
   private readonly database: Database.Database;
+  private isClosed = false;
 
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
@@ -48,14 +52,27 @@ export class DiscoStore {
         reasoning TEXT,
         tools_json TEXT,
         items_json TEXT,
+        status TEXT,
+        error TEXT,
         created_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS sessions_project_updated_idx
+        ON sessions (project_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS messages_session_created_idx
+        ON messages (session_id, created_at);
     `);
+
     const messageColumns = this.database
       .prepare("PRAGMA table_info(messages)")
       .all() as Array<{ name: string }>;
     if (!messageColumns.some((column) => column.name === "items_json")) {
       this.database.exec("ALTER TABLE messages ADD COLUMN items_json TEXT");
+    }
+    if (!messageColumns.some((column) => column.name === "status")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN status TEXT");
+    }
+    if (!messageColumns.some((column) => column.name === "error")) {
+      this.database.exec("ALTER TABLE messages ADD COLUMN error TEXT");
     }
   }
 
@@ -87,7 +104,7 @@ export class DiscoStore {
           updated_at AS updatedAt
         FROM sessions
         WHERE project_id = ?
-        ORDER BY updated_at DESC`,
+        ORDER BY updated_at DESC, rowid DESC`,
       )
       .all(projectId) as SessionInfo[];
   }
@@ -131,14 +148,32 @@ export class DiscoStore {
       .run(backendSessionId, new Date().toISOString(), sessionId);
   }
 
-  appendMessage(sessionId: string, message: StoredMessage): void {
+  updateSessionTitle(sessionId: string, title: string): void {
     this.database
-      .prepare(
-        `INSERT INTO messages (
-          id, session_id, role, text, reasoning, tools_json, items_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+      .prepare("UPDATE sessions SET title = ? WHERE id = ?")
+      .run(title, sessionId);
+  }
+
+  appendMessage(sessionId: string, message: StoredMessage): void {
+    const insertMessage = this.database.prepare(
+      `INSERT INTO messages (
+        id,
+        session_id,
+        role,
+        text,
+        reasoning,
+        tools_json,
+        items_json,
+        status,
+        error,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const updateSession = this.database.prepare(
+      "UPDATE sessions SET updated_at = ? WHERE id = ?",
+    );
+    const append = this.database.transaction(() => {
+      insertMessage.run(
         message.id,
         sessionId,
         message.role,
@@ -146,11 +181,13 @@ export class DiscoStore {
         message.reasoning ?? null,
         message.toolCalls ? JSON.stringify(message.toolCalls) : null,
         message.items ? JSON.stringify(message.items) : null,
+        message.status ?? null,
+        message.error ?? null,
         message.createdAt,
       );
-    this.database
-      .prepare("UPDATE sessions SET updated_at = ? WHERE id = ?")
-      .run(message.createdAt, sessionId);
+      updateSession.run(message.createdAt, sessionId);
+    });
+    append();
   }
 
   messages(sessionId: string): StoredMessage[] {
@@ -163,21 +200,36 @@ export class DiscoStore {
           reasoning,
           tools_json AS toolsJson,
           items_json AS itemsJson,
+          status,
+          error,
           created_at AS createdAt
         FROM messages
         WHERE session_id = ?
-        ORDER BY created_at`,
+        ORDER BY created_at, rowid`,
       )
       .all(sessionId) as StoredMessageRow[];
 
-    return rows.map(({ toolsJson, itemsJson, reasoning, ...message }) => ({
-      ...message,
-      reasoning: reasoning ?? undefined,
-      toolCalls: toolsJson ? (JSON.parse(toolsJson) as ToolCall[]) : undefined,
-      ...(itemsJson
-        ? { items: JSON.parse(itemsJson) as StoredMessage["items"] }
-        : {}),
-    }));
+    return rows.map(
+      ({ toolsJson, itemsJson, reasoning, status, error, id, ...message }) => ({
+        id,
+        ...message,
+        reasoning: reasoning ?? undefined,
+        ...(toolsJson !== null
+          ? { toolCalls: parseJsonColumn<ToolCall[]>(toolsJson, id, "工具调用") }
+          : {}),
+        ...(itemsJson !== null
+          ? {
+              items: parseJsonColumn<NonNullable<StoredMessage["items"]>>(
+                itemsJson,
+                id,
+                "消息项",
+              ),
+            }
+          : {}),
+        ...(status ? { status } : {}),
+        ...(error ? { error } : {}),
+      }),
+    );
   }
 
   getProject(projectId: string): ProjectInfo | undefined {
@@ -197,6 +249,22 @@ export class DiscoStore {
   }
 
   close(): void {
+    if (this.isClosed) {
+      return;
+    }
+    this.isClosed = true;
     this.database.close();
+  }
+}
+
+function parseJsonColumn<Value>(
+  value: string,
+  messageId: string,
+  columnName: string,
+): Value {
+  try {
+    return JSON.parse(value) as Value;
+  } catch {
+    throw new Error(`消息 ${messageId} 的${columnName}数据已损坏`);
   }
 }

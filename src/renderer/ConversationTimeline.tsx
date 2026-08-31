@@ -6,9 +6,12 @@ import type {
   SessionInfo,
   MessageItem,
   StoredMessage,
+  ToolCallStatus,
 } from "../shared/types";
 
 export interface PendingApproval {
+  sessionId: string;
+  runId: string;
   approvalId: string;
   toolName: string;
   title?: string;
@@ -18,7 +21,7 @@ export interface PendingApproval {
 interface ConversationTimelineProps {
   activeSession?: SessionInfo;
   messages: StoredMessage[];
-  pendingApproval: PendingApproval | null;
+  pendingApprovals: PendingApproval[];
   providers: ProviderInfo[];
   onAddProject: () => void;
   onAddSession: (backend: BackendKind) => void;
@@ -33,6 +36,28 @@ function itemStateLabel(state: MessageItem["state"]): string {
       return "更新中";
     case "completed":
       return "完成";
+  }
+}
+
+function toolStatusLabel(status: ToolCallStatus): string {
+  switch (status) {
+    case "started":
+      return "运行中";
+    case "completed":
+      return "完成";
+    case "failed":
+      return "失败";
+  }
+}
+
+function toolStatusIcon(status: ToolCallStatus): string {
+  switch (status) {
+    case "started":
+      return "◌";
+    case "completed":
+      return "✓";
+    case "failed":
+      return "×";
   }
 }
 
@@ -174,7 +199,7 @@ function renderMessageItem(item: MessageItem): JSX.Element {
 export function ConversationTimeline({
   activeSession,
   messages,
-  pendingApproval,
+  pendingApprovals,
   providers,
   onAddProject,
   onAddSession,
@@ -212,42 +237,50 @@ export function ConversationTimeline({
 
       {messages.map((message) => (
         <article className={`message ${message.role}`} key={message.id}>
-          {message.items ? (
+          {message.reasoning && (
+            <details className="reasoning-block">
+              <summary>分析过程</summary>
+              <pre>{message.reasoning}</pre>
+            </details>
+          )}
+          {message.text && <div className="message-text">{message.text}</div>}
+          {message.items && (
             <div className="timeline-items">
               {message.items.map((item) => (
                 <div key={item.id}>{renderMessageItem(item)}</div>
               ))}
             </div>
-          ) : (
-            <>
-              {message.reasoning && (
-                <details className="reasoning-block">
-                  <summary>分析过程</summary>
-                  <pre>{message.reasoning}</pre>
-                </details>
+          )}
+          {message.toolCalls?.map((toolCall) => (
+            <div className="tool-block" key={toolCall.id}>
+              <div className="tool-block-header">
+                <span className={`tool-icon ${toolCall.status}`}>
+                  {toolStatusIcon(toolCall.status)}
+                </span>
+                <span className="tool-name">{toolCall.name}</span>
+                <span className="tool-status">
+                  {toolStatusLabel(toolCall.status)}
+                </span>
+              </div>
+              {toolCall.error && (
+                <div className="item-error-text">{toolCall.error}</div>
               )}
-              {message.text && <div className="message-text">{message.text}</div>}
-              {message.toolCalls?.map((toolCall) => (
-                <div className="tool-block" key={toolCall.id}>
-                  <div className="tool-block-header">
-                    <span className="tool-icon">
-                      {toolCall.status === "completed" ? "✓" : "◌"}
-                    </span>
-                    <span className="tool-name">{toolCall.name}</span>
-                    <span className="tool-status">
-                      {toolCall.status === "started" ? "运行中" : "完成"}
-                    </span>
-                  </div>
-                  {toolCall.output && <pre className="tool-output">{toolCall.output}</pre>}
-                </div>
-              ))}
-            </>
+              {toolCall.output && (
+                <pre className="tool-output">{toolCall.output}</pre>
+              )}
+            </div>
+          ))}
+          {message.error && (
+            <div className="message-run-error">运行失败：{message.error}</div>
+          )}
+          {message.status === "cancelled" && (
+            <div className="message-run-cancelled">运行已取消</div>
           )}
         </article>
       ))}
 
-      {pendingApproval && (
-        <div className="approval-card">
+      {pendingApprovals.map((pendingApproval) => (
+        <div className="approval-card" key={pendingApproval.approvalId}>
           <div className="approval-head">
             <span className="approval-icon">⚠</span>
             <strong>{pendingApproval.title ?? pendingApproval.toolName}</strong>
@@ -270,7 +303,7 @@ export function ConversationTimeline({
             </button>
           </div>
         </div>
-      )}
+      ))}
     </div>
   );
 }

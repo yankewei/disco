@@ -9,7 +9,7 @@ Disco 是仅面向 macOS 的 Electron + TypeScript coding agent 桌面应用。
 - Electron 主进程负责项目、会话、运行协调、本地持久化和系统能力。
 - React renderer 只负责界面，不持有 Node.js 权限或后端凭据。
 - preload 通过受限 `contextBridge` 暴露经过主进程校验的 IPC。
-- Codex、Claude Code 和 OpenCode 分别通过各自的本地 SDK 或运行时接入。
+- Codex 通过本地 Codex CLI app-server 接入；Claude Code 和 OpenCode 保留各自运行时。
 - SQLite 保存项目、会话和消息镜像；官方运行时继续管理各后端的登录态。
 
 更完整的边界说明见 `docs/architecture.md`。
@@ -17,7 +17,7 @@ Disco 是仅面向 macOS 的 Electron + TypeScript coding agent 桌面应用。
 ## 技术栈
 
 - Electron、TypeScript、React、Vite
-- `@openai/codex-sdk`、`@anthropic-ai/claude-agent-sdk`
+- Codex CLI app-server、`@anthropic-ai/claude-agent-sdk`
 - OpenCode 本地 HTTP 接口
 - `better-sqlite3`（WAL 模式）
 - Zod（IPC 输入校验）

@@ -1,5 +1,9 @@
 import { type JSX, useEffect, useState } from "react";
-import type { AboutInfo, BackendKind, ProviderInfo } from "../shared/types";
+import type {
+  AboutInfo,
+  BackendKind,
+  ProviderInfo,
+} from "../shared/types";
 import {
   loadDisabledProviders,
   saveDisabledProviders,
@@ -18,6 +22,10 @@ const settingsSections = [
 
 type SettingsSection = (typeof settingsSections)[number]["key"];
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "加载设置失败";
+}
+
 export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [about, setAbout] = useState<AboutInfo>();
@@ -30,19 +38,25 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
   const [openInstallGuide, setOpenInstallGuide] = useState<BackendKind>();
   const [copiedHint, setCopiedHint] = useState<string>();
   const [checkedAt, setCheckedAt] = useState<number>();
+  const [settingsError, setSettingsError] = useState<string>();
 
   useEffect(() => {
     void refreshProviders();
   }, []);
 
   async function refreshProviders(): Promise<void> {
-    const [providerInfo, appInfo] = await Promise.all([
-      window.disco.providers(),
-      window.disco.about(),
-    ]);
-    setProviders(providerInfo);
-    setAbout(appInfo);
-    setCheckedAt(Date.now());
+    try {
+      setSettingsError(undefined);
+      const [providerInfo, appInfo] = await Promise.all([
+        window.disco.providers(),
+        window.disco.about(),
+      ]);
+      setProviders(providerInfo);
+      setAbout(appInfo);
+      setCheckedAt(Date.now());
+    } catch (error) {
+      setSettingsError(errorMessage(error));
+    }
   }
 
   function toggleProvider(kind: BackendKind): void {
@@ -117,12 +131,16 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
 
         {activeSection === "providers" ? (
           <div className="panel-card">
+            {settingsError && (
+              <div className="workspace-error" role="alert">
+                {settingsError}
+              </div>
+            )}
             <header className="panel-head">
               <div>
                 <h3>编程智能体</h3>
                 <p className="panel-sub">
-                  Disco
-                  调用安装在这台电脑上的智能体命令行工具。请先安装相应工具或完成登录，然后刷新。
+                  Disco 调用本机的智能体命令行工具。请先安装相应工具或完成登录，然后刷新。
                 </p>
               </div>
               <div className="panel-refresh">
@@ -156,14 +174,12 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                       {provider.available ? (
                         <span className="agent-status">
                           <i className="dot ready" />
-                          {provider.evidence && (
-                            <code>{provider.evidence}</code>
-                          )}
+                          <span>{provider.detail}</span>
                         </span>
                       ) : (
                         <span className="agent-status">
                           <i className="dot missing" />
-                          未检测到登录态或工具
+                          {provider.detail}
                         </span>
                       )}
                     </div>
@@ -238,6 +254,11 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
           </div>
         ) : (
           <div className="panel-card">
+            {settingsError && (
+              <div className="workspace-error" role="alert">
+                {settingsError}
+              </div>
+            )}
             <header className="panel-head">
               <div>
                 <h3>数据与应用</h3>

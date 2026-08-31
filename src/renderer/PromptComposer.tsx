@@ -65,6 +65,7 @@ export function PromptComposer({
           className="attach"
           aria-label="添加上下文"
           title="添加文件或目录作为上下文"
+          disabled={running}
           onClick={() => onAttachContext(true)}
         >
           +
@@ -74,6 +75,7 @@ export function PromptComposer({
           className="context-action"
           aria-label="引用文件"
           title="引用文件"
+          disabled={running}
           onClick={() => onAttachContext(false)}
         >
           @
@@ -103,7 +105,7 @@ export function PromptComposer({
             type="checkbox"
             checked={planMode}
             onChange={(event) => onPlanModeChange(event.target.checked)}
-            disabled={!activeSession || !supportsPlan}
+            disabled={running || !activeSession || !supportsPlan}
           />
           <span>计划模式</span>
         </label>
