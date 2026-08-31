@@ -44,6 +44,9 @@ export class CodexBackend implements AgentBackend {
 
   async run({
     backendSessionId,
+    modelId,
+    reasoningEffort,
+    sandboxMode,
     workingDirectory,
     prompt,
     mode,
@@ -56,12 +59,14 @@ export class CodexBackend implements AgentBackend {
       throw new Error("运行已取消");
     }
 
-    const sandbox = mode === "plan" ? "read-only" : "workspace-write";
+    const sandbox =
+      mode === "plan" ? "read-only" : sandboxMode ?? "workspace-write";
     const approvalPolicy = mode === "plan" ? "never" : "on-request";
     const threadParams = {
       cwd: workingDirectory,
       approvalPolicy,
       sandbox,
+      ...(modelId ? { model: modelId } : {}),
     } as const;
     const thread = backendSessionId
       ? await this.appServer.resumeThread({
@@ -106,6 +111,7 @@ export class CodexBackend implements AgentBackend {
       const turn = await this.appServer.startTurn({
         threadId,
         input: [{ type: "text", text: prompt }],
+        ...(reasoningEffort ? { effort: reasoningEffort } : {}),
       });
       activeTurn.turnId = turn.turn.id;
       if (signal.aborted) {

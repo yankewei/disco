@@ -20,6 +20,7 @@ export class ClaudeBackend implements AgentBackend {
 
   async run({
     backendSessionId,
+    modelId,
     workingDirectory,
     prompt,
     mode,
@@ -52,6 +53,7 @@ export class ClaudeBackend implements AgentBackend {
         options: {
           cwd: workingDirectory,
           resume: backendSessionId,
+          ...(modelId ? { model: modelId } : {}),
           abortController,
           includePartialMessages: true,
           permissionMode: mode === "plan" ? "plan" : "default",

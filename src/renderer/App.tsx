@@ -1,9 +1,12 @@
 import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
+import { defaultSandboxMode } from "../shared/types";
 import type {
   AgentEvent,
   BackendKind,
   ProjectInfo,
   ProviderInfo,
+  ReasoningEffort,
+  SandboxMode,
   SessionInfo,
   StoredMessage,
 } from "../shared/types";
@@ -19,6 +22,7 @@ import {
 } from "./providerPreferences";
 import { SettingsView } from "./SettingsView";
 import { WorkspaceSidebar } from "./WorkspaceSidebar";
+import { localizeSessionTitle, useI18n } from "./i18n";
 
 const providerNames: Record<BackendKind, string> = {
   codex: "Codex",
@@ -79,6 +83,7 @@ function Workspace({
 }: {
   onOpenSettings: () => void;
 }): JSX.Element {
+  const { locale, t } = useI18n();
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [sessionsByProject, setSessionsByProject] = useState<
     Map<string, SessionInfo[]>
@@ -93,6 +98,11 @@ function Workspace({
   );
   const [planMode, setPlanMode] = useState(false);
   const [backend, setBackend] = useState<BackendKind>("codex");
+  const [modelId, setModelId] = useState<string>();
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ReasoningEffort>();
+  const [sandboxMode, setSandboxMode] =
+    useState<SandboxMode>(defaultSandboxMode);
   const [pendingApprovals, setPendingApprovals] = useState<
     Map<string, PendingApproval>
   >(() => new Map());
@@ -101,7 +111,7 @@ function Workspace({
     () => new Set(),
   );
   const detectedProviders = useRef<ProviderInfo[]>([]);
-  const activeSessionIdRef = useRef<string>();
+  const activeSessionIdRef = useRef<string | undefined>(undefined);
   const backendRef = useRef(backend);
   const activeRunIdBySession = useRef<Map<string, string>>(new Map());
   const sessionSelectionVersion = useRef(0);
@@ -126,9 +136,11 @@ function Workspace({
         (approval) => approval.sessionId === activeSessionId,
       )
     : [];
-  const title =
-    activeSession?.title ??
-    (activeProject ? "新对话" : "开始使用 Disco");
+  const title = activeSession
+    ? localizeSessionTitle(activeSession.title, locale)
+    : activeProject
+      ? t("newConversation")
+      : t("startUsingDisco");
 
   useEffect(() => {
     let isMounted = true;
@@ -181,7 +193,7 @@ function Workspace({
     setWorkspaceError(undefined);
     const [projectList, providerList] = await Promise.all([
       window.disco.listProjects(),
-      window.disco.providers(),
+      window.disco.providers(locale),
     ]);
     setProjects(projectList);
     detectedProviders.current = providerList;
@@ -204,6 +216,9 @@ function Workspace({
       setSelectedProjectId(undefined);
       setActiveSessionId(undefined);
       setPlanMode(false);
+      setModelId(undefined);
+      setReasoningEffort(undefined);
+      setSandboxMode(defaultSandboxMode);
       setMessages([]);
       return;
     }
@@ -240,6 +255,9 @@ function Workspace({
       } else {
         setActiveSessionId(undefined);
         setPlanMode(false);
+        setModelId(undefined);
+        setReasoningEffort(undefined);
+        setSandboxMode(defaultSandboxMode);
         setMessages([]);
       }
     } catch (error) {
@@ -275,6 +293,9 @@ function Workspace({
       setSelectedProjectId(session.projectId);
       setActiveSessionId(session.sessionId);
       setBackend(session.backend);
+      setModelId(session.modelId);
+      setReasoningEffort(session.reasoningEffort);
+      setSandboxMode(session.sandboxMode ?? defaultSandboxMode);
       setPlanMode(false);
       setMessages([]);
       const loadedMessages = await window.disco.loadMessages(session.sessionId);
@@ -296,7 +317,7 @@ function Workspace({
         return undefined;
       }
 
-      const project = await window.disco.createProject(selectedPath);
+      const project = await window.disco.createProject(selectedPath, locale);
       setProjects((current) => [
         project,
         ...current.filter((item) => item.id !== project.id),
@@ -312,6 +333,11 @@ function Workspace({
 
   async function addSession(
     selectedBackend: BackendKind = backend,
+    selectedModelId: string | undefined = modelId,
+    selectedReasoningEffort: ReasoningEffort | undefined =
+      selectedBackend === backend ? reasoningEffort : undefined,
+    selectedSandboxMode: SandboxMode =
+      selectedBackend === backend ? sandboxMode : defaultSandboxMode,
   ): Promise<SessionInfo | undefined> {
     try {
       const targetProjectId = selectedProjectId ?? (await addProject())?.id;
@@ -327,9 +353,19 @@ function Workspace({
         throw new Error("没有可用的 Agent，请先完成登录或安装配置");
       }
 
+      const selectedProvider = providers.find(
+        (provider) => provider.kind === usableBackend,
+      );
+      const effectiveModelId =
+        selectedModelId ?? selectedProvider?.models[0]?.id;
+
       const session = await window.disco.createSession(
         targetProjectId,
         usableBackend,
+        effectiveModelId,
+        selectedReasoningEffort,
+        selectedSandboxMode,
+        locale,
       );
       setSessionsByProject((current) => {
         const next = new Map(current);
@@ -356,9 +392,16 @@ function Workspace({
       if (!usableBackend) {
         throw new Error("没有可用的 Agent，请先完成登录或安装配置");
       }
+      const selectedProvider = providers.find(
+        (provider) => provider.kind === usableBackend,
+      );
       const session = await window.disco.createSession(
         projectId,
         usableBackend,
+        selectedProvider?.models[0]?.id,
+        usableBackend === backend ? reasoningEffort : undefined,
+        usableBackend === backend ? sandboxMode : defaultSandboxMode,
+        locale,
       );
       setSessionsByProject((current) => {
         const next = new Map(current);
@@ -372,6 +415,41 @@ function Workspace({
     } catch (error) {
       setWorkspaceError(errorMessage(error));
     }
+  }
+
+  function changeSelection(
+    nextBackend: BackendKind,
+    nextModelId?: string,
+    nextReasoningEffort?: ReasoningEffort,
+    nextSandboxMode?: SandboxMode,
+  ): void {
+    if (running) {
+      return;
+    }
+    const activeProvider = providers.find(
+      (provider) => provider.kind === activeSession?.backend,
+    );
+    const activeModelId =
+      activeSession?.modelId ?? activeProvider?.models[0]?.id;
+    const effectiveSandboxMode =
+      nextSandboxMode ??
+      (nextBackend === backend ? sandboxMode : defaultSandboxMode);
+    if (
+      activeSession &&
+      (nextBackend !== activeSession.backend ||
+        nextModelId !== activeModelId ||
+        nextReasoningEffort !== activeSession.reasoningEffort ||
+        effectiveSandboxMode !==
+          (activeSession.sandboxMode ?? defaultSandboxMode))
+    ) {
+      setActiveSessionId(undefined);
+      setMessages([]);
+      setPlanMode(false);
+    }
+    setBackend(nextBackend);
+    setModelId(nextModelId);
+    setReasoningEffort(nextReasoningEffort);
+    setSandboxMode(effectiveSandboxMode);
   }
 
   async function attachContext(withDirectories: boolean): Promise<void> {
@@ -600,14 +678,14 @@ function Workspace({
     });
 
     const activeProvider = providers.find(
-      (provider) => provider.kind === activeSession?.backend,
+      (provider) => provider.kind === backend,
     );
     const requestedMode =
       activeSession && planMode && activeProvider?.supportsPlan
         ? "plan"
         : "agent";
     try {
-      await window.disco.prompt(sessionId, text, requestedMode);
+      await window.disco.prompt(sessionId, text, requestedMode, locale);
     } catch (error) {
       const runWasStarted = activeRunIdBySession.current.has(sessionId);
       if (runWasStarted) {
@@ -633,9 +711,9 @@ function Workspace({
     }
   }
 
-  let statusLabel = "准备就绪";
+  let statusLabel = t("ready");
   if (running) {
-    statusLabel = "正在处理";
+    statusLabel = t("working");
   } else if (activeSession) {
     statusLabel = providerNames[activeSession.backend];
   }
@@ -661,7 +739,7 @@ function Workspace({
       <section className="conversation">
         <header className="workspace-header">
           <div>
-            <span className="crumb">{activeProject?.name ?? "工作区"}</span>
+            <span className="crumb">{activeProject?.name ?? t("workspace")}</span>
             <h1>{title}</h1>
           </div>
           <div className="header-actions">
@@ -699,13 +777,17 @@ function Workspace({
           activeSessionId={activeSessionId}
           backend={backend}
           draft={draft}
+          hasProject={Boolean(activeProject)}
+          modelId={modelId}
+          reasoningEffort={reasoningEffort}
+          sandboxMode={sandboxMode}
           planMode={planMode}
           providers={providers}
           running={running}
           onAttachContext={(withDirectories) =>
             void attachContext(withDirectories)
           }
-          onBackendChange={setBackend}
+          onSelectionChange={changeSelection}
           onDraftChange={setDraft}
           onPlanModeChange={setPlanMode}
           onSend={(formEvent) => void send(formEvent)}

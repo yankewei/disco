@@ -29,6 +29,9 @@ describe("DiscoStore", () => {
       sessionId: "s",
       projectId: "p",
       backend: "codex",
+      modelId: "o3",
+      reasoningEffort: "high",
+      sandboxMode: "workspace-write",
       title: "新对话",
       updatedAt: project.createdAt,
     });
@@ -63,7 +66,18 @@ describe("DiscoStore", () => {
     });
 
     expect(store.listProjects()).toEqual([project]);
-    expect(store.listSessions("p")).toHaveLength(1);
+    expect(store.listSessions("p")).toEqual([
+      {
+        sessionId: "s",
+        projectId: "p",
+        backend: "codex",
+        modelId: "o3",
+        reasoningEffort: "high",
+        sandboxMode: "workspace-write",
+        title: "新对话",
+        updatedAt: project.createdAt,
+      },
+    ]);
     expect(store.messages("s")).toEqual([
       {
         id: "m",

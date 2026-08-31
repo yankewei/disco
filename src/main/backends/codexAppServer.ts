@@ -1,6 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import type {
+  ModelInfo,
+  ReasoningEffort,
+  SandboxMode,
+} from "../../shared/types.js";
 import { findExecutable } from "./executable.js";
 
 export type JsonRpcId = number | string;
@@ -223,8 +228,9 @@ export class JsonRpcConnection {
 
 export interface ThreadStartParams {
   cwd: string;
+  model?: string;
   approvalPolicy: "never" | "on-request";
-  sandbox: "read-only" | "workspace-write";
+  sandbox: SandboxMode;
 }
 
 export interface ThreadResumeParams extends ThreadStartParams {
@@ -234,6 +240,7 @@ export interface ThreadResumeParams extends ThreadStartParams {
 export interface TurnStartParams {
   threadId: string;
   input: Array<{ type: "text"; text: string }>;
+  effort?: ReasoningEffort;
 }
 
 export interface TurnInterruptParams {
@@ -322,6 +329,35 @@ export class CodexAppServer implements CodexAppServerClient {
   async startTurn(params: TurnStartParams): Promise<TurnResponse> {
     return this.request<TurnResponse>("turn/start", params);
   }
+
+  async listModels(): Promise<ModelInfo[]> {
+    const models: ModelInfo[] = [];
+    let cursor: string | undefined;
+    do {
+      const params: { limit: number; includeHidden: boolean; cursor?: string } =
+        {
+          limit: 100,
+          includeHidden: false,
+        };
+      if (cursor) {
+        params.cursor = cursor;
+      }
+      const result = await this.request<unknown>("model/list", params);
+      const resultRecord = recordValue(result);
+      const data = Array.isArray(resultRecord?.data)
+        ? resultRecord.data
+        : [];
+      for (const item of data) {
+        const model = toModelInfo(item);
+        if (model && !models.some((existing) => existing.id === model.id)) {
+          models.push(model);
+        }
+      }
+      cursor = stringValue(resultRecord?.nextCursor);
+    } while (cursor);
+    return models;
+  }
+
   async interruptTurn(params: TurnInterruptParams): Promise<unknown> {
     return this.request("turn/interrupt", params);
   }
@@ -502,6 +538,17 @@ export class CodexAppServer implements CodexAppServerClient {
   }
 }
 
+export async function listCodexModels(): Promise<ModelInfo[]> {
+  const appServer = new CodexAppServer();
+  try {
+    return await appServer.listModels();
+  } catch {
+    return [];
+  } finally {
+    await appServer.shutdown();
+  }
+}
+
 async function terminateChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
@@ -553,4 +600,42 @@ function appServerErrorValue(value: unknown): AppServerError | undefined {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+const reasoningEffortValues: ReasoningEffort[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+];
+
+function toModelInfo(value: unknown): ModelInfo | undefined {
+  const model = recordValue(value);
+  if (!model) {
+    return undefined;
+  }
+  const id = stringValue(model?.id);
+  if (!id || model?.hidden === true) {
+    return undefined;
+  }
+  const name = stringValue(model.displayName) ?? id;
+  const reasoningEfforts = Array.isArray(model.supportedReasoningEfforts)
+    ? model.supportedReasoningEfforts.flatMap((item) => {
+        const effort = recordValue(item)?.reasoningEffort;
+        return typeof effort === "string" && reasoningEffortValues.includes(
+          effort as ReasoningEffort,
+        )
+          ? [effort as ReasoningEffort]
+          : [];
+      })
+    : [];
+  return {
+    id,
+    name,
+    ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+  };
 }

@@ -1,8 +1,23 @@
 export type BackendKind = "codex" | "claude" | "opencode";
+export type Locale = "zh-CN" | "en-US";
 export type RunMode = "agent" | "plan";
 export type ApprovalDecision = "approved" | "denied";
 export type RunStatus = "completed" | "cancelled" | "failed";
 export type ToolCallStatus = "started" | "completed" | "failed";
+export type SandboxMode =
+  | "read-only"
+  | "workspace-write"
+  | "danger-full-access";
+export const defaultSandboxMode: SandboxMode = "workspace-write";
+export type ReasoningEffort =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra"
+  | "persistent";
 
 export interface ProjectInfo {
   id: string;
@@ -15,6 +30,9 @@ export interface SessionInfo {
   sessionId: string;
   projectId: string;
   backend: BackendKind;
+  modelId?: string;
+  reasoningEffort?: ReasoningEffort;
+  sandboxMode?: SandboxMode;
   backendSessionId?: string;
   title: string;
   updatedAt: string;
@@ -150,14 +168,26 @@ export type AgentEvent =
 
 export interface DiscoAPI {
   listProjects(): Promise<ProjectInfo[]>;
-  createProject(path: string): Promise<ProjectInfo>;
+  createProject(path: string, locale?: Locale): Promise<ProjectInfo>;
   listSessions(projectId: string): Promise<SessionInfo[]>;
-  createSession(projectId: string, backend: BackendKind): Promise<SessionInfo>;
+  createSession(
+    projectId: string,
+    backend: BackendKind,
+    modelId?: string,
+    reasoningEffort?: ReasoningEffort,
+    sandboxMode?: SandboxMode,
+    locale?: Locale,
+  ): Promise<SessionInfo>;
   loadMessages(sessionId: string): Promise<StoredMessage[]>;
-  prompt(sessionId: string, text: string, mode: RunMode): Promise<void>;
+  prompt(
+    sessionId: string,
+    text: string,
+    mode: RunMode,
+    locale?: Locale,
+  ): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   approve(approvalId: string, decision: ApprovalDecision): Promise<void>;
-  providers(): Promise<ProviderInfo[]>;
+  providers(locale?: Locale): Promise<ProviderInfo[]>;
   about(): Promise<AboutInfo>;
   chooseDirectory(): Promise<string | null>;
   chooseFiles(withDirectories: boolean): Promise<string[]>;
@@ -167,6 +197,7 @@ export interface DiscoAPI {
 export interface ModelInfo {
   id: string;
   name: string;
+  reasoningEfforts?: ReasoningEffort[];
 }
 
 export interface ProviderInfo {

@@ -10,6 +10,14 @@ const uuidSchema = z.string().uuid();
 const backendSchema = z.enum(["codex", "claude", "opencode"]);
 const runModeSchema = z.enum(["agent", "plan"]);
 const approvalDecisionSchema = z.enum(["approved", "denied"]);
+const localeSchema = z.enum(["zh-CN", "en-US"]).optional();
+const modelIdSchema = z.string().trim().min(1).max(200).optional();
+const reasoningEffortSchema = z
+  .enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent"])
+  .optional();
+const sandboxModeSchema = z
+  .enum(["read-only", "workspace-write", "danger-full-access"])
+  .optional();
 const rendererDevUrl = process.env.VITE_DEV_SERVER_URL;
 const preloadPath = join(import.meta.dirname, "../preload/index.cjs");
 const rendererPath = join(
@@ -101,21 +109,39 @@ ipcMain.handle("disco:projects", (event) => {
   assertTrustedRenderer(event);
   return getHost().listProjects();
 });
-ipcMain.handle("disco:create-project", (event, path: unknown) => {
+ipcMain.handle(
+  "disco:create-project",
+  (event, path: unknown, locale: unknown) => {
   assertTrustedRenderer(event);
-  return getHost().createProject(z.string().min(1).parse(path));
-});
+    return getHost().createProject(
+      z.string().min(1).parse(path),
+      localeSchema.parse(locale),
+    );
+  },
+);
 ipcMain.handle("disco:sessions", (event, projectId: unknown) => {
   assertTrustedRenderer(event);
   return getHost().listSessions(uuidSchema.parse(projectId));
 });
 ipcMain.handle(
   "disco:create-session",
-  (event, projectId: unknown, backend: unknown) => {
+  (
+    event,
+    projectId: unknown,
+    backend: unknown,
+    modelId: unknown,
+    reasoningEffort: unknown,
+    sandboxMode: unknown,
+    locale: unknown,
+  ) => {
     assertTrustedRenderer(event);
     return getHost().createSession(
       uuidSchema.parse(projectId),
       backendSchema.parse(backend),
+      modelIdSchema.parse(modelId),
+      reasoningEffortSchema.parse(reasoningEffort),
+      sandboxModeSchema.parse(sandboxMode),
+      localeSchema.parse(locale),
     );
   },
 );
@@ -125,12 +151,19 @@ ipcMain.handle("disco:messages", (event, sessionId: unknown) => {
 });
 ipcMain.handle(
   "disco:prompt",
-  async (event, sessionId: unknown, text: unknown, mode: unknown) => {
+  async (
+    event,
+    sessionId: unknown,
+    text: unknown,
+    mode: unknown,
+    locale: unknown,
+  ) => {
     assertTrustedRenderer(event);
     await getHost().prompt(
       uuidSchema.parse(sessionId),
       z.string().trim().min(1).max(100_000).parse(text),
       runModeSchema.parse(mode),
+      localeSchema.parse(locale),
     );
   },
 );
@@ -148,9 +181,9 @@ ipcMain.handle(
     );
   },
 );
-ipcMain.handle("disco:providers", (event) => {
+ipcMain.handle("disco:providers", (event, locale: unknown) => {
   assertTrustedRenderer(event);
-  return getHost().providers();
+  return getHost().providers(localeSchema.parse(locale));
 });
 
 ipcMain.handle("disco:about", (event) => {

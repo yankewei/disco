@@ -1,32 +1,21 @@
 import { type JSX, useEffect, useState } from "react";
-import type {
-  AboutInfo,
-  BackendKind,
-  ProviderInfo,
-} from "../shared/types";
+import type { AboutInfo, BackendKind, ProviderInfo } from "../shared/types";
 import {
   loadDisabledProviders,
   saveDisabledProviders,
 } from "./providerPreferences";
-
-const providerIcons: Record<BackendKind, { glyph: string; tint: string }> = {
-  codex: { glyph: "❋", tint: "#272725" },
-  claude: { glyph: "✳", tint: "#d9774b" },
-  opencode: { glyph: "◆", tint: "#6f6d69" },
-};
+import { providerIcons } from "./providerIcons";
+import { useI18n } from "./i18n";
 
 const settingsSections = [
-  { key: "providers", label: "服务商", icon: "☁" },
-  { key: "general", label: "通用", icon: "⚙" },
+  { key: "providers", labelKey: "settingsProviders", icon: "☁" },
+  { key: "general", labelKey: "settingsGeneral", icon: "⚙" },
 ] as const;
 
 type SettingsSection = (typeof settingsSections)[number]["key"];
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "加载设置失败";
-}
-
 export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element {
+  const { locale, setLocale, t } = useI18n();
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [about, setAbout] = useState<AboutInfo>();
   const [activeSection, setActiveSection] =
@@ -38,25 +27,19 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
   const [openInstallGuide, setOpenInstallGuide] = useState<BackendKind>();
   const [copiedHint, setCopiedHint] = useState<string>();
   const [checkedAt, setCheckedAt] = useState<number>();
-  const [settingsError, setSettingsError] = useState<string>();
 
   useEffect(() => {
     void refreshProviders();
-  }, []);
+  }, [locale]);
 
   async function refreshProviders(): Promise<void> {
-    try {
-      setSettingsError(undefined);
-      const [providerInfo, appInfo] = await Promise.all([
-        window.disco.providers(),
-        window.disco.about(),
-      ]);
-      setProviders(providerInfo);
-      setAbout(appInfo);
-      setCheckedAt(Date.now());
-    } catch (error) {
-      setSettingsError(errorMessage(error));
-    }
+    const [providerInfo, appInfo] = await Promise.all([
+      window.disco.providers(locale),
+      window.disco.about(),
+    ]);
+    setProviders(providerInfo);
+    setAbout(appInfo);
+    setCheckedAt(Date.now());
   }
 
   function toggleProvider(kind: BackendKind): void {
@@ -84,7 +67,8 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
   );
   const visibleSections = settingsSections.filter(
     (section) =>
-      !normalizedQuery || section.label.toLowerCase().includes(normalizedQuery),
+      !normalizedQuery ||
+      t(section.labelKey).toLowerCase().includes(normalizedQuery),
   );
 
   let checkedLabel: string | undefined;
@@ -95,21 +79,21 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
     );
     checkedLabel =
       Date.now() - checkedAt < 60_000
-        ? "刚刚检查过"
-        : `${minutesSinceCheck} 分钟前检查`;
+        ? t("justChecked")
+        : t("minutesAgo", { minutes: minutesSinceCheck });
   }
 
   return (
     <div className="settings standalone">
       <div className="settings-body">
-        <nav className="settings-nav" aria-label="设置导航">
+        <nav className="settings-nav" aria-label={t("settingsNavigation")}>
           <button className="settings-back" onClick={onClose}>
-            ← 返回
+            ← {t("back")}
           </button>
           <input
             className="settings-search"
             type="search"
-            placeholder="搜索设置"
+            placeholder={t("searchSettings")}
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
           />
@@ -124,31 +108,24 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
               <span className="nav-icon" aria-hidden="true">
                 {section.icon}
               </span>
-              <span>{section.label}</span>
+              <span>{t(section.labelKey)}</span>
             </button>
           ))}
         </nav>
 
         {activeSection === "providers" ? (
           <div className="panel-card">
-            {settingsError && (
-              <div className="workspace-error" role="alert">
-                {settingsError}
-              </div>
-            )}
             <header className="panel-head">
               <div>
-                <h3>编程智能体</h3>
-                <p className="panel-sub">
-                  Disco 调用本机的智能体命令行工具。请先安装相应工具或完成登录，然后刷新。
-                </p>
+                <h3>{t("codingAgents")}</h3>
+                <p className="panel-sub">{t("providersDescription")}</p>
               </div>
               <div className="panel-refresh">
                 <button
                   className="quiet"
                   onClick={() => void refreshProviders()}
                 >
-                  ⟳ 刷新
+                  ⟳ {t("refresh")}
                 </button>
                 {checkedLabel && <small>{checkedLabel}</small>}
               </div>
@@ -168,18 +145,20 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                       <strong>
                         {provider.name}
                         {disabledProviders.includes(provider.kind) && (
-                          <em className="agent-off">已停用</em>
+                          <em className="agent-off">{t("disabled")}</em>
                         )}
                       </strong>
                       {provider.available ? (
                         <span className="agent-status">
                           <i className="dot ready" />
-                          <span>{provider.detail}</span>
+                          {provider.evidence && (
+                            <code>{provider.evidence}</code>
+                          )}
                         </span>
                       ) : (
                         <span className="agent-status">
                           <i className="dot missing" />
-                          {provider.detail}
+                          {t("providerUnavailable")}
                         </span>
                       )}
                     </div>
@@ -188,15 +167,17 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                         className="switch"
                         title={
                           disabledProviders.includes(provider.kind)
-                            ? "启用该智能体"
-                            : "停用该智能体"
+                            ? t("enableAgent")
+                            : t("disableAgent")
                         }
                       >
                         <input
                           type="checkbox"
                           checked={!disabledProviders.includes(provider.kind)}
                           onChange={() => toggleProvider(provider.kind)}
-                          aria-label={`启用 ${provider.name}`}
+                          aria-label={t("enableProvider", {
+                            provider: provider.name,
+                          })}
                         />
                         <span aria-hidden="true" />
                       </label>
@@ -213,7 +194,7 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                             )
                           }
                         >
-                          安装指引 ›
+                          {t("installGuide")}
                         </button>
                       )
                     )}
@@ -222,7 +203,7 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                     openInstallGuide === provider.kind &&
                     provider.hint && (
                       <div className="agent-fix">
-                        <span>在终端运行</span>
+                        <span>{t("runInTerminal")}</span>
                         <code>{provider.hint}</code>
                         <button
                           type="button"
@@ -230,7 +211,9 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
                             provider.hint && copyHint(provider.hint)
                           }
                         >
-                          {copiedHint === provider.hint ? "已复制" : "复制"}
+                          {copiedHint === provider.hint
+                            ? t("copied")
+                            : t("copy")}
                         </button>
                       </div>
                     )}
@@ -247,33 +230,42 @@ export function SettingsView({ onClose }: { onClose: () => void }): JSX.Element 
               ))}
               {visibleProviders.length === 0 && (
                 <p className="panel-empty">
-                  没有匹配「{searchQuery.trim()}」的设置项
+                  {t("noMatchingSettings", { query: searchQuery.trim() })}
                 </p>
               )}
             </div>
           </div>
         ) : (
           <div className="panel-card">
-            {settingsError && (
-              <div className="workspace-error" role="alert">
-                {settingsError}
-              </div>
-            )}
             <header className="panel-head">
               <div>
-                <h3>数据与应用</h3>
-                <p className="panel-sub">
-                  所有项目、会话与消息都保存在本机 SQLite 数据库中，不会上传。
-                </p>
+                <h3>{t("dataAndApp")}</h3>
+                <p className="panel-sub">{t("dataAndAppDescription")}</p>
               </div>
             </header>
+            <div className="language-setting">
+              <div>
+                <strong>{t("language")}</strong>
+                <span>{t("languageDescription")}</span>
+              </div>
+              <select
+                value={locale}
+                aria-label={t("language")}
+                onChange={(event) =>
+                  setLocale(event.target.value as typeof locale)
+                }
+              >
+                <option value="zh-CN">{t("chinese")}</option>
+                <option value="en-US">{t("english")}</option>
+              </select>
+            </div>
             <div className="data-card">
               <div>
-                <span>会话记录</span>
+                <span>{t("sessionRecords")}</span>
                 <code title={about?.dataPath}>{about?.dataPath}</code>
               </div>
               <div>
-                <span>版本</span>
+                <span>{t("version")}</span>
                 <code>{about?.version}</code>
               </div>
             </div>

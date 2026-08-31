@@ -21,6 +21,35 @@ interface StoredMessageRow {
   createdAt: string;
 }
 
+interface SessionRow {
+  sessionId: string;
+  projectId: string;
+  backend: SessionInfo["backend"];
+  modelId: string | null;
+  reasoningEffort: SessionInfo["reasoningEffort"] | null;
+  sandboxMode: SessionInfo["sandboxMode"] | null;
+  backendSessionId: string | null;
+  title: string;
+  updatedAt: string;
+}
+
+function sessionFromRow(row: SessionRow): SessionInfo {
+  const {
+    modelId,
+    reasoningEffort,
+    sandboxMode,
+    backendSessionId,
+    ...session
+  } = row;
+  return {
+    ...session,
+    ...(modelId ? { modelId } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(sandboxMode ? { sandboxMode } : {}),
+    ...(backendSessionId ? { backendSessionId } : {}),
+  };
+}
+
 export class DiscoStore {
   private readonly database: Database.Database;
   private isClosed = false;
@@ -40,6 +69,9 @@ export class DiscoStore {
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
         backend TEXT NOT NULL,
+        model_id TEXT,
+        reasoning_effort TEXT,
+        sandbox_mode TEXT,
         backend_session_id TEXT,
         title TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -61,6 +93,21 @@ export class DiscoStore {
       CREATE INDEX IF NOT EXISTS messages_session_created_idx
         ON messages (session_id, created_at);
     `);
+
+    const sessionColumns = this.database
+      .prepare("PRAGMA table_info(sessions)")
+      .all() as Array<{ name: string }>;
+    if (!sessionColumns.some((column) => column.name === "model_id")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN model_id TEXT");
+    }
+    if (!sessionColumns.some((column) => column.name === "reasoning_effort")) {
+      this.database.exec(
+        "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT",
+      );
+    }
+    if (!sessionColumns.some((column) => column.name === "sandbox_mode")) {
+      this.database.exec("ALTER TABLE sessions ADD COLUMN sandbox_mode TEXT");
+    }
 
     const messageColumns = this.database
       .prepare("PRAGMA table_info(messages)")
@@ -93,12 +140,15 @@ export class DiscoStore {
   }
 
   listSessions(projectId: string): SessionInfo[] {
-    return this.database
+    const rows = this.database
       .prepare(
         `SELECT
           id AS sessionId,
           project_id AS projectId,
           backend,
+          model_id AS modelId,
+          reasoning_effort AS reasoningEffort,
+          sandbox_mode AS sandboxMode,
           backend_session_id AS backendSessionId,
           title,
           updated_at AS updatedAt
@@ -106,36 +156,60 @@ export class DiscoStore {
         WHERE project_id = ?
         ORDER BY updated_at DESC, rowid DESC`,
       )
-      .all(projectId) as SessionInfo[];
+      .all(projectId) as SessionRow[];
+    return rows.map(sessionFromRow);
   }
 
   getSession(sessionId: string): SessionInfo | undefined {
-    return this.database
+    const row = this.database
       .prepare(
         `SELECT
           id AS sessionId,
           project_id AS projectId,
           backend,
+          model_id AS modelId,
+          reasoning_effort AS reasoningEffort,
+          sandbox_mode AS sandboxMode,
           backend_session_id AS backendSessionId,
           title,
           updated_at AS updatedAt
         FROM sessions
         WHERE id = ?`,
       )
-      .get(sessionId) as SessionInfo | undefined;
+      .get(sessionId) as SessionRow | undefined;
+    return row ? sessionFromRow(row) : undefined;
   }
 
   createSession(session: SessionInfo): void {
     this.database
       .prepare(
         `INSERT INTO sessions (
-          id, project_id, backend, backend_session_id, title, updated_at
+          id,
+          project_id,
+          backend,
+          model_id,
+          reasoning_effort,
+          sandbox_mode,
+          backend_session_id,
+          title,
+          updated_at
         ) VALUES (
-          @sessionId, @projectId, @backend, @backendSessionId, @title, @updatedAt
+          @sessionId,
+          @projectId,
+          @backend,
+          @modelId,
+          @reasoningEffort,
+          @sandboxMode,
+          @backendSessionId,
+          @title,
+          @updatedAt
         )`,
       )
       .run({
         ...session,
+        modelId: session.modelId ?? null,
+        reasoningEffort: session.reasoningEffort ?? null,
+        sandboxMode: session.sandboxMode ?? null,
         backendSessionId: session.backendSessionId ?? null,
       });
   }

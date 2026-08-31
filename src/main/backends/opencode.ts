@@ -33,6 +33,7 @@ export class OpenCodeBackend implements AgentBackend {
 
   async run({
     backendSessionId,
+    modelId,
     workingDirectory,
     prompt,
     emit,
@@ -139,7 +140,10 @@ export class OpenCodeBackend implements AgentBackend {
         ),
         {
           method: "POST",
-          body: JSON.stringify({ parts: [{ type: "text", text: prompt }] }),
+          body: JSON.stringify({
+            parts: [{ type: "text", text: prompt }],
+            ...(modelId ? { model: modelId } : {}),
+          }),
           signal,
         },
       );

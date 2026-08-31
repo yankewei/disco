@@ -6,14 +6,18 @@ import type {
   AgentEvent,
   ApprovalDecision,
   BackendKind,
+  Locale,
   ProjectInfo,
   ProviderInfo,
+  ReasoningEffort,
   RunMode,
   RunStatus,
+  SandboxMode,
   SessionInfo,
   StoredMessage,
   ToolCall,
 } from "../shared/types.js";
+import { translate } from "../shared/i18n.js";
 import {
   ClaudeBackend,
   CodexBackend,
@@ -23,6 +27,7 @@ import {
   type RequestApproval,
 } from "./backends/index.js";
 import { findExecutable } from "./backends/executable.js";
+import { listCodexModels } from "./backends/codexAppServer.js";
 import { DiscoStore } from "./store.js";
 
 interface ActiveRun {
@@ -61,13 +66,13 @@ export class AgentHost {
     return this.store.listProjects();
   }
 
-  createProject(path: string): ProjectInfo {
+  createProject(path: string, locale: Locale = "zh-CN"): ProjectInfo {
     const normalizedPath = resolve(path);
     if (
       !existsSync(normalizedPath) ||
       !statSync(normalizedPath).isDirectory()
     ) {
-      throw new Error("工作区路径无效或不可访问");
+      throw new Error(translate(locale, "invalidWorkspace"));
     }
 
     const existingProject = this.store.projectByPath(normalizedPath);
@@ -89,16 +94,26 @@ export class AgentHost {
     return this.store.listSessions(projectId);
   }
 
-  createSession(projectId: string, backend: BackendKind): SessionInfo {
+  createSession(
+    projectId: string,
+    backend: BackendKind,
+    modelId?: string,
+    reasoningEffort?: ReasoningEffort,
+    sandboxMode?: SandboxMode,
+    locale: Locale = "zh-CN",
+  ): SessionInfo {
     if (!this.store.getProject(projectId)) {
-      throw new Error("项目不存在");
+      throw new Error(translate(locale, "projectNotFound"));
     }
 
     const session = {
       sessionId: randomUUID(),
       projectId,
       backend,
-      title: "新对话",
+      modelId,
+      reasoningEffort,
+      sandboxMode,
+      title: translate(locale, "newConversation"),
       updatedAt: new Date().toISOString(),
     };
     this.store.createSession(session);
@@ -109,17 +124,22 @@ export class AgentHost {
     return this.store.messages(sessionId);
   }
 
-  async prompt(sessionId: string, text: string, mode: RunMode): Promise<void> {
+  async prompt(
+    sessionId: string,
+    text: string,
+    mode: RunMode,
+    locale: Locale = "zh-CN",
+  ): Promise<void> {
     if (this.isShuttingDown) {
       throw new Error("Disco 正在关闭");
     }
     const session = this.store.getSession(sessionId);
     if (!session) {
-      throw new Error("会话不存在");
+      throw new Error(translate(locale, "sessionNotFound"));
     }
     const project = this.store.getProject(session.projectId);
     if (!project) {
-      throw new Error("项目不存在");
+      throw new Error(translate(locale, "projectNotFound"));
     }
     const backend = this.backends[session.backend];
     if (!backend) {
@@ -246,9 +266,13 @@ export class AgentHost {
 
       const backendSessionId = await backend.run({
         backendSessionId: session.backendSessionId,
+        modelId: session.modelId,
+        reasoningEffort: session.reasoningEffort,
+        sandboxMode: session.sandboxMode,
         workingDirectory: project.path,
         prompt: text,
         mode,
+        locale,
         emit: handleBackendEvent,
         signal: controller.signal,
         requestApproval,
@@ -376,7 +400,7 @@ export class AgentHost {
     }
   }
 
-  providers(): ProviderInfo[] {
+  async providers(locale: Locale = "zh-CN"): Promise<ProviderInfo[]> {
     const homeDirectory = homedir();
     const claudeCredentialsPath = [
       join(homeDirectory, ".claude", ".credentials.json"),
@@ -399,11 +423,21 @@ export class AgentHost {
       openCodeDetail = "已检测到 OpenCode 配置和命令";
     }
 
-    const codexModels = [
-      { id: "o4-mini", name: "o4-mini" },
-      { id: "o3", name: "o3" },
-      { id: "o4-mini-high", name: "o4-mini (high reasoning)" },
-    ];
+    const codexModels = await listCodexModels();
+    if (codexModels.length === 0) {
+      codexModels.push(
+        {
+          id: "o4-mini",
+          name: "o4-mini",
+          reasoningEfforts: ["minimal", "low", "medium", "high"],
+        },
+        {
+          id: "o3",
+          name: "o3",
+          reasoningEfforts: ["minimal", "low", "medium", "high"],
+        },
+      );
+    }
 
     const claudeModels = [
       { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
@@ -421,8 +455,8 @@ export class AgentHost {
         name: "Codex",
         available: isCodexAvailable,
         detail: isCodexAvailable
-          ? "已检测到本地 Codex CLI；未登录时请在终端运行 codex login"
-          : "未找到 codex 命令，请先安装 Codex CLI",
+          ? translate(locale, "providerCodexReady")
+          : translate(locale, "providerCodexMissing"),
         evidence: codexExecutable,
         hint: "codex login",
         supportsPlan: this.backends.codex.supportsPlan,
@@ -433,8 +467,8 @@ export class AgentHost {
         name: "Claude Code",
         available: isClaudeAvailable,
         detail: isClaudeAvailable
-          ? "已检测到 Claude Code 登录态或 API Key"
-          : "未检测到登录态，先在终端登录或设置 ANTHROPIC_API_KEY 后重新检测",
+          ? translate(locale, "providerClaudeReady")
+          : translate(locale, "providerClaudeMissing"),
         evidence: isClaudeAvailable
           ? (claudeCredentialsPath ?? "ANTHROPIC_API_KEY")
           : undefined,

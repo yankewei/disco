@@ -1,7 +1,10 @@
 import type {
   ApprovalDecision,
+  Locale,
   MessageItem,
+  ReasoningEffort,
   RunMode,
+  SandboxMode,
   ToolCallStatus,
 } from "../../shared/types.js";
 
@@ -28,9 +31,13 @@ export type RequestApproval = (
 export interface BackendRunContext {
   backendSessionId?: string;
   onBackendSessionId?: (backendSessionId: string) => void;
+  modelId?: string;
+  reasoningEffort?: ReasoningEffort;
+  sandboxMode?: SandboxMode;
   workingDirectory: string;
   prompt: string;
   mode: RunMode;
+  locale?: Locale;
   emit: (event: BackendEvent) => void;
   signal: AbortSignal;
   requestApproval: RequestApproval;

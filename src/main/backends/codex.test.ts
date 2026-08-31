@@ -214,6 +214,9 @@ describe("CodexBackend", () => {
     const runPromise = backend.run(
       createContext({
         backendSessionId: "thread-existing",
+        modelId: "o3",
+        reasoningEffort: "high",
+        sandboxMode: "danger-full-access",
         emit: (event) => emittedEvents.push(event),
       }),
     );
@@ -268,8 +271,14 @@ describe("CodexBackend", () => {
     expect(appServer.resumeThread).toHaveBeenCalledWith({
       threadId: "thread-existing",
       cwd: "/tmp/project",
+      model: "o3",
       approvalPolicy: "on-request",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
+    });
+    expect(appServer.startTurn).toHaveBeenCalledWith({
+      threadId: "thread-existing",
+      input: [{ type: "text", text: "执行任务" }],
+      effort: "high",
     });
     expect(emittedEvents).toEqual([
       {
