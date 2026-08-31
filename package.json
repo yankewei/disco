@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist-node/main/index.js",
   "scripts": {
-    "dev": "npm run build:main && concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev": "npm run build:main && concurrently -k \"vite\" \"wait-on tcp:5173 && env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build:main": "tsc -p tsconfig.node.json",
     "build": "npm run build:main && vite build",
     "start": "electron .",
@@ -54,7 +54,6 @@
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "latest",
-    "cross-env": "latest",
     "electron": "latest",
     "electron-builder": "^26.15.3",
     "typescript": "latest",
