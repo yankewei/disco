@@ -10,37 +10,12 @@
     "build": "npm run build:main && vite build",
     "start": "electron .",
     "test": "vitest run",
-    "package": "npm run build && electron-builder --mac universal"
-  },
-  "build": {
-    "appId": "ai.disco.desktop",
-    "productName": "Disco",
-    "files": [
-      "dist-node/**",
-      "dist-renderer/**",
-      "package.json"
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "identity": "${CSC_NAME}",
-      "target": [
-        "dmg",
-        "zip"
-      ]
-    },
-    "publish": [
-      {
-        "provider": "generic",
-        "url": "${DISCO_UPDATE_URL}"
-      }
-    ],
-    "dmg": {
-      "sign": false
-    }
+    "prepare:universal": "node scripts/prepare-universal.mjs",
+    "package": "npm run build && npm run prepare:universal && electron-builder --config electron-builder.config.js --mac --universal --publish never",
+    "package:release": "if [ -z \"$DISCO_UPDATE_URL\" ]; then echo 'DISCO_UPDATE_URL 未设置' >&2; exit 1; fi && npm run build && npm run prepare:universal && electron-builder --config electron-builder.config.js --mac --universal --publish always"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.251",
-    "@openai/codex-sdk": "^0.151.0",
     "better-sqlite3": "^13.0.3",
     "electron-updater": "^6.8.9",
     "react": "latest",

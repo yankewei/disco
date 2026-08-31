@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   MessageItem,
   RunMode,
+  ToolCallStatus,
 } from "../../shared/types.js";
 
 export type BackendEvent =
@@ -12,8 +13,10 @@ export type BackendEvent =
       type: "tool";
       id: string;
       title: string;
-      state: "started" | "completed";
+      state: ToolCallStatus;
+      input?: unknown;
       output?: string;
+      error?: string;
     };
 
 export type RequestApproval = (
@@ -24,6 +27,7 @@ export type RequestApproval = (
 
 export interface BackendRunContext {
   backendSessionId?: string;
+  onBackendSessionId?: (backendSessionId: string) => void;
   workingDirectory: string;
   prompt: string;
   mode: RunMode;
@@ -33,5 +37,7 @@ export interface BackendRunContext {
 }
 
 export interface AgentBackend {
+  readonly supportsPlan: boolean;
   run(context: BackendRunContext): Promise<string>;
+  shutdown?(): Promise<void>;
 }

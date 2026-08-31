@@ -18,17 +18,52 @@ const rendererPath = join(
 );
 
 let mainWindow: BrowserWindow | undefined;
-let host: AgentHost;
+let host: AgentHost | undefined;
+let store: DiscoStore | undefined;
+let isQuitting = false;
+
+function getHost(): AgentHost {
+  if (!host) {
+    throw new Error("Disco 主进程尚未完成初始化");
+  }
+  return host;
+}
+
+function assertTrustedRenderer(event: Electron.IpcMainInvokeEvent): void {
+  if (event.sender !== mainWindow?.webContents) {
+    throw new Error("拒绝来自未知窗口的请求");
+  }
+}
+
+function isRendererUrl(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    if (rendererDevUrl) {
+      return parsedUrl.origin === new URL(rendererDevUrl).origin;
+    }
+    return (
+      parsedUrl.protocol === "file:" &&
+      decodeURIComponent(parsedUrl.pathname) === rendererPath
+    );
+  } catch {
+    return false;
+  }
+}
 
 function secureNavigation(browserWindow: BrowserWindow): void {
   browserWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    try {
+      const protocol = new URL(url).protocol;
+      if (protocol === "http:" || protocol === "https:") {
+        void shell.openExternal(url).catch(() => {});
+      }
+    } catch {
+      // Invalid URLs stay blocked.
+    }
     return { action: "deny" };
   });
   browserWindow.webContents.on("will-navigate", (event, url) => {
-    const isAllowed =
-      url.startsWith("file:") || url.startsWith("http://127.0.0.1:5173");
-    if (!isAllowed) {
+    if (!isRendererUrl(url)) {
       event.preventDefault();
     }
   });
@@ -62,51 +97,71 @@ function createMainWindow(): void {
   loadRenderer(mainWindow);
 }
 
-ipcMain.handle("disco:projects", () => host.listProjects());
-ipcMain.handle("disco:create-project", (_event, path: unknown) =>
-  host.createProject(z.string().min(1).parse(path)),
-);
-ipcMain.handle("disco:sessions", (_event, projectId: unknown) =>
-  host.listSessions(uuidSchema.parse(projectId)),
-);
+ipcMain.handle("disco:projects", (event) => {
+  assertTrustedRenderer(event);
+  return getHost().listProjects();
+});
+ipcMain.handle("disco:create-project", (event, path: unknown) => {
+  assertTrustedRenderer(event);
+  return getHost().createProject(z.string().min(1).parse(path));
+});
+ipcMain.handle("disco:sessions", (event, projectId: unknown) => {
+  assertTrustedRenderer(event);
+  return getHost().listSessions(uuidSchema.parse(projectId));
+});
 ipcMain.handle(
   "disco:create-session",
-  (_event, projectId: unknown, backend: unknown) =>
-    host.createSession(
+  (event, projectId: unknown, backend: unknown) => {
+    assertTrustedRenderer(event);
+    return getHost().createSession(
       uuidSchema.parse(projectId),
       backendSchema.parse(backend),
-    ),
+    );
+  },
 );
-ipcMain.handle("disco:messages", (_event, sessionId: unknown) =>
-  host.messages(uuidSchema.parse(sessionId)),
-);
+ipcMain.handle("disco:messages", (event, sessionId: unknown) => {
+  assertTrustedRenderer(event);
+  return getHost().messages(uuidSchema.parse(sessionId));
+});
 ipcMain.handle(
   "disco:prompt",
-  (_event, sessionId: unknown, text: unknown, mode: unknown) => {
-    void host.prompt(
+  async (event, sessionId: unknown, text: unknown, mode: unknown) => {
+    assertTrustedRenderer(event);
+    await getHost().prompt(
       uuidSchema.parse(sessionId),
       z.string().trim().min(1).max(100_000).parse(text),
       runModeSchema.parse(mode),
     );
   },
 );
-ipcMain.handle("disco:cancel", (_event, sessionId: unknown) =>
-  host.cancel(uuidSchema.parse(sessionId)),
-);
+ipcMain.handle("disco:cancel", (event, sessionId: unknown) => {
+  assertTrustedRenderer(event);
+  return getHost().cancel(uuidSchema.parse(sessionId));
+});
 ipcMain.handle(
   "disco:approve",
-  (_event, approvalId: unknown, decision: unknown) =>
-    host.approve(
+  (event, approvalId: unknown, decision: unknown) => {
+    assertTrustedRenderer(event);
+    return getHost().approve(
       uuidSchema.parse(approvalId),
       approvalDecisionSchema.parse(decision),
-    ),
+    );
+  },
 );
-ipcMain.handle("disco:providers", () => host.providers());
-ipcMain.handle("disco:about", () => ({
-  dataPath: join(app.getPath("userData"), "disco.sqlite"),
-  version: app.getVersion(),
-}));
-ipcMain.handle("disco:choose-directory", async () => {
+ipcMain.handle("disco:providers", (event) => {
+  assertTrustedRenderer(event);
+  return getHost().providers();
+});
+
+ipcMain.handle("disco:about", (event) => {
+  assertTrustedRenderer(event);
+  return {
+    dataPath: join(app.getPath("userData"), "disco.sqlite"),
+    version: app.getVersion(),
+  };
+});
+ipcMain.handle("disco:choose-directory", async (event) => {
+  assertTrustedRenderer(event);
   const result = await dialog.showOpenDialog({
     properties: ["openDirectory", "createDirectory"],
   });
@@ -114,9 +169,10 @@ ipcMain.handle("disco:choose-directory", async () => {
 });
 ipcMain.handle(
   "disco:choose-files",
-  async (_event, withDirectories: unknown) => {
+  async (event, withDirectories: unknown) => {
+    assertTrustedRenderer(event);
     const properties: Array<"openFile" | "openDirectory" | "multiSelections"> =
-      withDirectories === true
+      z.boolean().parse(withDirectories)
         ? ["openFile", "openDirectory", "multiSelections"]
         : ["openFile", "multiSelections"];
     return (await dialog.showOpenDialog({ properties })).filePaths;
@@ -124,14 +180,32 @@ ipcMain.handle(
 );
 
 app.whenReady().then(() => {
+  store = new DiscoStore(join(app.getPath("userData"), "disco.sqlite"));
   host = new AgentHost(
-    new DiscoStore(join(app.getPath("userData"), "disco.sqlite")),
+    store,
     (event) => mainWindow?.webContents.send("disco:event", event),
   );
   createMainWindow();
   if (app.isPackaged && process.env.DISCO_DISABLE_AUTO_UPDATE !== "1") {
-    void autoUpdater.checkForUpdatesAndNotify();
+    void autoUpdater.checkForUpdatesAndNotify().catch(() => {});
   }
+});
+
+app.on("before-quit", (event) => {
+  if (isQuitting) {
+    return;
+  }
+  event.preventDefault();
+  isQuitting = true;
+  void (async () => {
+    await host?.shutdown();
+    store?.close();
+    app.quit();
+  })();
+});
+
+app.on("will-quit", () => {
+  store?.close();
 });
 
 app.on("window-all-closed", () => {

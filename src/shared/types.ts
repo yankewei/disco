@@ -1,6 +1,8 @@
 export type BackendKind = "codex" | "claude" | "opencode";
 export type RunMode = "agent" | "plan";
 export type ApprovalDecision = "approved" | "denied";
+export type RunStatus = "completed" | "cancelled" | "failed";
+export type ToolCallStatus = "started" | "completed" | "failed";
 
 export interface ProjectInfo {
   id: string;
@@ -21,8 +23,10 @@ export interface SessionInfo {
 export interface ToolCall {
   id: string;
   name: string;
-  status: "started" | "completed";
+  status: ToolCallStatus;
+  input?: unknown;
   output?: string;
+  error?: string;
 }
 
 export type MessageItemState = "started" | "updated" | "completed";
@@ -94,24 +98,36 @@ export interface StoredMessage {
   reasoning?: string;
   toolCalls?: ToolCall[];
   items?: MessageItem[];
+  status?: RunStatus;
+  error?: string;
   createdAt: string;
 }
 
 export type AgentEvent =
-  | { type: "text"; sessionId: string; text: string }
-  | { type: "reasoning"; sessionId: string; text: string }
-  | { type: "item"; sessionId: string; item: MessageItem }
+  | { type: "run-started"; sessionId: string; runId: string }
+  | { type: "text"; sessionId: string; runId: string; text: string }
+  | { type: "reasoning"; sessionId: string; runId: string; text: string }
+  | {
+      type: "item";
+      sessionId: string;
+      runId: string;
+      item: MessageItem;
+    }
   | {
       type: "tool";
       sessionId: string;
+      runId: string;
       id: string;
       title: string;
-      state: "started" | "completed";
+      state: ToolCallStatus;
+      input?: unknown;
       output?: string;
+      error?: string;
     }
   | {
       type: "approval-requested";
       sessionId: string;
+      runId: string;
       approvalId: string;
       toolName: string;
       title?: string;
@@ -120,8 +136,17 @@ export type AgentEvent =
   | {
       type: "approval-resolved";
       sessionId: string;
+      runId: string;
+      approvalId: string;
     }
-  | { type: "run-finished"; sessionId: string; error?: string };
+  | {
+      type: "run-finished";
+      sessionId: string;
+      runId: string;
+      status: RunStatus;
+      sessionTitle?: string;
+      error?: string;
+    };
 
 export interface DiscoAPI {
   listProjects(): Promise<ProjectInfo[]>;

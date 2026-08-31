@@ -1,6 +1,8 @@
 import type { BackendKind } from "../shared/types";
 
 const disabledProvidersKey = "disco.disabledProviders";
+export const providerPreferencesChangedEventName =
+  "disco-provider-preferences-changed";
 
 export function loadDisabledProviders(): BackendKind[] {
   try {
@@ -21,8 +23,13 @@ export function loadDisabledProviders(): BackendKind[] {
 
 export function saveDisabledProviders(disabledProviders: BackendKind[]): void {
   localStorage.setItem(disabledProvidersKey, JSON.stringify(disabledProviders));
+  window.dispatchEvent(new Event(providerPreferencesChangedEventName));
 }
 
-export function isProviderPreferencesEvent(event: StorageEvent): boolean {
-  return event.key === disabledProvidersKey;
+export function isProviderPreferencesEvent(event: Event): boolean {
+  return (
+    event.type === providerPreferencesChangedEventName ||
+    (event.type === "storage" &&
+      (event as StorageEvent).key === disabledProvidersKey)
+  );
 }

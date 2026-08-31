@@ -9,8 +9,10 @@ import type {
   ProjectInfo,
   ProviderInfo,
   RunMode,
+  RunStatus,
   SessionInfo,
   StoredMessage,
+  ToolCall,
 } from "../shared/types.js";
 import {
   ClaudeBackend,
@@ -20,26 +22,40 @@ import {
   type BackendEvent,
   type RequestApproval,
 } from "./backends/index.js";
+import { findExecutable } from "./backends/executable.js";
 import { DiscoStore } from "./store.js";
+
+interface ActiveRun {
+  runId: string;
+  controller: AbortController;
+}
 
 interface PendingApproval {
   resolve: (decision: ApprovalDecision) => void;
   sessionId: string;
+  runId: string;
+  signal: AbortSignal;
+  abortHandler: () => void;
 }
 
 export class AgentHost {
-  private readonly backends: Record<BackendKind, AgentBackend> = {
-    codex: new CodexBackend(),
-    claude: new ClaudeBackend(),
-    opencode: new OpenCodeBackend(),
-  };
-  private readonly runs = new Map<string, AbortController>();
+  private readonly runs = new Map<string, ActiveRun>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
+  private readonly activePromptCompletions = new Set<Promise<void>>();
+  private readonly backends: Record<BackendKind, AgentBackend>;
+  private isShuttingDown = false;
 
   constructor(
     private readonly store: DiscoStore,
     private readonly emit: (event: AgentEvent) => void,
-  ) {}
+    backends: Record<BackendKind, AgentBackend> = {
+      codex: new CodexBackend(),
+      claude: new ClaudeBackend(),
+      opencode: new OpenCodeBackend(),
+    },
+  ) {
+    this.backends = backends;
+  }
 
   listProjects(): ProjectInfo[] {
     return this.store.listProjects();
@@ -94,6 +110,9 @@ export class AgentHost {
   }
 
   async prompt(sessionId: string, text: string, mode: RunMode): Promise<void> {
+    if (this.isShuttingDown) {
+      throw new Error("Disco 正在关闭");
+    }
     const session = this.store.getSession(sessionId);
     if (!session) {
       throw new Error("会话不存在");
@@ -102,23 +121,34 @@ export class AgentHost {
     if (!project) {
       throw new Error("项目不存在");
     }
+    const backend = this.backends[session.backend];
+    if (!backend) {
+      throw new Error("会话绑定的 Agent 不可用");
+    }
+    if (mode === "plan" && !backend.supportsPlan) {
+      throw new Error(`${session.backend} 不支持计划模式`);
+    }
     if (this.runs.has(sessionId)) {
       throw new Error("该会话正在运行");
     }
 
-    this.store.appendMessage(sessionId, {
-      id: randomUUID(),
-      role: "user",
-      text,
-      createdAt: new Date().toISOString(),
-    });
-
+    const runId = randomUUID();
     const controller = new AbortController();
-    this.runs.set(sessionId, controller);
+    let resolvePromptCompletion: () => void = () => {};
+    const promptCompletion = new Promise<void>((resolveCompletion) => {
+      resolvePromptCompletion = resolveCompletion;
+    });
+    this.activePromptCompletions.add(promptCompletion);
+    this.runs.set(sessionId, { runId, controller });
+    this.notify({ type: "run-started", sessionId, runId });
+
     let assistantText = "";
     let reasoning = "";
-    const toolCalls: NonNullable<StoredMessage["toolCalls"]> = [];
+    const toolCalls: ToolCall[] = [];
     const items: NonNullable<StoredMessage["items"]> = [];
+    let runStatus: RunStatus = "completed";
+    let runError: string | undefined;
+    let sessionTitle: string | undefined;
 
     const handleBackendEvent = (event: BackendEvent): void => {
       if (event.type === "text") {
@@ -135,60 +165,86 @@ export class AgentHost {
       } else {
         const toolCall = toolCalls.find((item) => item.id === event.id);
         if (toolCall) {
-          toolCall.status = event.state;
-          toolCall.output = event.output;
+          if (toolCall.status === "started" || event.state !== "started") {
+            toolCall.status = event.state;
+          }
+          if (event.input !== undefined) {
+            toolCall.input = event.input;
+          }
+          if (event.output !== undefined) {
+            toolCall.output = event.output;
+          }
+          if (event.error !== undefined) {
+            toolCall.error = event.error;
+          }
         } else {
           toolCalls.push({
             id: event.id,
             name: event.title,
             status: event.state,
+            input: event.input,
             output: event.output,
+            error: event.error,
           });
         }
       }
-      this.emit({ ...event, sessionId });
+      this.notify({ ...event, sessionId, runId });
+    };
+
+    const registerBackendSessionId = (backendSessionId: string): void => {
+      if (session.backendSessionId === backendSessionId) {
+        return;
+      }
+      session.backendSessionId = backendSessionId;
+      this.store.updateSession(sessionId, backendSessionId);
     };
 
     const requestApproval: RequestApproval = (toolName, title, input) => {
       const approvalId = randomUUID();
       return new Promise<ApprovalDecision>((resolveApproval) => {
+        const abortHandler = (): void => {
+          this.resolveApproval(approvalId, "denied");
+        };
         this.pendingApprovals.set(approvalId, {
           resolve: resolveApproval,
           sessionId,
+          runId,
+          signal: controller.signal,
+          abortHandler,
         });
-        this.emit({
+        this.notify({
           type: "approval-requested",
           sessionId,
+          runId,
           approvalId,
           toolName,
           title,
           input,
         });
-
-        const denyOnAbort = (): void => {
-          const pendingApproval = this.pendingApprovals.get(approvalId);
-          if (!pendingApproval) {
-            return;
-          }
-          this.pendingApprovals.delete(approvalId);
-          pendingApproval.resolve("denied");
-          this.emit({
-            type: "approval-resolved",
-            sessionId,
-          });
-        };
         if (controller.signal.aborted) {
-          denyOnAbort();
-          return;
+          abortHandler();
+        } else {
+          controller.signal.addEventListener("abort", abortHandler, {
+            once: true,
+          });
         }
-        controller.signal.addEventListener("abort", denyOnAbort, {
-          once: true,
-        });
       });
     };
 
     try {
-      const backendSessionId = await this.backends[session.backend].run({
+      const userMessage = {
+        id: randomUUID(),
+        role: "user" as const,
+        text,
+        createdAt: new Date().toISOString(),
+      };
+      this.store.appendMessage(sessionId, userMessage);
+      if (session.title === "新对话") {
+        sessionTitle = titleFromPrompt(text);
+        this.store.updateSessionTitle(sessionId, sessionTitle);
+      }
+
+      const backendSessionId = await backend.run({
         backendSessionId: session.backendSessionId,
         workingDirectory: project.path,
         prompt: text,
@@ -196,74 +252,132 @@ export class AgentHost {
         emit: handleBackendEvent,
         signal: controller.signal,
         requestApproval,
+        onBackendSessionId: registerBackendSessionId,
       });
-      this.store.updateSession(sessionId, backendSessionId);
-
+      registerBackendSessionId(backendSessionId);
+    } catch (error) {
+      runStatus = controller.signal.aborted ? "cancelled" : "failed";
+      if (runStatus === "failed") {
+        runError = error instanceof Error ? error.message : "运行失败";
+      }
+    } finally {
       if (
         assistantText ||
         reasoning ||
         toolCalls.length > 0 ||
-        items.length > 0
+        items.length > 0 ||
+        runStatus !== "completed"
       ) {
-        this.store.appendMessage(sessionId, {
-          id: randomUUID(),
-          role: "assistant",
-          text: assistantText,
-          reasoning: reasoning || undefined,
-          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-          items: items.length > 0 ? items : undefined,
-          createdAt: new Date().toISOString(),
-        });
+        try {
+          this.store.appendMessage(sessionId, {
+            id: randomUUID(),
+            role: "assistant",
+            text: assistantText,
+            reasoning: reasoning || undefined,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            items: items.length > 0 ? items : undefined,
+            status: runStatus === "completed" ? undefined : runStatus,
+            error: runError,
+            createdAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          runStatus = "failed";
+          runError = error instanceof Error ? error.message : "保存运行结果失败";
+        }
       }
-      this.emit({ type: "run-finished", sessionId });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "运行失败";
-      this.emit({
-        type: "run-finished",
-        sessionId,
-        error: controller.signal.aborted ? undefined : message,
-      });
-    } finally {
-      this.clearApprovals(sessionId);
-      this.runs.delete(sessionId);
+
+      this.clearApprovals(sessionId, runId);
+      if (this.runs.get(sessionId)?.runId === runId) {
+        this.runs.delete(sessionId);
+      }
+      try {
+        this.notify({
+          type: "run-finished",
+          sessionId,
+          runId,
+          status: runStatus,
+          sessionTitle,
+          error: runError,
+        });
+      } finally {
+        resolvePromptCompletion();
+        this.activePromptCompletions.delete(promptCompletion);
+      }
     }
   }
 
   approve(approvalId: string, decision: ApprovalDecision): void {
+    this.resolveApproval(approvalId, decision);
+  }
+
+  cancel(sessionId: string): void {
+    const activeRun = this.runs.get(sessionId);
+    if (!activeRun) {
+      return;
+    }
+    activeRun.controller.abort();
+    this.clearApprovals(sessionId, activeRun.runId);
+  }
+
+  async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
+    for (const activeRun of this.runs.values()) {
+      activeRun.controller.abort();
+    }
+    for (const approvalId of this.pendingApprovals.keys()) {
+      this.resolveApproval(approvalId, "denied");
+    }
+    await Promise.all(this.activePromptCompletions);
+    await Promise.allSettled(
+      [...new Set(Object.values(this.backends))].map((backend) =>
+        backend.shutdown?.(),
+      ),
+    );
+  }
+
+  private notify(event: AgentEvent): void {
+    try {
+      this.emit(event);
+    } catch {
+      // A renderer can disappear while a backend is still finishing.
+    }
+  }
+
+  private resolveApproval(
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): void {
     const pendingApproval = this.pendingApprovals.get(approvalId);
     if (!pendingApproval) {
       return;
     }
     this.pendingApprovals.delete(approvalId);
+    pendingApproval.signal.removeEventListener(
+      "abort",
+      pendingApproval.abortHandler,
+    );
     pendingApproval.resolve(decision);
-    this.emit({
+    this.notify({
       type: "approval-resolved",
       sessionId: pendingApproval.sessionId,
+      runId: pendingApproval.runId,
+      approvalId,
     });
   }
 
-  cancel(sessionId: string): void {
-    this.runs.get(sessionId)?.abort();
-    this.clearApprovals(sessionId);
-  }
-
-  private clearApprovals(sessionId: string): void {
+  private clearApprovals(sessionId: string, runId: string): void {
     for (const [approvalId, pendingApproval] of this.pendingApprovals) {
-      if (pendingApproval.sessionId !== sessionId) {
-        continue;
+      if (
+        pendingApproval.sessionId === sessionId &&
+        pendingApproval.runId === runId
+      ) {
+        this.resolveApproval(approvalId, "denied");
       }
-      this.pendingApprovals.delete(approvalId);
-      pendingApproval.resolve("denied");
-      this.emit({
-        type: "approval-resolved",
-        sessionId,
-      });
     }
   }
 
   providers(): ProviderInfo[] {
     const homeDirectory = homedir();
-    const codexAuthPath = join(homeDirectory, ".codex", "auth.json");
     const claudeCredentialsPath = [
       join(homeDirectory, ".claude", ".credentials.json"),
       join(homeDirectory, ".claude.json"),
@@ -272,9 +386,18 @@ export class AgentHost {
       join(homeDirectory, ".config", "opencode", "opencode.json"),
       join(homeDirectory, ".opencode", "opencode.json"),
     ].find((file) => existsSync(file));
-    const isCodexAvailable = existsSync(codexAuthPath);
+    const codexExecutable = findExecutable("codex");
+    const openCodeExecutable = findExecutable("opencode");
+    const isCodexAvailable = Boolean(codexExecutable);
     const isClaudeAvailable =
       Boolean(process.env.ANTHROPIC_API_KEY) || Boolean(claudeCredentialsPath);
+    const isOpenCodeAvailable = Boolean(openCodeExecutable);
+    let openCodeDetail = "未找到 opencode 命令，请先安装 OpenCode";
+    if (openCodeExecutable && !openCodeConfigPath) {
+      openCodeDetail = "已检测到 opencode 命令，将使用 OpenCode 当前配置";
+    } else if (isOpenCodeAvailable) {
+      openCodeDetail = "已检测到 OpenCode 配置和命令";
+    }
 
     const codexModels = [
       { id: "o4-mini", name: "o4-mini" },
@@ -298,11 +421,11 @@ export class AgentHost {
         name: "Codex",
         available: isCodexAvailable,
         detail: isCodexAvailable
-          ? "已检测到 codex 登录态"
-          : "未检测到登录态，先在终端完成登录后重新检测",
-        evidence: isCodexAvailable ? codexAuthPath : undefined,
+          ? "已检测到本地 Codex CLI；未登录时请在终端运行 codex login"
+          : "未找到 codex 命令，请先安装 Codex CLI",
+        evidence: codexExecutable,
         hint: "codex login",
-        supportsPlan: true,
+        supportsPlan: this.backends.codex.supportsPlan,
         models: codexModels,
       },
       {
@@ -316,36 +439,60 @@ export class AgentHost {
           ? (claudeCredentialsPath ?? "ANTHROPIC_API_KEY")
           : undefined,
         hint: "claude",
-        supportsPlan: true,
+        supportsPlan: this.backends.claude.supportsPlan,
         models: claudeModels,
       },
       {
         kind: "opencode",
         name: "OpenCode",
-        available: Boolean(openCodeConfigPath),
-        detail: openCodeConfigPath
-          ? "已检测到 OpenCode 配置"
-          : "未检测到配置，先在终端完成 provider 配置后重新检测",
-        evidence: openCodeConfigPath,
+        available: isOpenCodeAvailable,
+        detail: openCodeDetail,
+        evidence: openCodeConfigPath ?? openCodeExecutable,
         hint: "opencode",
-        supportsPlan: false,
+        supportsPlan: this.backends.opencode.supportsPlan,
         models: openCodeModels,
       },
     ];
   }
 
-  private readOpenCodeModels(configPath: string | undefined): ProviderInfo["models"] {
-    if (!configPath) return [];
+  private readOpenCodeModels(
+    configPath: string | undefined,
+  ): ProviderInfo["models"] {
+    if (!configPath) {
+      return [];
+    }
     try {
-      const config = JSON.parse(readFileSync(configPath, "utf8")) as {
-        providers?: Record<string, { models?: Array<{ id: string; name?: string }> }>;
-      };
-      if (!config.providers) return [];
+      const config = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+      const configRecord = recordValue(config);
+      const providers =
+        recordValue(configRecord?.provider) ??
+        recordValue(configRecord?.providers);
+      if (!providers) {
+        return [];
+      }
       const models: ProviderInfo["models"] = [];
-      for (const provider of Object.values(config.providers)) {
-        if (!provider.models) continue;
-        for (const model of provider.models) {
-          models.push({ id: model.id, name: model.name ?? model.id });
+      for (const provider of Object.values(providers)) {
+        const providerModels = recordValue(provider)?.models;
+        if (Array.isArray(providerModels)) {
+          for (const model of providerModels) {
+            const modelRecord = recordValue(model);
+            const id = stringValue(modelRecord?.id);
+            if (id) {
+              models.push({ id, name: stringValue(modelRecord?.name) ?? id });
+            }
+          }
+        } else {
+          const modelsById = recordValue(providerModels);
+          if (!modelsById) {
+            continue;
+          }
+          for (const [id, model] of Object.entries(modelsById)) {
+            const modelRecord = recordValue(model);
+            models.push({
+              id,
+              name: stringValue(modelRecord?.name) ?? id,
+            });
+          }
         }
       }
       return models;
@@ -353,4 +500,22 @@ export class AgentHost {
       return [];
     }
   }
+}
+
+function titleFromPrompt(prompt: string): string {
+  const compactPrompt = prompt.replace(/\s+/g, " ").trim();
+  return compactPrompt.length > 40
+    ? `${compactPrompt.slice(0, 40)}…`
+    : compactPrompt;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
