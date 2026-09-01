@@ -1,17 +1,15 @@
 *.xcuserstate
 xcuserdata/
 DerivedData/
+.swiftpm/
+.build/
 .reasonix/
+.DS_Store
 
 # 测试覆盖率产物
 *.profraw
-dist/
 
-# Electron 客户端构建与依赖产物
-node_modules/
-dist-node/
-dist-renderer/
+# 原生构建产物
+build/
 release/
-macos/build/
-
-.alma-snapshots
+*.xcarchive

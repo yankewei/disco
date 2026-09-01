@@ -1,20 +1,21 @@
-# Disco Electron 架构
+# Disco 原生架构
 
-Disco 是单一 Electron 产品，运行在 macOS。主进程同时负责项目、会话、运行协调和本地持久化；React renderer 只负责界面，不持有 Node.js 或后端凭据。
+Disco 是仅面向 macOS 的 SwiftUI/AppKit 原生应用。应用进程直接负责界面状态、会话运行协调、Provider 进程管理和本地持久化。
 
 ```text
-React renderer
-  |  受限 contextBridge IPC
-Electron main
-  |- AgentHost
-  |   |- Codex CLI app-server -> 本机 `codex login`
-  |   |- Claude Agent SDK -> Claude Code 登录态
-  |   `- OpenCode HTTP/SSE -> opencode serve
-  `- SQLite 本地镜像
+SwiftUI / AppKit
+  |
+  `- AppModel：工作区、会话和设置状态
+      |- AgentHost：运行、审批、取消和事件聚合
+      |   |- CodexBackend -> codex app-server stdio JSON-RPC
+      |   `- OpenCodeBackend -> opencode serve HTTP/SSE
+      `- SQLiteStore：项目、会话和消息镜像
 ```
 
-后端统一实现内部 `AgentBackend`，并产生文本、推理、工具和事件项。Codex 启动本机 CLI 的 `app-server` stdio JSON-RPC 通道，使用 `thread/start` 或 `thread/resume` 创建线程，再通过 `turn/start` 执行请求；Claude 使用 Agent SDK 的流式消息，OpenCode 在本机动态端口启动 `opencode serve`，先订阅 SSE，再提交 `prompt_async`，直到收到对应会话的 idle 事件；取消时 Codex 调用 `turn/interrupt`，其他后端沿用各自的取消流程。主进程为每次运行分配 `runId`，发送开始、结束（完成、取消或失败）事件，避免不同会话的流互相污染。
+Provider 适配器实现统一的 `AgentBackend` 契约，只向 `AgentHost` 产生文本、推理、工具和状态事件。Codex 使用 `thread/start` 或 `thread/resume` 创建线程，再通过 `turn/start` 执行请求；OpenCode 在本地动态端口启动 `opencode serve`，订阅 SSE 后提交 `prompt_async`，直到收到对应会话的 idle 事件。
 
-SQLite 仅保存项目、Disco 会话索引、消息镜像、工具记录和运行失败/取消状态；Codex、Claude Code 或 OpenCode 的认证凭据始终留在各自的官方本地运行时中。
+`AgentHost` 为每次运行维护唯一的运行状态，处理审批、取消、终止和最终消息持久化，并保证一次 Prompt 只产生一个结束状态。Provider 的登录态继续由各自的官方 CLI 管理，Disco 不读取或复制凭据。
 
-安全边界：窗口启用 `contextIsolation` 与 sandbox，renderer 禁用 Node integration；preload 仅暴露经过主进程 Zod 校验的参数化操作。主进程校验工作区目录、导航、IPC 调用来源和全部 IPC 参数。
+SQLite 仅保存项目、Disco 会话索引、消息镜像、工具记录以及运行失败/取消状态。原生客户端首次启动时会从旧 Electron 数据库迁移历史数据；旧客户端代码不再属于当前构建。
+
+应用启用 Hardened Runtime。由于需要直接管理用户已安装的 Provider 可执行文件，原生 v1 暂不启用 App Sandbox；签名和 notarization 在发布阶段完成。

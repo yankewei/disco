@@ -12,25 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Electron tests
+  native:
+    name: Native macOS build and tests
     runs-on: macos-14
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml --project .
 
       - name: Build application
-        run: npm run build
+        run: xcodebuild -project Disco.xcodeproj -scheme Disco -configuration Debug -sdk macosx CODE_SIGNING_ALLOWED=NO build
+
+      - name: Run tests
+        run: xcodebuild test -project Disco.xcodeproj -scheme Disco -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
