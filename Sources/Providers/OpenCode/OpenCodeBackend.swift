@@ -33,16 +33,47 @@ final class OpenCodeBackend: AgentBackend {
         }
     }
 
+    func listSessions(workingDirectory: String) async throws -> [AgentSessionSnapshot] {
+        let cancellation = CancellationToken()
+        let server = try await startServer(cancellation: cancellation, workingDirectory: workingDirectory)
+        defer { stop(server) }
+        let response = try await requestJSON(
+            baseURL: server.baseURL,
+            path: directoryPath("/session", directory: workingDirectory),
+            method: "GET",
+            body: nil,
+            cancellation: cancellation
+        )
+        return parseOpenCodeSessions(response)
+    }
+
+    func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage] {
+        let cancellation = CancellationToken()
+        let server = try await startServer(cancellation: cancellation, workingDirectory: workingDirectory)
+        defer { stop(server) }
+        let response = try await requestJSON(
+            baseURL: server.baseURL,
+            path: directoryPath(
+                "/session/\(agentThreadID)/message",
+                directory: workingDirectory
+            ),
+            method: "GET",
+            body: nil,
+            cancellation: cancellation
+        )
+        return parseOpenCodeMessages(response)
+    }
+
     func run(context: BackendRunContext) async throws -> String {
         let cancellation = context.cancellation
         let server = try await startServer(
             cancellation: cancellation,
             workingDirectory: context.workingDirectory
         )
-        let serverID = context.backendSessionID ?? UUID().uuidString
+        let activeServerKey = context.agentThreadID ?? UUID().uuidString
         let accepted = withStateLock {
             guard !isShuttingDown else { return false }
-            activeServers[serverID] = server
+            activeServers[activeServerKey] = server
             return true
         }
         guard accepted else {
@@ -52,7 +83,7 @@ final class OpenCodeBackend: AgentBackend {
         defer {
             stop(server)
             _ = withStateLock {
-                activeServers.removeValue(forKey: serverID)
+                activeServers.removeValue(forKey: activeServerKey)
             }
         }
 
@@ -61,7 +92,7 @@ final class OpenCodeBackend: AgentBackend {
             throw OpenCodeBackendError.cancelled
         }
 
-        var sessionID = context.backendSessionID
+        var sessionID = context.agentThreadID
         if sessionID == nil {
             let response = try await requestJSON(
                 baseURL: server.baseURL,
@@ -74,7 +105,7 @@ final class OpenCodeBackend: AgentBackend {
             guard let sessionID else {
                 throw OpenCodeBackendError.invalidResponse("OpenCode 未返回会话 ID")
             }
-            context.reportBackendSessionID(sessionID)
+            context.reportAgentThreadID(sessionID)
         }
         guard let sessionID else {
             throw OpenCodeBackendError.invalidResponse("OpenCode 会话 ID 为空")
@@ -782,6 +813,123 @@ private func parseSSEEvent(_ data: String) -> [String: JSONValue]? {
         let value = try? JSONDecoder().decode(JSONValue.self, from: jsonData)
     else { return nil }
     return jsonObject(value)
+}
+
+private func parseOpenCodeSessions(_ value: JSONValue?) -> [AgentSessionSnapshot] {
+    let responseObject = jsonObject(value)
+    let sessionValues = value?.arrayValue
+        ?? jsonArray(responseObject?["data"] ?? responseObject?["sessions"])
+    return sessionValues.compactMap { value in
+        guard let session = jsonObject(value), let agentThreadID = jsonString(session["id"]) else {
+            return nil
+        }
+        let time = jsonObject(session["time"])
+        return AgentSessionSnapshot(
+            agentThreadID: agentThreadID,
+            title: jsonString(session["title"]),
+            createdAt: openCodeTimestamp(time?["created"] ?? session["createdAt"]),
+            activatedAt: openCodeTimestamp(time?["updated"] ?? session["updatedAt"]),
+            modelID: nil,
+            reasoningEffort: nil,
+            sandboxMode: nil
+        )
+    }
+}
+
+private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
+    let responseObject = jsonObject(value)
+    let messageValues = value?.arrayValue
+        ?? jsonArray(responseObject?["data"] ?? responseObject?["messages"])
+    return messageValues.compactMap { value in
+        guard let message = jsonObject(value) else { return nil }
+        let info = jsonObject(message["info"]) ?? message
+        guard let role = jsonString(info["role"]).flatMap({ MessageRole(rawValue: $0) }) else {
+            return nil
+        }
+        let messageID = jsonString(info["id"]) ?? UUID().uuidString
+        let time = jsonObject(info["time"])
+        let createdAt = openCodeTimestamp(time?["created"] ?? info["createdAt"]) ?? .timestamp()
+        var text = jsonString(info["text"]) ?? ""
+        var reasoning = ""
+        var timeline: [MessageItem] = []
+
+        for partValue in jsonArray(message["parts"]) {
+            guard let part = jsonObject(partValue),
+                  let partID = jsonString(part["id"]),
+                  let type = jsonString(part["type"])
+            else { continue }
+            let state = messageItemState(part)
+            switch type {
+            case "text":
+                let partText = jsonString(part["text"]) ?? ""
+                text += partText
+                timeline.append(.text(id: partID, text: partText, state: state))
+            case "reasoning":
+                let partText = jsonString(part["text"]) ?? ""
+                reasoning += partText
+                timeline.append(.reasoning(id: partID, text: partText, state: state))
+            case "tool":
+                let toolState = jsonObject(part["state"])
+                let status = jsonString(toolState?["status"])
+                let toolStatus: ToolCallStatus = switch status {
+                case "completed": .completed
+                case "error": .failed
+                default: .started
+                }
+                let error = jsonString(toolState?["error"])
+                    ?? jsonObject(toolState?["error"]).flatMap { jsonString($0["message"]) }
+                timeline.append(
+                    .toolCall(
+                        id: jsonString(part["callID"]) ?? partID,
+                        name: jsonString(part["tool"]) ?? "工具调用",
+                        input: toolState?["input"],
+                        output: formatJSONValue(toolState?["output"]),
+                        error: error,
+                        state: toolStatus
+                    )
+                )
+            case "patch":
+                let files = jsonStringArray(part["files"]).map {
+                    FileChange(path: $0, kind: .update, diff: nil)
+                }
+                if !files.isEmpty {
+                    timeline.append(
+                        .fileChange(
+                            id: partID,
+                            changes: files,
+                            patchOutput: jsonString(part["hash"]),
+                            state: state
+                        )
+                    )
+                }
+            default:
+                break
+            }
+        }
+
+        let errorValue = info["error"].flatMap { $0 == .null ? nil : $0 }
+        return ConversationMessage(
+            id: messageID,
+            role: role,
+            text: text,
+            reasoning: reasoning.isEmpty ? nil : reasoning,
+            toolCalls: nil,
+            items: timeline.isEmpty ? nil : timeline,
+            timeline: timeline.isEmpty ? nil : timeline,
+            status: errorValue == nil ? nil : .failed,
+            error: errorValue.map(formatError),
+            createdAt: createdAt
+        )
+    }
+}
+
+private func openCodeTimestamp(_ value: JSONValue?) -> String? {
+    if let string = jsonString(value) {
+        return string
+    }
+    guard let number = jsonNumber(value) else { return nil }
+    let seconds = number > 10_000_000_000 ? number / 1_000 : number
+    return ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: seconds))
 }
 
 private func parseOpenCodeModels(_ value: JSONValue?) -> [ModelInfo] {

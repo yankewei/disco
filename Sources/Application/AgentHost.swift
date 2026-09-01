@@ -5,7 +5,9 @@ final class AgentHost {
 
     private let store: SQLiteStore
     private let eventHandler: EventHandler
-    private let backends: [BackendKind: AgentBackend]
+    private let executableURLProvider: () async -> [BackendKind: URL]
+    private var backends: [BackendKind: AgentBackend]
+    private var executableURLs: [BackendKind: URL]
     private let stateLock = NSLock()
     private var activeRuns: [String: ActiveRun] = [:]
     private var pendingApprovals: [String: PendingApproval] = [:]
@@ -15,39 +17,36 @@ final class AgentHost {
     init(
         store: SQLiteStore,
         eventHandler: @escaping EventHandler,
-        codexExecutableURL: URL?,
-        openCodeExecutableURL: URL?
+        backends: [BackendKind: AgentBackend],
+        executableURLs: [BackendKind: URL],
+        executableURLProvider: @escaping () async -> [BackendKind: URL]
     ) {
         self.store = store
         self.eventHandler = eventHandler
-        var backends: [BackendKind: AgentBackend] = [:]
-        if let codexExecutableURL {
-            backends[.codex] = CodexBackend(executableURL: codexExecutableURL)
-        }
-        if let openCodeExecutableURL {
-            backends[.opencode] = OpenCodeBackend(executableURL: openCodeExecutableURL)
-        }
         self.backends = backends
+        self.executableURLs = executableURLs
+        self.executableURLProvider = executableURLProvider
     }
 
     func listProjects() throws -> [ProjectInfo] {
         try store.listProjects()
     }
 
-    func createProject(path: String) throws -> ProjectInfo {
-        let normalizedURL = URL(fileURLWithPath: path).standardizedFileURL
+    func createProject(projectPath: String) throws -> ProjectInfo {
+        let normalizedURL = URL(fileURLWithPath: projectPath).standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: normalizedURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw AgentHostError.invalidWorkspace
         }
-        if let existingProject = try store.project(path: normalizedURL.path) {
+        if let existingProject = try store.project(projectPath: normalizedURL.path) {
             return existingProject
         }
         let project = ProjectInfo(
-            id: UUID().uuidString,
+            projectID: UUID().uuidString,
             name: normalizedURL.lastPathComponent,
-            path: normalizedURL.path,
-            createdAt: .timestamp()
+            projectPath: normalizedURL.path,
+            createdAt: .timestamp(),
+            activatedAt: .timestamp()
         )
         try store.createProject(project)
         return project
@@ -57,9 +56,38 @@ final class AgentHost {
         try store.listSessions(projectID: projectID)
     }
 
+    func activateProject(projectID: String) throws {
+        try store.touchProject(projectID: projectID)
+    }
+
+    func activateSession(sessionID: String) throws {
+        try store.touchSession(sessionID: sessionID)
+    }
+
+    func refreshSessions(projectID: String) async throws -> [SessionInfo] {
+        guard let project = try store.project(id: projectID) else {
+            throw AgentHostError.projectNotFound
+        }
+        let availableBackends = withStateLock { backends }
+        for agent in BackendKind.allCases {
+            guard let backend = availableBackends[agent] else { continue }
+            guard let snapshots = try? await backend.listSessions(workingDirectory: project.projectPath) else {
+                continue
+            }
+            for snapshot in snapshots {
+                try store.saveAgentSession(
+                    projectID: projectID,
+                    agent: agent,
+                    snapshot: snapshot
+                )
+            }
+        }
+        return try store.listSessions(projectID: projectID)
+    }
+
     func createSession(
         projectID: String,
-        backend: BackendKind,
+        agent: BackendKind,
         modelID: String?,
         reasoningEffort: ReasoningEffort?,
         sandboxMode: SandboxMode?
@@ -67,30 +95,65 @@ final class AgentHost {
         guard try store.project(id: projectID) != nil else {
             throw AgentHostError.projectNotFound
         }
-        guard backends[backend] != nil else {
-            throw AgentHostError.providerUnavailable(backend.displayName)
+        guard self.backend(for: agent) != nil else {
+            throw AgentHostError.providerUnavailable(agent.displayName)
         }
         let session = SessionInfo(
             sessionID: UUID().uuidString,
             projectID: projectID,
-            backend: backend,
+            agent: agent,
             modelID: modelID,
             reasoningEffort: reasoningEffort,
             sandboxMode: sandboxMode,
-            backendSessionID: nil,
+            agentThreadID: nil,
             title: "新对话",
-            updatedAt: .timestamp()
+            createdAt: .timestamp(),
+            activatedAt: nil
         )
         try store.createSession(session)
         return session
     }
 
-    func messages(sessionID: String) throws -> [StoredMessage] {
-        try store.messages(sessionID: sessionID)
+    func loadMessages(sessionID: String) async throws -> [ConversationMessage] {
+        guard let session = try store.session(id: sessionID) else {
+            throw AgentHostError.sessionNotFound
+        }
+        guard let project = try store.project(id: session.projectID) else {
+            throw AgentHostError.projectNotFound
+        }
+        guard let agentThreadID = session.agentThreadID else {
+            return []
+        }
+        guard let backend = self.backend(for: session.agent) else {
+            throw AgentHostError.providerUnavailable(session.agent.displayName)
+        }
+        return try await backend.loadMessages(
+            agentThreadID: agentThreadID,
+            workingDirectory: project.projectPath
+        )
+    }
+
+    func refreshBackends() async {
+        guard withStateLock({ !isShuttingDown && activeRuns.isEmpty }) else { return }
+        let configuration = AgentBackendConfiguration(
+            executableURLs: await executableURLProvider()
+        )
+        let previousBackends = withStateLock { () -> [AgentBackend] in
+            guard !isShuttingDown, activeRuns.isEmpty else { return [] }
+            guard executableURLs != configuration.executableURLs else { return [] }
+            let previousBackends = Array(backends.values)
+            backends = configuration.backends
+            executableURLs = configuration.executableURLs
+            return previousBackends
+        }
+        for backend in previousBackends {
+            backend.shutdown()
+        }
     }
 
     func providers() async -> [ProviderInfo] {
         var providers: [ProviderInfo] = []
+        let (backends, executableURLs) = withStateLock { (self.backends, self.executableURLs) }
         for backendKind in BackendKind.allCases {
             guard let backend = backends[backendKind] else {
                 providers.append(
@@ -98,6 +161,8 @@ final class AgentHost {
                         kind: backendKind,
                         available: false,
                         detail: "未找到 \(backendKind.displayName) 命令",
+                        version: nil,
+                        executablePath: nil,
                         supportsPlan: backendKind == .codex,
                         models: []
                     )
@@ -110,6 +175,10 @@ final class AgentHost {
                     kind: backendKind,
                     available: true,
                     detail: "已检测到 \(backendKind.displayName)",
+                    version: executableURLs[backendKind].flatMap {
+                        ExecutableMetadataLocator.version(for: $0)
+                    },
+                    executablePath: executableURLs[backendKind]?.path,
                     supportsPlan: backend.supportsPlan,
                     models: models
                 )
@@ -132,8 +201,8 @@ final class AgentHost {
             guard try store.project(id: session.projectID) != nil else {
                 throw AgentHostError.projectNotFound
             }
-            guard let backend = backends[session.backend] else {
-                throw AgentHostError.providerUnavailable(session.backend.displayName)
+            guard let backend = self.backend(for: session.agent) else {
+                throw AgentHostError.providerUnavailable(session.agent.displayName)
             }
             guard mode != .plan || backend.supportsPlan else {
                 throw AgentHostError.planModeUnsupported
@@ -160,7 +229,6 @@ final class AgentHost {
         }
 
         eventHandler(.runStarted(sessionID: sessionID, runID: runID))
-        var timelineBuilder = TimelineBuilder()
         var runStatus = RunStatus.completed
         var runError: String?
         var sessionTitle: String?
@@ -170,49 +238,34 @@ final class AgentHost {
         } else {
             nil
         }
-        guard let session, let project, let backend = backends[session.backend] else {
+        guard let session, let project, let backend = self.backend(for: session.agent) else {
             finishRun(sessionID: sessionID, runID: runID, status: .failed, title: nil, error: "运行配置无效")
             return
         }
 
         do {
-            try store.appendMessage(
-                sessionID: sessionID,
-                message: StoredMessage(
-                    id: UUID().uuidString,
-                    role: .user,
-                    text: text,
-                    reasoning: nil,
-                    toolCalls: nil,
-                    items: nil,
-                    timeline: nil,
-                    status: nil,
-                    error: nil,
-                    createdAt: .timestamp()
-                )
-            )
+            try store.touchSession(sessionID: sessionID)
             if session.title == "新对话" {
                 let title = titleFromPrompt(text)
                 sessionTitle = title
                 try store.updateSessionTitle(sessionID: sessionID, title: title)
             }
             let context = BackendRunContext(
-                backendSessionID: session.backendSessionID,
+                agentThreadID: session.agentThreadID,
                 modelID: session.modelID,
                 reasoningEffort: session.reasoningEffort,
                 sandboxMode: session.sandboxMode,
-                workingDirectory: project.path,
+                workingDirectory: project.projectPath,
                 prompt: text,
                 mode: mode,
                 emit: { [weak self] event in
-                    timelineBuilder.apply(event)
                     self?.emitBackendEvent(event, sessionID: sessionID, runID: runID)
                 },
                 cancellation: cancellation,
-                reportBackendSessionID: { [weak self] backendSessionID in
-                    try? self?.store.updateBackendSessionID(
+                reportAgentThreadID: { [weak self] agentThreadID in
+                    try? self?.store.updateAgentThreadID(
                         sessionID: sessionID,
-                        backendSessionID: backendSessionID
+                        agentThreadID: agentThreadID
                     )
                 },
                 requestApproval: { [weak self] toolName, title, input in
@@ -239,29 +292,6 @@ final class AgentHost {
             }
         }
 
-        let finalizedBuilder = timelineBuilder.finalized(status: runStatus)
-        if !finalizedBuilder.timeline.isEmpty || !finalizedBuilder.assistantText.isEmpty || !finalizedBuilder.reasoning.isEmpty || !finalizedBuilder.toolCalls.isEmpty || runStatus != .completed {
-            do {
-                try store.appendMessage(
-                    sessionID: sessionID,
-                    message: StoredMessage(
-                        id: UUID().uuidString,
-                        role: .assistant,
-                        text: finalizedBuilder.assistantText,
-                        reasoning: finalizedBuilder.reasoning.isEmpty ? nil : finalizedBuilder.reasoning,
-                        toolCalls: finalizedBuilder.toolCalls.isEmpty ? nil : finalizedBuilder.toolCalls,
-                        items: finalizedBuilder.items.isEmpty ? nil : finalizedBuilder.items,
-                        timeline: finalizedBuilder.timeline,
-                        status: runStatus == .completed ? nil : runStatus,
-                        error: runError,
-                        createdAt: .timestamp()
-                    )
-                )
-            } catch {
-                runStatus = .failed
-                runError = error.localizedDescription
-            }
-        }
         finishRun(
             sessionID: sessionID,
             runID: runID,
@@ -311,7 +341,8 @@ final class AgentHost {
         for approval in approvals.values {
             approval.continuation.resume(returning: .denied)
         }
-        for backend in backends.values {
+        let backendList = withStateLock { Array(backends.values) }
+        for backend in backendList {
             backend.shutdown()
         }
         await waitForShutdown()
@@ -432,6 +463,10 @@ final class AgentHost {
         stateLock.lock()
         defer { stateLock.unlock() }
         return try operation()
+    }
+
+    private func backend(for kind: BackendKind) -> AgentBackend? {
+        withStateLock { backends[kind] }
     }
 
     private func titleFromPrompt(_ prompt: String) -> String {

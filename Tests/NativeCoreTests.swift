@@ -4,8 +4,8 @@ import SQLite3
 import XCTest
 
 final class NativeCoreTests: XCTestCase {
-    func testStoredMessageRoundTripKeepsTimeline() throws {
-        let message = StoredMessage(
+    func testConversationMessageRoundTripKeepsTimeline() throws {
+        let message = ConversationMessage(
             id: "message-1",
             role: .assistant,
             text: "完成",
@@ -38,7 +38,7 @@ final class NativeCoreTests: XCTestCase {
             createdAt: "2026-01-01T00:00:00Z"
         )
         let data = try JSONEncoder().encode(message)
-        let decoded = try JSONDecoder().decode(StoredMessage.self, from: data)
+        let decoded = try JSONDecoder().decode(ConversationMessage.self, from: data)
         XCTAssertEqual(decoded, message)
 
         let commandJSON = #"{"type":"command_execution","id":"command-1","command":"pwd","output":"/tmp","processId":"42","state":"completed"}"#
@@ -167,15 +167,20 @@ final class NativeCoreTests: XCTestCase {
 
         let store = try SQLiteStore(databaseURL: databaseURL)
         let session = try XCTUnwrap(store.session(id: "session-1"))
-        XCTAssertEqual(session.backend, .codex)
+        XCTAssertEqual(session.agent, .codex)
+        XCTAssertEqual(session.agentThreadID, "thread-1")
         XCTAssertNil(session.modelID)
-        let message = try XCTUnwrap(store.messages(sessionID: session.id).first)
-        XCTAssertEqual(message.text, "已迁移")
-        XCTAssertNil(message.items)
-        XCTAssertNil(message.timeline)
-        XCTAssertNil(message.status)
-        XCTAssertNil(message.error)
         store.close()
+
+        var migratedDatabase: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(databaseURL.path, &migratedDatabase, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(migratedDatabase) }
+        let messagesTableStatement = try XCTUnwrap(try prepareStatement(
+            database: migratedDatabase,
+            sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+        ))
+        defer { sqlite3_finalize(messagesTableStatement) }
+        XCTAssertEqual(sqlite3_step(messagesTableStatement), SQLITE_DONE)
     }
 
     func testSQLiteStoreRoundTrip() throws {
@@ -186,46 +191,63 @@ final class NativeCoreTests: XCTestCase {
 
         let store = try SQLiteStore(databaseURL: databaseURL)
         let project = ProjectInfo(
-            id: "project-1",
+            projectID: "project-1",
             name: "Disco",
-            path: "/tmp/disco",
-            createdAt: "2026-01-01T00:00:00Z"
+            projectPath: "/tmp/disco",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: "2026-01-01T00:00:01Z"
         )
         try store.createProject(project)
         let session = SessionInfo(
             sessionID: "session-1",
             projectID: project.id,
-            backend: .codex,
+            agent: .codex,
             modelID: "o3",
             reasoningEffort: .high,
             sandboxMode: .workspaceWrite,
-            backendSessionID: "thread-1",
+            agentThreadID: "thread-1",
             title: "新对话",
-            updatedAt: "2026-01-01T00:00:00Z"
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: "2026-01-01T00:00:01Z"
         )
         try store.createSession(session)
-        try store.appendMessage(
-            sessionID: session.id,
-            message: StoredMessage(
-                id: "message-1",
-                role: .user,
-                text: "执行任务",
-                reasoning: nil,
-                toolCalls: nil,
-                items: nil,
-                timeline: nil,
-                status: nil,
-                error: nil,
-                createdAt: "2026-01-01T00:00:01Z"
-            )
-        )
 
         XCTAssertEqual(try store.listProjects(), [project])
         let storedSession = try XCTUnwrap(store.listSessions(projectID: project.id).first)
-        XCTAssertEqual(storedSession.backend, session.backend)
-        XCTAssertEqual(storedSession.backendSessionID, session.backendSessionID)
-        XCTAssertEqual(storedSession.updatedAt, "2026-01-01T00:00:01Z")
-        XCTAssertEqual(try store.messages(sessionID: session.id).count, 1)
+        XCTAssertEqual(storedSession.agent, session.agent)
+        XCTAssertEqual(storedSession.agentThreadID, session.agentThreadID)
+        XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
+
+        try store.saveAgentSession(
+            projectID: project.id,
+            agent: .opencode,
+            snapshot: AgentSessionSnapshot(
+                agentThreadID: "session-2",
+                title: "已发现会话",
+                createdAt: "2026-01-02T00:00:00Z",
+                activatedAt: "2026-01-02T00:00:01Z",
+                modelID: "openai/gpt-5",
+                reasoningEffort: .high,
+                sandboxMode: nil
+            )
+        )
+        let importedSession = try XCTUnwrap(
+            store.listSessions(projectID: project.id).first { $0.agentThreadID == "session-2" }
+        )
+        XCTAssertEqual(importedSession.title, "已发现会话")
+        XCTAssertEqual(importedSession.agent, .opencode)
+        XCTAssertEqual(importedSession.modelID, "openai/gpt-5")
         store.close()
+    }
+
+    private func prepareStatement(
+        database: OpaquePointer?,
+        sql: String
+    ) throws -> OpaquePointer? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw NSError(domain: "NativeCoreTests", code: 1)
+        }
+        return statement
     }
 }

@@ -8,7 +8,7 @@ struct WorkspaceView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(expandedProjectIDs: $expandedProjectIDs)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 360)
+                .navigationSplitViewColumnWidth(228)
         } detail: {
             ConversationView()
         }
@@ -51,13 +51,6 @@ private struct SidebarView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("添加项目")
-
-                SettingsLink {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.borderless)
-                .help("设置")
-                .accessibilityLabel("设置")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -81,7 +74,7 @@ private struct SidebarView: View {
                                 model.selectSession(session)
                             } label: {
                                 HStack(spacing: 8) {
-                                    Image(systemName: session.backend == .codex ? "sparkles" : "terminal")
+                                    Image(systemName: session.agent.systemImage)
                                         .foregroundStyle(.secondary)
                                     Text(session.title)
                                         .lineLimit(1)
@@ -115,11 +108,15 @@ private struct SidebarView: View {
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
-                Image(systemName: "circle.grid.2x2")
-                    .foregroundStyle(.secondary)
-                Text("Codex 与 OpenCode")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                SettingsLink {
+                    Image(systemName: "gearshape")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help("设置")
+                .accessibilityLabel("设置")
+
                 Spacer()
             }
             .padding(12)
@@ -152,7 +149,7 @@ private struct ConversationView: View {
                 Text(model.selectedSession?.title ?? model.selectedProject?.name ?? "Disco")
                     .font(.headline)
                 if let project = model.selectedProject {
-                    Text(project.path)
+                        Text(project.projectPath)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -230,42 +227,50 @@ private struct WelcomeView: View {
 }
 
 private struct MessageView: View {
-    let message: StoredMessage
+    let message: ConversationMessage
 
     var body: some View {
-        let isUserMessage = message.role == .user
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: isUserMessage ? "person" : "sparkles")
-                    .foregroundStyle(isUserMessage ? .blue : .purple)
-                Text(isUserMessage ? "你" : "Disco")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                if let status = message.status {
-                    Text(statusLabel(status))
-                        .font(.caption)
-                        .foregroundStyle(status == .failed ? .red : .secondary)
-                }
-            }
-            if isUserMessage {
+        if message.role == .user {
+            HStack {
+                Spacer(minLength: 0)
                 Text(message.text)
                     .textSelection(.enabled)
-                    .padding(12)
-                    .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
-            } else if let timeline = message.timeline, !timeline.isEmpty {
-                ForEach(timeline) { item in
-                    MessageItemView(item: item)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+                    .frame(maxWidth: 620, alignment: .trailing)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.purple)
+                    Text("Disco")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if let status = message.status {
+                        Text(statusLabel(status))
+                            .font(.caption)
+                            .foregroundStyle(status == .failed ? .red : .secondary)
+                    }
                 }
-            } else {
-                MarkdownText(text: message.text)
+                if let timeline = message.timeline, !timeline.isEmpty {
+                    ForEach(timeline) { item in
+                        MessageItemView(item: item)
+                    }
+                } else {
+                    MarkdownText(text: message.text)
+                }
+                if let error = message.error {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .font(.callout)
+                }
             }
-            if let error = message.error {
-                Text(error)
-                    .foregroundStyle(.red)
-                    .font(.callout)
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func statusLabel(_ status: RunStatus) -> String {
@@ -481,12 +486,12 @@ private struct ComposerView: View {
                 Picker(
                     "Provider",
                     selection: Binding(
-                        get: { model.selectedBackend },
-                        set: { model.updateBackend($0) }
+                        get: { model.selectedAgent },
+                        set: { model.updateAgent($0) }
                     )
-                ) {
+                    ) {
                     ForEach(model.providers) { provider in
-                        Label(provider.kind.displayName, systemImage: provider.kind == .codex ? "sparkles" : "terminal")
+                        Label(provider.kind.displayName, systemImage: provider.kind.systemImage)
                             .tag(provider.kind)
                     }
                 }
@@ -543,7 +548,7 @@ private struct ComposerView: View {
                 }
                 .labelsHidden()
                 .frame(maxWidth: 140)
-                .disabled(isRunning || model.selectedBackend != .codex)
+                .disabled(isRunning || model.selectedAgent != .codex)
 
                 Toggle("计划", isOn: $model.planMode)
                     .toggleStyle(.checkbox)

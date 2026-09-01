@@ -9,9 +9,9 @@ final class AppModel: ObservableObject {
     @Published var providers: [ProviderInfo] = []
     @Published var selectedProjectID: String?
     @Published var selectedSessionID: String?
-    @Published var messages: [StoredMessage] = []
+    @Published var messages: [ConversationMessage] = []
     @Published var draft = ""
-    @Published var selectedBackend: BackendKind = .codex
+    @Published var selectedAgent: BackendKind = .codex
     @Published var selectedModelID: String?
     @Published var selectedReasoningEffort: ReasoningEffort?
     @Published var selectedSandboxMode = defaultSandboxMode
@@ -37,7 +37,7 @@ final class AppModel: ObservableObject {
     }
 
     var selectedProvider: ProviderInfo? {
-        providers.first { $0.kind == selectedBackend }
+        providers.first { $0.kind == selectedAgent }
     }
 
     var availableProviders: [ProviderInfo] {
@@ -50,16 +50,12 @@ final class AppModel: ObservableObject {
         var resolvedHost: AgentHost?
         let relay = AppEventRelay()
         do {
-            let environment = try AppEnvironment.live()
-            let store = try SQLiteStore(databaseURL: environment.databaseURL)
-            resolvedDatabaseURL = environment.databaseURL
-            resolvedStore = store
-            resolvedHost = AgentHost(
-                store: store,
-                eventHandler: { event in relay.send(event) },
-                codexExecutableURL: ExecutableLocator.locate("codex"),
-                openCodeExecutableURL: ExecutableLocator.locate("opencode")
-            )
+            let dependencies = try AppDependencies.live {
+                relay.send($0)
+            }
+            resolvedDatabaseURL = dependencies.databaseURL
+            resolvedStore = dependencies.store
+            resolvedHost = dependencies.agentHost
         } catch {
             workspaceError = error.localizedDescription
         }
@@ -74,13 +70,14 @@ final class AppModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
+            await host.refreshBackends()
             providers = await host.providers()
             guard !isShuttingDown else { return }
             let projectList = try host.listProjects()
             projects = projectList
             var nextSessions: [String: [SessionInfo]] = [:]
             for project in projectList {
-                nextSessions[project.id] = try host.listSessions(projectID: project.id)
+                nextSessions[project.id] = try await host.refreshSessions(projectID: project.id)
             }
             sessionsByProject = nextSessions
             if selectedProjectID == nil || !projectList.contains(where: { $0.id == selectedProjectID }) {
@@ -100,8 +97,8 @@ final class AppModel: ObservableObject {
                 selectedSessionID = nil
                 messages = []
             }
-            if selectedSession == nil, !availableProviders.contains(where: { $0.kind == selectedBackend }) {
-                selectedBackend = availableProviders.first?.kind ?? .codex
+            if selectedSession == nil, !availableProviders.contains(where: { $0.kind == selectedAgent }) {
+                selectedAgent = availableProviders.first?.kind ?? .codex
                 selectedModelID = nil
                 selectedReasoningEffort = nil
             }
@@ -114,6 +111,9 @@ final class AppModel: ObservableObject {
         selectedProjectID = project.id
         selectedSessionID = nil
         messages = []
+        if let host {
+            try? host.activateProject(projectID: project.id)
+        }
         let sessions = sessionsByProject[project.id] ?? []
         if let session = sessions.first {
             selectSession(session)
@@ -123,17 +123,18 @@ final class AppModel: ObservableObject {
     func selectSession(_ session: SessionInfo) {
         selectedProjectID = session.projectID
         selectedSessionID = session.id
-        selectedBackend = session.backend
-        let providerModels = providers.first { $0.kind == session.backend }?.models ?? []
+        selectedAgent = session.agent
+        let providerModels = providers.first { $0.kind == session.agent }?.models ?? []
         selectedModelID = providerModels.contains(where: { $0.id == session.modelID }) ? session.modelID : nil
         selectedReasoningEffort = session.reasoningEffort
         selectedSandboxMode = session.sandboxMode ?? defaultSandboxMode
         planMode = false
-        guard let host else { return }
-        do {
-            messages = try host.messages(sessionID: session.id)
-        } catch {
-            workspaceError = error.localizedDescription
+        messages = []
+        if let host {
+            try? host.activateSession(sessionID: session.id)
+        }
+        Task { [weak self] in
+            await self?.loadMessages(sessionID: session.id)
         }
     }
 
@@ -144,22 +145,35 @@ final class AppModel: ObservableObject {
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.begin { [weak self] response in
-            guard response == .OK, let path = panel.url?.path else { return }
+            guard response == .OK, let projectPath = panel.url?.path else { return }
             Task { @MainActor [weak self] in
-                self?.createProject(path: path)
+                self?.createProject(projectPath: projectPath)
             }
         }
     }
 
-    func createProject(path: String) {
+    func createProject(projectPath: String) {
         guard let host else { return }
         do {
-            let project = try host.createProject(path: path)
+            let project = try host.createProject(projectPath: projectPath)
             let sessions = try host.listSessions(projectID: project.id)
             projects.removeAll { $0.id == project.id }
             projects.insert(project, at: 0)
             sessionsByProject[project.id] = sessions
             selectProject(project)
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let refreshedSessions = try await host.refreshSessions(projectID: project.id)
+                    guard selectedProjectID == project.id else { return }
+                    sessionsByProject[project.id] = refreshedSessions
+                    if selectedSessionID == nil, let session = refreshedSessions.first {
+                        selectSession(session)
+                    }
+                } catch {
+                    workspaceError = error.localizedDescription
+                }
+            }
         } catch {
             workspaceError = error.localizedDescription
         }
@@ -182,15 +196,15 @@ final class AppModel: ObservableObject {
             workspaceError = "请先选择一个项目"
             return
         }
-        let provider = providers.first { $0.kind == selectedBackend }
+        let provider = providers.first { $0.kind == selectedAgent }
         guard provider?.available == true else {
-            workspaceError = "Provider 不可用：\(selectedBackend.displayName)"
+            workspaceError = "Provider 不可用：\(selectedAgent.displayName)"
             return
         }
         do {
             let session = try host.createSession(
                 projectID: project.id,
-                backend: selectedBackend,
+                agent: selectedAgent,
                 modelID: selectedModelID,
                 reasoningEffort: selectedReasoningEffort,
                 sandboxMode: selectedSandboxMode
@@ -198,7 +212,7 @@ final class AppModel: ObservableObject {
             sessionsByProject[project.id, default: []].insert(session, at: 0)
             selectedProjectID = project.id
             selectedSessionID = session.id
-            selectedBackend = session.backend
+            selectedAgent = session.agent
             selectedModelID = session.modelID
             selectedReasoningEffort = session.reasoningEffort
             selectedSandboxMode = session.sandboxMode ?? defaultSandboxMode
@@ -208,15 +222,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func updateBackend(_ backend: BackendKind) {
+    func updateAgent(_ agent: BackendKind) {
         guard !isRunning else {
             workspaceError = "运行期间不能切换 Provider"
             return
         }
-        if selectedSession != nil, selectedSession?.backend != backend {
+        if selectedSession != nil, selectedSession?.agent != agent {
             startNewSessionSelection()
         }
-        selectedBackend = backend
+        selectedAgent = agent
         selectedModelID = nil
         selectedReasoningEffort = nil
     }
@@ -307,7 +321,7 @@ final class AppModel: ObservableObject {
 
     private func send(text: String, to session: SessionInfo, using host: AgentHost) {
         draft = ""
-        let userMessage = StoredMessage(
+        let userMessage = ConversationMessage(
             id: UUID().uuidString,
             role: .user,
             text: text,
@@ -387,7 +401,7 @@ final class AppModel: ObservableObject {
         builder.apply(event)
         activeTimelineBuilders[sessionID] = builder
         guard selectedSessionID == sessionID else { return }
-        let renderedMessage = StoredMessage(
+        let renderedMessage = ConversationMessage(
             id: "active-\(sessionID)",
             role: .assistant,
             text: builder.assistantText,
@@ -406,10 +420,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func loadMessages(sessionID: String) async {
+        guard let host else { return }
+        do {
+            let loadedMessages = try await host.loadMessages(sessionID: sessionID)
+            guard selectedSessionID == sessionID else { return }
+            messages = loadedMessages
+        } catch {
+            guard selectedSessionID == sessionID else { return }
+            workspaceError = error.localizedDescription
+        }
+    }
+
     private func reloadMessages(sessionID: String) async {
         guard let host else { return }
         do {
-            let loadedMessages = try host.messages(sessionID: sessionID)
+            let loadedMessages = try await host.loadMessages(sessionID: sessionID)
             if selectedSessionID == sessionID {
                 messages = loadedMessages
             }
@@ -422,7 +448,7 @@ final class AppModel: ObservableObject {
     private func refreshSessions(for projectID: String?) async {
         guard let host, let projectID else { return }
         do {
-            sessionsByProject[projectID] = try host.listSessions(projectID: projectID)
+            sessionsByProject[projectID] = try await host.refreshSessions(projectID: projectID)
         } catch {
             workspaceError = error.localizedDescription
         }

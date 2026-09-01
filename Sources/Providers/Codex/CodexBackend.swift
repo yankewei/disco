@@ -42,6 +42,42 @@ final class CodexBackend: AgentBackend {
         }
     }
 
+    func listSessions(workingDirectory: String) async throws -> [AgentSessionSnapshot] {
+        try await startIfNeeded()
+        var snapshots: [AgentSessionSnapshot] = []
+        var cursor: String?
+        repeat {
+            var params: [String: JSONValue] = [
+                "cwd": .string(workingDirectory),
+                "limit": .number(100),
+                "sortKey": .string("updated_at"),
+            ]
+            if let cursor {
+                params["cursor"] = .string(cursor)
+            }
+            let response = try await appServer.request(method: "thread/list", params: params)
+            let responseObject = response.objectValue ?? [:]
+            let threadValues = jsonArray(responseObject["data"] ?? responseObject["threads"])
+            snapshots.append(contentsOf: threadValues.compactMap(codexSessionSnapshot))
+            cursor = jsonString(responseObject["nextCursor"] ?? responseObject["next_cursor"])
+        } while cursor != nil
+        return snapshots
+    }
+
+    func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage] {
+        try await startIfNeeded()
+        let response = try await appServer.request(
+            method: "thread/read",
+            params: [
+                "threadId": .string(agentThreadID),
+                "includeTurns": .boolean(true),
+            ]
+        )
+        let responseObject = response.objectValue ?? [:]
+        let thread = jsonObject(responseObject["thread"]) ?? responseObject
+        return parseCodexMessages(jsonArray(thread["turns"]))
+    }
+
     func run(context: BackendRunContext) async throws -> String {
         if context.cancellation.isCancelled {
             throw CodexBackendError.cancelled
@@ -67,8 +103,8 @@ final class CodexBackend: AgentBackend {
         }
 
         let threadResponse: JSONValue
-        if let backendSessionID = context.backendSessionID {
-            threadParams["threadId"] = .string(backendSessionID)
+        if let agentThreadID = context.agentThreadID {
+            threadParams["threadId"] = .string(agentThreadID)
             threadResponse = try await appServer.request(
                 method: "thread/resume",
                 params: threadParams
@@ -86,7 +122,7 @@ final class CodexBackend: AgentBackend {
         else {
             throw CodexBackendError.invalidResponse("Codex 未返回线程 ID")
         }
-        context.reportBackendSessionID(threadID)
+        context.reportAgentThreadID(threadID)
 
         let activeRun = ActiveCodexRun(threadID: threadID, context: context)
         withStateLock {
@@ -858,7 +894,11 @@ private func makeMessageItem(
 
     switch type {
     case "agentMessage", "agent_message":
-        return .text(id: id, text: jsonString(item["text"]) ?? "", state: state)
+        return .text(
+            id: id,
+            text: jsonString(item["text"]) ?? jsonTextParts([item["content"]]),
+            state: state
+        )
     case "reasoning":
         let reasoningText = jsonTextParts([item["summary"], item["content"]])
         return .reasoning(
@@ -910,6 +950,89 @@ private func makeMessageItem(
     default:
         return .codexEvent(id: id, eventType: type, payload: item, state: mapItemState(jsonString(item["status"]), fallback: state))
     }
+}
+
+private func codexSessionSnapshot(_ value: JSONValue) -> AgentSessionSnapshot? {
+    guard let object = jsonObject(value), let agentThreadID = jsonString(object["id"]) else {
+        return nil
+    }
+    return AgentSessionSnapshot(
+        agentThreadID: agentThreadID,
+        title: jsonString(object["name"] ?? object["title"] ?? object["preview"]),
+        createdAt: jsonString(object["createdAt"] ?? object["created_at"]),
+        activatedAt: jsonString(object["updatedAt"] ?? object["updated_at"] ?? object["recencyAt"]),
+        modelID: jsonString(object["model"]),
+        reasoningEffort: jsonString(object["reasoningEffort"] ?? object["reasoning_effort"])
+            .flatMap(ReasoningEffort.init(rawValue:)),
+        sandboxMode: jsonString(object["sandbox"] ?? object["sandboxMode"] ?? object["sandbox_mode"])
+            .flatMap(SandboxMode.init(rawValue:))
+    )
+}
+
+private func parseCodexMessages(_ turns: [JSONValue]) -> [ConversationMessage] {
+    var messages: [ConversationMessage] = []
+    for (turnIndex, turnValue) in turns.enumerated() {
+        guard let turn = jsonObject(turnValue) else { continue }
+        let turnID = jsonString(turn["id"]) ?? "turn-\(turnIndex)"
+        let createdAt = jsonString(turn["createdAt"] ?? turn["created_at"]) ?? .timestamp()
+        let completedAt = jsonString(turn["updatedAt"] ?? turn["updated_at"]) ?? createdAt
+        var userText = ""
+        var assistantText = ""
+        var reasoning = ""
+        var timeline: [MessageItem] = []
+
+        for itemValue in jsonArray(turn["items"]) {
+            guard let item = jsonObject(itemValue), let type = jsonString(item["type"]) else { continue }
+            if type == "userMessage" || type == "user_message" {
+                userText = jsonString(item["text"]) ?? jsonTextParts([item["content"], item["parts"]])
+                continue
+            }
+            guard let messageItem = makeMessageItem(item, state: .completed) else { continue }
+            timeline.append(messageItem)
+            switch messageItem {
+            case let .text(_, text, _):
+                assistantText += text
+            case let .reasoning(_, text, _):
+                reasoning += text
+            default:
+                break
+            }
+        }
+
+        if !userText.isEmpty {
+            messages.append(
+                ConversationMessage(
+                    id: "\(turnID)-user",
+                    role: .user,
+                    text: userText,
+                    reasoning: nil,
+                    toolCalls: nil,
+                    items: nil,
+                    timeline: nil,
+                    status: nil,
+                    error: nil,
+                    createdAt: createdAt
+                )
+            )
+        }
+        if !assistantText.isEmpty || !reasoning.isEmpty || !timeline.isEmpty {
+            messages.append(
+                ConversationMessage(
+                    id: "\(turnID)-assistant",
+                    role: .assistant,
+                    text: assistantText,
+                    reasoning: reasoning.isEmpty ? nil : reasoning,
+                    toolCalls: nil,
+                    items: timeline.isEmpty ? nil : timeline,
+                    timeline: timeline.isEmpty ? nil : timeline,
+                    status: nil,
+                    error: nil,
+                    createdAt: completedAt
+                )
+            )
+        }
+    }
+    return messages
 }
 
 private func modelInfo(_ value: JSONValue) -> ModelInfo? {

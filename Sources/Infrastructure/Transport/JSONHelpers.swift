@@ -33,7 +33,15 @@ func jsonStringArray(_ value: JSONValue?) -> [String] {
 
 func jsonTextParts(_ values: [JSONValue?]) -> String {
     values
-        .flatMap { jsonArray($0) }
+        .flatMap { value -> [JSONValue] in
+            if let string = value?.stringValue {
+                return [.string(string)]
+            }
+            if let object = jsonObject(value), let text = object["text"]?.stringValue {
+                return [.string(text)]
+            }
+            return jsonArray(value)
+        }
         .compactMap { value in
             if let text = value.stringValue {
                 return text

@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Shared domain values
 
-enum BackendKind: String, CaseIterable, Codable, Identifiable {
+enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
     case codex
     case opencode
 
@@ -16,6 +16,33 @@ enum BackendKind: String, CaseIterable, Codable, Identifiable {
             "Codex"
         case .opencode:
             "OpenCode"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .codex:
+            "sparkles"
+        case .opencode:
+            "terminal"
+        }
+    }
+
+    var iconAssetName: String {
+        switch self {
+        case .codex:
+            "CodexIcon"
+        case .opencode:
+            "OpenCodeIcon"
+        }
+    }
+
+    var cliDescription: String {
+        switch self {
+        case .codex:
+            "OpenAI Codex CLI"
+        case .opencode:
+            "OpenCode CLI"
         }
     }
 }
@@ -49,13 +76,13 @@ enum MessageItemState: String, Codable {
     case failed
 }
 
-enum SandboxMode: String, Codable, CaseIterable {
+enum SandboxMode: String, Codable, CaseIterable, Sendable {
     case readOnly = "read-only"
     case workspaceWrite = "workspace-write"
     case dangerFullAccess = "danger-full-access"
 }
 
-enum ReasoningEffort: String, Codable, CaseIterable {
+enum ReasoningEffort: String, Codable, CaseIterable, Sendable {
     case minimal
     case low
     case medium
@@ -69,10 +96,15 @@ enum ReasoningEffort: String, Codable, CaseIterable {
 let defaultSandboxMode = SandboxMode.workspaceWrite
 
 struct ProjectInfo: Codable, Identifiable, Hashable {
-    let id: String
+    var id: String {
+        projectID
+    }
+
+    let projectID: String
     var name: String
-    var path: String
+    var projectPath: String
     let createdAt: String
+    var activatedAt: String?
 }
 
 struct SessionInfo: Codable, Identifiable, Hashable {
@@ -82,13 +114,14 @@ struct SessionInfo: Codable, Identifiable, Hashable {
 
     let sessionID: String
     let projectID: String
-    var backend: BackendKind
+    var agent: BackendKind
     var modelID: String?
     var reasoningEffort: ReasoningEffort?
     var sandboxMode: SandboxMode?
-    var backendSessionID: String?
+    var agentThreadID: String?
     var title: String
-    var updatedAt: String
+    let createdAt: String
+    var activatedAt: String?
 }
 
 struct ModelInfo: Codable, Identifiable, Hashable {
@@ -101,6 +134,8 @@ struct ProviderInfo: Identifiable, Hashable {
     let kind: BackendKind
     let available: Bool
     let detail: String
+    let version: String?
+    let executablePath: String?
     let supportsPlan: Bool
     var models: [ModelInfo]
 
@@ -231,7 +266,7 @@ enum JSONValue: Codable, Hashable {
     }
 }
 
-// MARK: - Message persistence
+// MARK: - Normalized messages
 
 enum MessageItem: Codable, Identifiable, Hashable {
     case text(id: String, text: String, state: MessageItemState)
@@ -481,7 +516,7 @@ struct ToolCall: Codable, Hashable {
     var error: String?
 }
 
-struct StoredMessage: Codable, Identifiable, Hashable {
+struct ConversationMessage: Codable, Identifiable, Hashable {
     let id: String
     let role: MessageRole
     var text: String
@@ -497,121 +532,6 @@ struct StoredMessage: Codable, Identifiable, Hashable {
 enum MessageRole: String, Codable {
     case user
     case assistant
-}
-
-// MARK: - Runtime events
-
-enum BackendEvent {
-    case text(text: String, itemID: String?)
-    case reasoning(text: String, itemID: String?)
-    case item(MessageItem)
-    case tool(
-        id: String,
-        title: String,
-        state: ToolCallStatus,
-        input: JSONValue?,
-        output: String?,
-        error: String?
-    )
-}
-
-enum AgentEvent {
-    case runStarted(sessionID: String, runID: String)
-    case text(sessionID: String, runID: String, text: String, itemID: String?)
-    case reasoning(sessionID: String, runID: String, text: String, itemID: String?)
-    case item(sessionID: String, runID: String, item: MessageItem)
-    case tool(
-        sessionID: String,
-        runID: String,
-        id: String,
-        title: String,
-        state: ToolCallStatus,
-        input: JSONValue?,
-        output: String?,
-        error: String?
-    )
-    case approvalRequested(
-        sessionID: String,
-        runID: String,
-        approvalID: String,
-        toolName: String,
-        title: String?,
-        input: [String: JSONValue]
-    )
-    case approvalResolved(sessionID: String, runID: String, approvalID: String)
-    case runFinished(
-        sessionID: String,
-        runID: String,
-        status: RunStatus,
-        sessionTitle: String?,
-        error: String?
-    )
-}
-
-final class CancellationToken {
-    private let stateLock = NSLock()
-    private var cancelled = false
-    private var cancellationHandler: (() -> Void)?
-
-    var isCancelled: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return cancelled
-    }
-
-    var onCancel: (() -> Void)? {
-        get {
-            stateLock.lock()
-            defer { stateLock.unlock() }
-            return cancellationHandler
-        }
-        set {
-            stateLock.lock()
-            cancellationHandler = newValue
-            let shouldInvoke = cancelled && newValue != nil
-            stateLock.unlock()
-            if shouldInvoke {
-                newValue?()
-            }
-        }
-    }
-
-    func cancel() {
-        stateLock.lock()
-        guard !cancelled else {
-            stateLock.unlock()
-            return
-        }
-        cancelled = true
-        let handler = cancellationHandler
-        stateLock.unlock()
-        handler?()
-    }
-}
-
-struct BackendRunContext {
-    let backendSessionID: String?
-    let modelID: String?
-    let reasoningEffort: ReasoningEffort?
-    let sandboxMode: SandboxMode?
-    let workingDirectory: String
-    let prompt: String
-    let mode: RunMode
-    let emit: (BackendEvent) -> Void
-    let cancellation: CancellationToken
-    let reportBackendSessionID: (String) -> Void
-    let requestApproval: (
-        _ toolName: String,
-        _ title: String?,
-        _ input: [String: JSONValue]
-    ) async -> ApprovalDecision
-}
-
-protocol AgentBackend: AnyObject {
-    var supportsPlan: Bool { get }
-    func listModels() async -> [ModelInfo]
-    func run(context: BackendRunContext) async throws -> String
-    func shutdown()
 }
 
 extension String {
