@@ -200,7 +200,7 @@ final class OpenCodeBackend: AgentBackend {
             executableURL: executableURL,
             arguments: ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
             workingDirectory: workingDirectory,
-            environment: providerEnvironment(for: executableURL),
+            environment: await providerEnvironment(for: executableURL),
             captureStandardOutput: false,
             captureStandardError: false
         )

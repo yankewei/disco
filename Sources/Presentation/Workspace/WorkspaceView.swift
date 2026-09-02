@@ -174,15 +174,30 @@ private struct ConversationView: View {
             conversationHeader
             Divider()
             if model.selectedSession != nil {
-                messageList
-                Divider()
-                ApprovalList()
-                ComposerView()
+                GeometryReader { geometry in
+                    let chatColumnWidth = chatColumnWidth(for: geometry.size.width)
+
+                    VStack(spacing: 0) {
+                        messageList
+                        Divider()
+                        ApprovalList()
+                        ComposerView(availableHeight: geometry.size.height)
+                    }
+                    .frame(width: chatColumnWidth)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.white)
+                }
             } else {
                 WelcomeView()
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func chatColumnWidth(for availableWidth: CGFloat) -> CGFloat {
+        let targetWidth = availableWidth * 0.4
+        let minimumWidth: CGFloat = 400
+        return min(max(targetWidth, minimumWidth), max(availableWidth - 32, 0))
     }
 
     private var conversationHeader: some View {
@@ -221,13 +236,17 @@ private struct ConversationView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     ForEach(model.messages) { message in
-                        MessageView(message: message)
+                        MessageView(
+                            message: message,
+                            isStreaming: model.selectedSessionID.map { sessionID in
+                                model.runningSessionIDs.contains(sessionID)
+                                    && message.id == "active-\(sessionID)"
+                            } ?? false
+                        )
                             .id(message.id)
                     }
                 }
                 .padding(24)
-                .frame(maxWidth: 900, alignment: .leading)
-                .frame(maxWidth: .infinity)
             }
             .onChange(of: model.messages.count) {
                 if let lastMessage = model.messages.last {
@@ -270,6 +289,7 @@ private struct WelcomeView: View {
 
 private struct MessageView: View {
     let message: ConversationMessage
+    let isStreaming: Bool
 
     var body: some View {
         if message.role == .user {
@@ -280,30 +300,37 @@ private struct MessageView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+                    .background(Color(red: 0.92, green: 0.92, blue: 0.92), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .frame(maxWidth: 620, alignment: .trailing)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(.purple)
-                    Text("Disco")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    if let status = message.status {
+                if let status = message.status {
+                    HStack {
+                        Spacer()
                         Text(statusLabel(status))
                             .font(.caption)
                             .foregroundStyle(status == .failed ? .red : .secondary)
                     }
                 }
-                if let timeline = message.timeline, !timeline.isEmpty {
-                    ForEach(timeline) { item in
+                let visibleTimeline = (message.timeline ?? []).filter { item in
+                    if case .codexEvent = item {
+                        return false
+                    }
+                    return true
+                }
+                if !visibleTimeline.isEmpty {
+                    ForEach(visibleTimeline) { item in
                         MessageItemView(item: item)
                     }
-                } else {
+                } else if !message.text.isEmpty {
                     MarkdownText(text: message.text)
+                }
+                if isStreaming {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.top, 2)
                 }
                 if let error = message.error {
                     Text(error)
@@ -384,10 +411,16 @@ private struct MessageItemView: View {
             }
             .padding(12)
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+        case let .notice(_, message, _):
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .padding(10)
+                .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
         case let .error(_, message, state):
             ToolCard(title: "错误", state: stateLabel(state), input: nil, output: nil, error: message)
-        case let .codexEvent(_, eventType, payload, state):
-            ToolCard(title: eventType, state: stateLabel(state), input: JSONValue.object(payload).prettyPrinted(), output: nil, error: nil)
+        case .codexEvent:
+            EmptyView()
         }
     }
 
@@ -513,113 +546,270 @@ private struct ApprovalCard: View {
 
 private struct ComposerView: View {
     @EnvironmentObject private var model: AppModel
+    let availableHeight: CGFloat
 
     var body: some View {
-        VStack(spacing: 10) {
-            TextEditor(text: $model.draft)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(8)
-                .frame(minHeight: 74, maxHeight: 150)
-                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
-                .disabled(isRunning)
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                ZStack(alignment: .topLeading) {
+                    TextEditor(text: $model.draft)
+                        .font(.body)
+                        .scrollContentBackground(.hidden)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 6)
+                        .disabled(isRunning)
 
-            HStack(spacing: 10) {
-                Picker(
-                    "Provider",
-                    selection: Binding(
-                        get: { model.selectedAgent },
-                        set: { model.updateAgent($0) }
-                    )
-                    ) {
-                    ForEach(model.providers) { provider in
-                        Label(provider.kind.displayName, systemImage: provider.kind.systemImage)
-                            .tag(provider.kind)
+                    if model.draft.isEmpty {
+                        Text("做什么都可以…")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 17)
+                            .padding(.top, 12)
+                            .allowsHitTesting(false)
                     }
                 }
-                .labelsHidden()
-                .frame(maxWidth: 170)
-                .disabled(isRunning)
+                .frame(height: editorHeight)
 
-                Picker(
-                    "模型",
-                    selection: Binding(
-                        get: { model.selectedModelID },
-                        set: { model.updateModel($0) }
-                    )
-                ) {
-                    Text("默认模型").tag(nil as String?)
-                    ForEach(model.selectedProvider?.models ?? []) { modelInfo in
-                        Text(modelInfo.name).tag(Optional(modelInfo.id))
-                    }
+                HStack(spacing: 8) {
+                    agentModelMenu
+                    reasoningMenu
+                    sandboxMenu
+                    modeSwitcher
+
+                    Spacer(minLength: 0)
+
+                    sendButton
                 }
-                .labelsHidden()
-                .frame(maxWidth: 190)
-                .disabled(isRunning)
-
-                if let reasoningEfforts = model.selectedProvider?.models.first(where: { $0.id == model.selectedModelID })?.reasoningEfforts,
-                   !reasoningEfforts.isEmpty
-                {
-                    Picker(
-                        "推理",
-                        selection: Binding(
-                            get: { model.selectedReasoningEffort },
-                            set: { model.updateReasoningEffort($0) }
-                        )
-                    ) {
-                        Text("默认").tag(nil as ReasoningEffort?)
-                        ForEach(reasoningEfforts, id: \.self) { effort in
-                            Text(effort.rawValue).tag(Optional(effort))
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: 130)
-                    .disabled(isRunning)
-                }
-
-                Picker(
-                    "权限",
-                    selection: Binding(
-                        get: { model.selectedSandboxMode },
-                        set: { model.updateSandboxMode($0) }
-                    )
-                ) {
-                    Text("只读").tag(SandboxMode.readOnly)
-                    Text("工作区可写").tag(SandboxMode.workspaceWrite)
-                    Text("完全访问").tag(SandboxMode.dangerFullAccess)
-                }
-                .labelsHidden()
-                .frame(maxWidth: 140)
-                .disabled(isRunning || model.selectedAgent != .codex)
-
-                Toggle("计划", isOn: $model.planMode)
-                    .toggleStyle(.checkbox)
-                    .disabled(isRunning || model.selectedProvider?.supportsPlan != true)
-
-                Spacer()
-                if isRunning {
-                    Button("停止") {
-                        model.cancelRun()
-                    }
-                    .keyboardShortcut(.escape, modifiers: [])
-                } else {
-                    Button {
-                        model.sendPrompt()
-                    } label: {
-                        Image(systemName: "arrow.up")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .help("发送（⌘↩）")
-                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            }
+            .background(Color.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.black.opacity(0.12), lineWidth: 1)
             }
         }
-        .padding(20)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(height: composerHeight)
     }
 
     private var isRunning: Bool {
         guard let selectedSessionID = model.selectedSessionID else { return false }
         return model.runningSessionIDs.contains(selectedSessionID)
+    }
+
+    private var selectedModelName: String {
+        guard let selectedModelID = model.selectedModelID else { return "默认模型" }
+        return model.selectedProvider?.models.first { $0.id == selectedModelID }?.name ?? selectedModelID
+    }
+
+    private var selectedReasoningEfforts: [ReasoningEffort] {
+        model.selectedProvider?.models.first { $0.id == model.selectedModelID }?.reasoningEfforts ?? []
+    }
+
+    private var supportsPlan: Bool {
+        model.selectedProvider?.supportsPlan == true
+    }
+
+    private var composerHeight: CGFloat {
+        max(104, availableHeight * 0.05)
+    }
+
+    private var editorHeight: CGFloat {
+        max(42, composerHeight - 62)
+    }
+
+    private var agentModelMenu: some View {
+        HStack(spacing: 6) {
+            agentIcon
+
+            Menu {
+                Section("Agent") {
+                    ForEach(model.availableProviders) { provider in
+                        Button {
+                            model.updateAgent(provider.kind)
+                        } label: {
+                            Label(provider.kind.displayName, systemImage: provider.kind.systemImage)
+                        }
+                    }
+                }
+
+                Section("模型") {
+                    Button("默认模型") {
+                        model.updateModel(nil)
+                    }
+                    ForEach(model.selectedProvider?.models ?? []) { modelInfo in
+                        Button(modelInfo.name) {
+                            model.updateModel(modelInfo.id)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selectedModelName)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
+                .font(.system(size: 12, weight: .medium))
+            }
+            .menuStyle(.borderlessButton)
+            .help("切换 Agent 和模型")
+            .disabled(isRunning)
+        }
+        .frame(maxWidth: 130, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var agentIcon: some View {
+        if let provider = model.selectedProvider {
+            Image(provider.kind.iconAssetName)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 20, height: 20)
+                .clipped()
+                .frame(width: 34, height: 34)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+            Image(systemName: "sparkles")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 34, height: 34)
+        }
+    }
+
+    private var reasoningMenu: some View {
+        Menu {
+            Button("默认") {
+                model.updateReasoningEffort(nil)
+            }
+            ForEach(selectedReasoningEfforts, id: \.self) { effort in
+                Button(reasoningLabel(effort)) {
+                    model.updateReasoningEffort(effort)
+                }
+            }
+        } label: {
+            Text(reasoningLabel(model.selectedReasoningEffort))
+                .font(.system(size: 12, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(isRunning || selectedReasoningEfforts.isEmpty)
+        .help("思考级别")
+    }
+
+    private var sandboxMenu: some View {
+        Menu {
+            ForEach(SandboxMode.allCases, id: \.self) { sandboxMode in
+                Button {
+                    model.updateSandboxMode(sandboxMode)
+                } label: {
+                    Label(sandboxLabel(sandboxMode), systemImage: sandboxIcon(sandboxMode))
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "lock")
+                Text(authorizationLabel)
+            }
+            .font(.system(size: 12, weight: .medium))
+        }
+        .menuStyle(.borderlessButton)
+        .disabled(isRunning || model.selectedAgent != .codex)
+        .help("授权级别")
+    }
+
+    private var modeSwitcher: some View {
+        HStack(spacing: 2) {
+            Button("Build") {
+                model.planMode = false
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(model.planMode ? Color.primary : Color.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(model.planMode ? Color.clear : Color.black, in: Capsule())
+            .disabled(isRunning)
+
+            Button("Plan") {
+                model.planMode = true
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(model.planMode ? Color.white : Color.primary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(model.planMode ? Color.black : Color.clear, in: Capsule())
+            .disabled(isRunning || !supportsPlan)
+        }
+        .padding(2)
+        .background(Color.black.opacity(0.07), in: Capsule())
+        .opacity(isRunning ? 0.55 : 1)
+        .help("切换 Build 和 Plan 模式")
+    }
+
+    private var sendButton: some View {
+        Button {
+            if isRunning {
+                model.cancelRun()
+            } else {
+                model.sendPrompt()
+            }
+        } label: {
+            Image(systemName: isRunning ? "stop.fill" : "arrow.up")
+                .font(.system(size: 14, weight: .semibold))
+                .frame(width: 34, height: 34)
+                .foregroundStyle(canSend || isRunning ? .white : .black)
+                .background(
+                    (canSend || isRunning ? Color.black : Color(red: 0.82, green: 0.82, blue: 0.82)),
+                    in: Circle()
+                )
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(.return, modifiers: [.command])
+        .disabled(!canSend && !isRunning)
+        .help(isRunning ? "停止（Esc）" : "发送（⌘↩）")
+    }
+
+    private var canSend: Bool {
+        !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func reasoningLabel(_ effort: ReasoningEffort?) -> String {
+        switch effort {
+        case .minimal: "Minimal"
+        case .low: "Low"
+        case .medium: "Medium"
+        case .high: "High"
+        case .xhigh: "XHigh"
+        case .max: "Max"
+        case .ultra: "Ultra"
+        case .persistent: "Persistent"
+        case nil: "默认"
+        }
+    }
+
+    private func sandboxLabel(_ sandboxMode: SandboxMode) -> String {
+        switch sandboxMode {
+        case .readOnly: "只读"
+        case .workspaceWrite: "工作区可写"
+        case .dangerFullAccess: "完全访问"
+        }
+    }
+
+    private var authorizationLabel: String {
+        switch model.selectedSandboxMode {
+        case .readOnly: "只读"
+        case .workspaceWrite: "工作区"
+        case .dangerFullAccess: "完全访问"
+        }
+    }
+
+    private func sandboxIcon(_ sandboxMode: SandboxMode) -> String {
+        switch sandboxMode {
+        case .readOnly: "lock"
+        case .workspaceWrite: "lock.open"
+        case .dangerFullAccess: "lock.open.fill"
+        }
     }
 }

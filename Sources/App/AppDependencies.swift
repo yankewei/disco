@@ -58,7 +58,7 @@ struct AppDependencies {
                 backends: backendConfiguration.backends,
                 executableURLs: backendConfiguration.executableURLs,
                 executableURLProvider: {
-                    await Task.detached(priority: .userInitiated) {
+                    await Task.detached(priority: .utility) {
                         AgentBackendConfiguration.discoverExecutableURLs()
                     }.value
                 }

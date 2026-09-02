@@ -313,11 +313,12 @@ final class CodexAppServer {
     }
 
     func start(
+        environment: [String: String],
         serverRequestHandler: @escaping JSONRPCConnection.ServerRequestHandler,
         notificationHandler: @escaping JSONRPCConnection.NotificationHandler,
         closeHandler: (() -> Void)? = nil
     ) throws {
-        var codexEnvironment = providerEnvironment(for: executableURL)
+        var codexEnvironment = environment
         codexEnvironment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] =
             codexEnvironment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] ?? "codex_cli_rs"
         let process = ManagedProcess(

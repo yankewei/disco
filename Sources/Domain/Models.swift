@@ -307,7 +307,9 @@ enum MessageItem: Codable, Identifiable, Hashable {
     )
     case webSearch(id: String, query: String, state: MessageItemState)
     case todoList(id: String, items: [TodoEntry], state: MessageItemState)
+    case notice(id: String, message: String, state: MessageItemState)
     case error(id: String, message: String, state: MessageItemState)
+    // Kept for decoding messages persisted by older versions. New protocol events are not emitted as chat items.
     case codexEvent(
         id: String,
         eventType: String,
@@ -318,7 +320,7 @@ enum MessageItem: Codable, Identifiable, Hashable {
     var id: String {
         switch self {
         case let .text(id, _, _), let .reasoning(id, _, _), let .webSearch(id, _, _),
-             let .todoList(id, _, _), let .error(id, _, _):
+             let .todoList(id, _, _), let .notice(id, _, _), let .error(id, _, _):
             id
         case let .toolCall(id, _, _, _, _, _), let .commandExecution(id, _, _, _, _, _, _, _),
              let .fileChange(id, _, _, _), let .mcpToolCall(id, _, _, _, _, _, _, _),
@@ -422,6 +424,12 @@ enum MessageItem: Codable, Identifiable, Hashable {
                 items: container.decode([TodoEntry].self, forKey: .items),
                 state: container.decode(MessageItemState.self, forKey: .state)
             )
+        case "notice":
+            self = try .notice(
+                id: id,
+                message: container.decode(String.self, forKey: .message),
+                state: container.decode(MessageItemState.self, forKey: .state)
+            )
         case "error":
             self = try .error(
                 id: id,
@@ -493,6 +501,10 @@ enum MessageItem: Codable, Identifiable, Hashable {
         case let .todoList(_, items, state):
             try container.encode("todo_list", forKey: .type)
             try container.encode(items, forKey: .items)
+            try container.encode(state, forKey: .state)
+        case let .notice(_, message, state):
+            try container.encode("notice", forKey: .type)
+            try container.encode(message, forKey: .message)
             try container.encode(state, forKey: .state)
         case let .error(_, message, state):
             try container.encode("error", forKey: .type)

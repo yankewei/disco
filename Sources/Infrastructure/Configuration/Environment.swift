@@ -203,17 +203,17 @@ enum ExecutableLocator {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
+        let waiter = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            waiter.signal()
+        }
+        defer { process.terminationHandler = nil }
         do {
             try process.run()
         } catch {
             return nil
         }
 
-        let waiter = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .utility).async {
-            process.waitUntilExit()
-            waiter.signal()
-        }
         guard waiter.wait(timeout: .now() + timeout) == .success else {
             if process.isRunning {
                 process.terminate()
@@ -258,13 +258,23 @@ enum ExecutableMetadataLocator {
         process.standardOutput = outputPipe
         process.standardError = FileHandle.nullDevice
 
+        let waiter = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            waiter.signal()
+        }
+        defer { process.terminationHandler = nil }
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return nil
         }
 
+        guard waiter.wait(timeout: .now() + 5) == .success else {
+            if process.isRunning {
+                process.terminate()
+            }
+            return nil
+        }
         guard process.terminationStatus == 0 else { return nil }
         let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
         guard let text = String(data: output, encoding: .utf8) else { return nil }
@@ -276,8 +286,10 @@ enum ExecutableMetadataLocator {
     }
 }
 
-func providerEnvironment(for executableURL: URL) -> [String: String] {
-    var environment = ExecutableLocator.environmentIncludingLoginShell()
+func providerEnvironment(for executableURL: URL) async -> [String: String] {
+    var environment = await Task.detached(priority: .utility) {
+        ExecutableLocator.environmentIncludingLoginShell()
+    }.value
     var pathEntries = environment["PATH"]?.split(separator: ":").map(String.init) ?? []
     let additionalDirectories = [executableURL.deletingLastPathComponent().path]
         + ExecutableLocator.standardSearchDirectories()

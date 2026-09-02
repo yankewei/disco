@@ -170,14 +170,20 @@ final class AgentHost {
                 continue
             }
             let models = await backend.listModels()
+            let version: String?
+            if let executableURL = executableURLs[backendKind] {
+                version = await Task.detached(priority: .utility) {
+                    ExecutableMetadataLocator.version(for: executableURL)
+                }.value
+            } else {
+                version = nil
+            }
             providers.append(
                 ProviderInfo(
                     kind: backendKind,
                     available: true,
                     detail: "已检测到 \(backendKind.displayName)",
-                    version: executableURLs[backendKind].flatMap {
-                        ExecutableMetadataLocator.version(for: $0)
-                    },
+                    version: version,
                     executablePath: executableURLs[backendKind]?.path,
                     supportsPlan: backend.supportsPlan,
                     models: models

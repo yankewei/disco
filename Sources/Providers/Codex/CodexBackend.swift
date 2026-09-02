@@ -3,6 +3,7 @@ import Foundation
 final class CodexBackend: AgentBackend {
     let supportsPlan = true
 
+    private let executableURL: URL
     private let appServer: CodexAppServer
     private let stateLock = NSLock()
     private var isInitialized = false
@@ -11,6 +12,7 @@ final class CodexBackend: AgentBackend {
     private var isShuttingDown = false
 
     init(executableURL: URL) {
+        self.executableURL = executableURL
         appServer = CodexAppServer(executableURL: executableURL)
     }
 
@@ -201,7 +203,9 @@ final class CodexBackend: AgentBackend {
                 initializationTask = nil
             }
         }
+        let codexEnvironment = await providerEnvironment(for: executableURL)
         try appServer.start(
+            environment: codexEnvironment,
             serverRequestHandler: { [weak self] request in
                 guard let self else { throw CodexBackendError.shuttingDown }
                 return try await handleServerRequest(request)
@@ -291,16 +295,12 @@ final class CodexBackend: AgentBackend {
             emitPlanDelta(activeRun, params: paramsObject)
         case "turn/plan/updated":
             emitPlanUpdate(activeRun, params: paramsObject)
-        case "turn/diff/updated":
-            emitCodexEvent(activeRun, eventType: method, params: paramsObject)
         case "warning", "guardianWarning":
-            emitCodexEvent(activeRun, eventType: method, params: paramsObject)
+            emitNotice(activeRun, params: paramsObject)
         case "item/started", "item/updated", "item/completed":
             emitItemNotification(activeRun, method: method, params: paramsObject)
         default:
-            if paramsObject["turnId"] != nil || paramsObject["itemId"] != nil {
-                emitCodexEvent(activeRun, eventType: method, params: paramsObject)
-            }
+            break
         }
     }
 
@@ -607,6 +607,9 @@ final class CodexBackend: AgentBackend {
             let itemID = jsonString(itemObject["id"]),
             let itemType = jsonString(itemObject["type"])
         else { return }
+        if itemType == "userMessage" || itemType == "user_message" {
+            return
+        }
         let state: MessageItemState = switch method {
         case "item/started": .started
         case "item/completed": .completed
@@ -636,20 +639,16 @@ final class CodexBackend: AgentBackend {
         }
     }
 
-    private func emitCodexEvent(
+    private func emitNotice(
         _ activeRun: ActiveCodexRun,
-        eventType: String,
         params: [String: JSONValue]
     ) {
-        let itemID = jsonString(params["itemId"])
-        let eventID = itemID.map { "codex-\(eventType)-\($0)" }
-            ?? "codex-\(eventType)-\(activeRun.items.count)"
+        guard let message = jsonString(params["message"]), !message.isEmpty else { return }
         emitItem(
             activeRun,
-            item: .codexEvent(
-                id: eventID,
-                eventType: eventType,
-                payload: params,
+            item: .notice(
+                id: UUID().uuidString,
+                message: message,
                 state: .updated
             )
         )
@@ -926,7 +925,7 @@ private func makeMessageItem(
     case "error":
         return .error(id: id, message: jsonString(item["message"]) ?? "Codex item 执行失败", state: state)
     default:
-        return .codexEvent(id: id, eventType: type, payload: item, state: mapItemState(jsonString(item["status"]), fallback: state))
+        return nil
     }
 }
 

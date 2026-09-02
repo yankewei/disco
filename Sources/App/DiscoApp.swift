@@ -14,13 +14,14 @@ struct DiscoApp: App {
         WindowGroup("Disco") {
             WorkspaceView()
                 .environmentObject(model)
-                .frame(minWidth: 960, minHeight: 640)
+                .frame(minWidth: 900, minHeight: 560)
                 .onAppear {
                     appDelegate.shutdownHandler = { [weak model] in
                         await model?.shutdown()
                     }
                 }
         }
+        .defaultSize(width: 1000, height: 640)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("新建会话") {

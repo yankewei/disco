@@ -86,6 +86,9 @@ struct TimelineBuilder {
     }
 
     private mutating func upsertItem(_ item: MessageItem) {
+        if case .codexEvent = item {
+            return
+        }
         if let index = items.firstIndex(where: { $0.id == item.id }) {
             items[index] = item
         } else {
@@ -184,6 +187,8 @@ private extension MessageItem {
             return .webSearch(id: id, query: query, state: finalState(itemState, fallback: state))
         case let .todoList(id, items, itemState):
             return .todoList(id: id, items: items, state: finalState(itemState, fallback: state))
+        case let .notice(id, message, itemState):
+            return .notice(id: id, message: message, state: finalState(itemState, fallback: state))
         case let .error(id, message, itemState):
             return .error(id: id, message: message, state: finalState(itemState, fallback: state))
         case let .codexEvent(id, eventType, payload, itemState):

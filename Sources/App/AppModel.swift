@@ -342,6 +342,23 @@ final class AppModel: ObservableObject {
             createdAt: .timestamp()
         )
         messages.append(userMessage)
+        let activeAssistantMessage = ConversationMessage(
+            id: "active-\(session.id)",
+            role: .assistant,
+            text: "",
+            reasoning: nil,
+            toolCalls: nil,
+            items: nil,
+            timeline: [],
+            status: nil,
+            error: nil,
+            createdAt: .timestamp()
+        )
+        messages.append(activeAssistantMessage)
+        runningSessionIDs.insert(session.id)
+        activeTimelineBuilders[session.id] = TimelineBuilder()
+        persistMessages(sessionID: session.id)
+
         let runMode: RunMode = planMode ? .plan : .agent
         Task {
             await host.prompt(
@@ -391,18 +408,38 @@ final class AppModel: ObservableObject {
             approvalRequests.removeAll { $0.id == approvalID }
         case let .runFinished(sessionID, _, status, sessionTitle, error):
             runningSessionIDs.remove(sessionID)
-            activeTimelineBuilders.removeValue(forKey: sessionID)
             if let selectedSessionID, selectedSessionID == sessionID {
                 if let sessionTitle {
                     updateSessionTitle(sessionID: sessionID, title: sessionTitle)
                 }
+                if let builder = activeTimelineBuilders[sessionID] {
+                    var finalizedBuilder = builder
+                    finalizedBuilder = finalizedBuilder.finalized(status: status)
+                    let finalizedMessage = ConversationMessage(
+                        id: UUID().uuidString,
+                        role: .assistant,
+                        text: finalizedBuilder.assistantText,
+                        reasoning: finalizedBuilder.reasoning.isEmpty ? nil : finalizedBuilder.reasoning,
+                        toolCalls: finalizedBuilder.toolCalls.isEmpty ? nil : finalizedBuilder.toolCalls,
+                        items: finalizedBuilder.items.isEmpty ? nil : finalizedBuilder.items,
+                        timeline: finalizedBuilder.timeline,
+                        status: status,
+                        error: error,
+                        createdAt: .timestamp()
+                    )
+                    let activeMessageID = "active-\(sessionID)"
+                    if let activeMessageIndex = messages.lastIndex(where: { $0.id == activeMessageID }) {
+                        messages[activeMessageIndex] = finalizedMessage
+                    } else {
+                        messages.append(finalizedMessage)
+                    }
+                }
                 if status == .failed, let error {
                     workspaceError = error
                 }
-                Task { [weak self] in
-                    await self?.reloadMessages(sessionID: sessionID)
-                }
+                persistMessages(sessionID: sessionID)
             }
+            activeTimelineBuilders.removeValue(forKey: sessionID)
         }
     }
 
@@ -432,23 +469,47 @@ final class AppModel: ObservableObject {
 
     private func loadMessages(sessionID: String) async {
         guard let host else { return }
+
+        if let store,
+           let localMessages = try? store.loadMessages(sessionID: sessionID),
+           !localMessages.isEmpty,
+           !localMessages.contains(where: { $0.id.hasPrefix("active-") })
+        {
+            guard selectedSessionID == sessionID else { return }
+            messages = localMessages
+            return
+        }
+
         do {
             let loadedMessages = try await host.loadMessages(sessionID: sessionID)
             guard selectedSessionID == sessionID else { return }
-            messages = loadedMessages
+            if !loadedMessages.isEmpty {
+                messages = loadedMessages
+                persistMessages(sessionID: sessionID)
+            } else if let store,
+                      let localMessages = try? store.loadMessages(sessionID: sessionID)
+            {
+                messages = localMessages.filter { !$0.id.hasPrefix("active-") }
+            } else {
+                messages = []
+            }
         } catch {
             guard selectedSessionID == sessionID else { return }
-            workspaceError = error.localizedDescription
+            if let store,
+               let localMessages = try? store.loadMessages(sessionID: sessionID),
+               !localMessages.isEmpty
+            {
+                messages = localMessages.filter { !$0.id.hasPrefix("active-") }
+            } else {
+                workspaceError = error.localizedDescription
+            }
         }
     }
 
-    private func reloadMessages(sessionID: String) async {
-        guard let host else { return }
+    private func persistMessages(sessionID: String) {
+        guard let store else { return }
         do {
-            let loadedMessages = try await host.loadMessages(sessionID: sessionID)
-            if selectedSessionID == sessionID {
-                messages = loadedMessages
-            }
+            try store.replaceMessages(messages, sessionID: sessionID)
         } catch {
             workspaceError = error.localizedDescription
         }

@@ -84,6 +84,21 @@ final class NativeCoreTests: XCTestCase {
         ))
     }
 
+    func testTimelineBuilderIgnoresProtocolEvents() {
+        var builder = TimelineBuilder()
+        builder.apply(.item(
+            .codexEvent(
+                id: "event-1",
+                eventType: "hook/started",
+                payload: [String: JSONValue](),
+                state: .updated
+            )
+        ))
+
+        XCTAssertTrue(builder.timeline.isEmpty)
+        XCTAssertTrue(builder.items.isEmpty)
+    }
+
     func testJSONRPCConnectionRoundTrip() async throws {
         let script = #"while IFS= read -r line; do printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'; done"#
         let process = ManagedProcess(
@@ -219,6 +234,101 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
 
         store.close()
+    }
+
+    func testSQLiteStorePersistsConversationTimeline() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let databaseURL = folder.appendingPathComponent("disco.sqlite")
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let store = try SQLiteStore(databaseURL: databaseURL)
+        let project = ProjectInfo(
+            projectID: "project-1",
+            name: "Disco",
+            projectPath: "/tmp/disco",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createProject(project)
+        let session = SessionInfo(
+            sessionID: "session-1",
+            projectID: project.id,
+            agent: .codex,
+            modelID: nil,
+            reasoningEffort: nil,
+            sandboxMode: nil,
+            agentThreadID: nil,
+            title: "测试会话",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createSession(session)
+
+        let messages = [
+            ConversationMessage(
+                id: "user-1",
+                role: .user,
+                text: "读取 README",
+                reasoning: nil,
+                toolCalls: nil,
+                items: nil,
+                timeline: nil,
+                status: nil,
+                error: nil,
+                createdAt: "2026-01-01T00:00:00Z"
+            ),
+            ConversationMessage(
+                id: "assistant-1",
+                role: .assistant,
+                text: "README 内容如下",
+                reasoning: "先读取文件",
+                toolCalls: [
+                    ToolCall(
+                        id: "tool-1",
+                        name: "读取文件",
+                        status: .completed,
+                        input: .object(["path": .string("README.md")]),
+                        output: "内容",
+                        error: nil
+                    ),
+                ],
+                items: [
+                    .reasoning(id: "reasoning-1", text: "先读取文件", state: .completed),
+                    .toolCall(
+                        id: "tool-1",
+                        name: "读取文件",
+                        input: .object(["path": .string("README.md")]),
+                        output: "内容",
+                        error: nil,
+                        state: .completed
+                    ),
+                ],
+                timeline: [
+                    .reasoning(id: "reasoning-1", text: "先读取文件", state: .completed),
+                    .toolCall(
+                        id: "tool-1",
+                        name: "读取文件",
+                        input: .object(["path": .string("README.md")]),
+                        output: "内容",
+                        error: nil,
+                        state: .completed
+                    ),
+                    .text(id: "text-1", text: "README 内容如下", state: .completed),
+                ],
+                status: .completed,
+                error: nil,
+                createdAt: "2026-01-01T00:00:01Z"
+            ),
+        ]
+
+        try store.replaceMessages(messages, sessionID: session.id)
+        XCTAssertEqual(try store.loadMessages(sessionID: session.id), messages)
+        store.close()
+
+        let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
+        defer { reopenedStore.close() }
+        XCTAssertEqual(try reopenedStore.loadMessages(sessionID: session.id), messages)
     }
 
     func testSQLiteStoreDeletesSession() throws {
