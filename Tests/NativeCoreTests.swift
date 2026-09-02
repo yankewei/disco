@@ -218,26 +218,47 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(storedSession.agentThreadID, session.agentThreadID)
         XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
 
-        try store.saveAgentSession(
-            projectID: project.id,
-            agent: .opencode,
-            snapshot: AgentSessionSnapshot(
-                agentThreadID: "session-2",
-                title: "已发现会话",
-                createdAt: "2026-01-02T00:00:00Z",
-                activatedAt: "2026-01-02T00:00:01Z",
-                modelID: "openai/gpt-5",
-                reasoningEffort: .high,
-                sandboxMode: nil
+        store.close()
+    }
+
+    func testSQLiteStoreDeletesSession() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let databaseURL = folder.appendingPathComponent("disco.sqlite")
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let store = try SQLiteStore(databaseURL: databaseURL)
+        let project = ProjectInfo(
+            projectID: "project-1",
+            name: "Disco",
+            projectPath: "/tmp/disco",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createProject(project)
+        try store.createSession(
+            SessionInfo(
+                sessionID: "session-1",
+                projectID: project.id,
+                agent: .codex,
+                modelID: nil,
+                reasoningEffort: nil,
+                sandboxMode: nil,
+                agentThreadID: "thread-1",
+                title: "已删除会话",
+                createdAt: "2026-01-01T00:00:00Z",
+                activatedAt: nil
             )
         )
-        let importedSession = try XCTUnwrap(
-            store.listSessions(projectID: project.id).first { $0.agentThreadID == "session-2" }
-        )
-        XCTAssertEqual(importedSession.title, "已发现会话")
-        XCTAssertEqual(importedSession.agent, .opencode)
-        XCTAssertEqual(importedSession.modelID, "openai/gpt-5")
+
+        try store.deleteSession(sessionID: "session-1")
+        XCTAssertNil(try store.session(id: "session-1"))
+        XCTAssertTrue(try store.listSessions(projectID: project.id).isEmpty)
         store.close()
+
+        let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
+        defer { reopenedStore.close() }
+        XCTAssertTrue(try reopenedStore.listSessions(projectID: project.id).isEmpty)
     }
 
     private func prepareStatement(

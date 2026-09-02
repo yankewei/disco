@@ -77,7 +77,7 @@ final class AppModel: ObservableObject {
             projects = projectList
             var nextSessions: [String: [SessionInfo]] = [:]
             for project in projectList {
-                nextSessions[project.id] = try await host.refreshSessions(projectID: project.id)
+                nextSessions[project.id] = try host.listSessions(projectID: project.id)
             }
             sessionsByProject = nextSessions
             if selectedProjectID == nil || !projectList.contains(where: { $0.id == selectedProjectID }) {
@@ -161,19 +161,6 @@ final class AppModel: ObservableObject {
             projects.insert(project, at: 0)
             sessionsByProject[project.id] = sessions
             selectProject(project)
-            Task { [weak self] in
-                guard let self else { return }
-                do {
-                    let refreshedSessions = try await host.refreshSessions(projectID: project.id)
-                    guard selectedProjectID == project.id else { return }
-                    sessionsByProject[project.id] = refreshedSessions
-                    if selectedSessionID == nil, let session = refreshedSessions.first {
-                        selectSession(session)
-                    }
-                } catch {
-                    workspaceError = error.localizedDescription
-                }
-            }
         } catch {
             workspaceError = error.localizedDescription
         }
@@ -217,6 +204,27 @@ final class AppModel: ObservableObject {
             selectedReasoningEffort = session.reasoningEffort
             selectedSandboxMode = session.sandboxMode ?? defaultSandboxMode
             messages = []
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
+    func deleteSession(_ session: SessionInfo) {
+        guard let host else { return }
+        do {
+            try host.deleteSession(sessionID: session.id)
+            sessionsByProject[session.projectID]?.removeAll { $0.id == session.id }
+            approvalRequests.removeAll { $0.sessionID == session.id }
+            activeTimelineBuilders.removeValue(forKey: session.id)
+            runningSessionIDs.remove(session.id)
+
+            guard selectedSessionID == session.id else { return }
+            selectedSessionID = nil
+            messages = []
+            planMode = false
+            if let nextSession = sessionsByProject[session.projectID]?.first {
+                selectSession(nextSession)
+            }
         } catch {
             workspaceError = error.localizedDescription
         }
@@ -349,6 +357,8 @@ final class AppModel: ObservableObject {
         case let .runStarted(sessionID, _):
             runningSessionIDs.insert(sessionID)
             activeTimelineBuilders[sessionID] = TimelineBuilder()
+        case let .sessionAgentThreadIDUpdated(sessionID, agentThreadID):
+            updateSessionAgentThreadID(sessionID: sessionID, agentThreadID: agentThreadID)
         case let .text(sessionID, _, text, itemID):
             apply(
                 .text(text: text, itemID: itemID),
@@ -439,18 +449,18 @@ final class AppModel: ObservableObject {
             if selectedSessionID == sessionID {
                 messages = loadedMessages
             }
-            await refreshSessions(for: selectedProjectID)
         } catch {
             workspaceError = error.localizedDescription
         }
     }
 
-    private func refreshSessions(for projectID: String?) async {
-        guard let host, let projectID else { return }
-        do {
-            sessionsByProject[projectID] = try await host.refreshSessions(projectID: projectID)
-        } catch {
-            workspaceError = error.localizedDescription
+    private func updateSessionAgentThreadID(sessionID: String, agentThreadID: String) {
+        for projectID in sessionsByProject.keys {
+            guard let index = sessionsByProject[projectID]?.firstIndex(where: { $0.id == sessionID }) else {
+                continue
+            }
+            sessionsByProject[projectID]?[index].agentThreadID = agentThreadID
+            break
         }
     }
 

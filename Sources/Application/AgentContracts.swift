@@ -16,6 +16,7 @@ enum BackendEvent {
 
 enum AgentEvent {
     case runStarted(sessionID: String, runID: String)
+    case sessionAgentThreadIDUpdated(sessionID: String, agentThreadID: String)
     case text(sessionID: String, runID: String, text: String, itemID: String?)
     case reasoning(sessionID: String, runID: String, text: String, itemID: String?)
     case item(sessionID: String, runID: String, item: MessageItem)
@@ -106,20 +107,9 @@ struct BackendRunContext {
     ) async -> ApprovalDecision
 }
 
-struct AgentSessionSnapshot: Hashable, Sendable {
-    let agentThreadID: String
-    let title: String?
-    let createdAt: String?
-    let activatedAt: String?
-    let modelID: String?
-    let reasoningEffort: ReasoningEffort?
-    let sandboxMode: SandboxMode?
-}
-
 protocol AgentBackend: AnyObject {
     var supportsPlan: Bool { get }
     func listModels() async -> [ModelInfo]
-    func listSessions(workingDirectory: String) async throws -> [AgentSessionSnapshot]
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage]
     func run(context: BackendRunContext) async throws -> String
     func shutdown()

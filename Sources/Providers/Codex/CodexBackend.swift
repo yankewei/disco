@@ -42,28 +42,6 @@ final class CodexBackend: AgentBackend {
         }
     }
 
-    func listSessions(workingDirectory: String) async throws -> [AgentSessionSnapshot] {
-        try await startIfNeeded()
-        var snapshots: [AgentSessionSnapshot] = []
-        var cursor: String?
-        repeat {
-            var params: [String: JSONValue] = [
-                "cwd": .string(workingDirectory),
-                "limit": .number(100),
-                "sortKey": .string("updated_at"),
-            ]
-            if let cursor {
-                params["cursor"] = .string(cursor)
-            }
-            let response = try await appServer.request(method: "thread/list", params: params)
-            let responseObject = response.objectValue ?? [:]
-            let threadValues = jsonArray(responseObject["data"] ?? responseObject["threads"])
-            snapshots.append(contentsOf: threadValues.compactMap(codexSessionSnapshot))
-            cursor = jsonString(responseObject["nextCursor"] ?? responseObject["next_cursor"])
-        } while cursor != nil
-        return snapshots
-    }
-
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage] {
         try await startIfNeeded()
         let response = try await appServer.request(
@@ -950,23 +928,6 @@ private func makeMessageItem(
     default:
         return .codexEvent(id: id, eventType: type, payload: item, state: mapItemState(jsonString(item["status"]), fallback: state))
     }
-}
-
-private func codexSessionSnapshot(_ value: JSONValue) -> AgentSessionSnapshot? {
-    guard let object = jsonObject(value), let agentThreadID = jsonString(object["id"]) else {
-        return nil
-    }
-    return AgentSessionSnapshot(
-        agentThreadID: agentThreadID,
-        title: jsonString(object["name"] ?? object["title"] ?? object["preview"]),
-        createdAt: jsonString(object["createdAt"] ?? object["created_at"]),
-        activatedAt: jsonString(object["updatedAt"] ?? object["updated_at"] ?? object["recencyAt"]),
-        modelID: jsonString(object["model"]),
-        reasoningEffort: jsonString(object["reasoningEffort"] ?? object["reasoning_effort"])
-            .flatMap(ReasoningEffort.init(rawValue:)),
-        sandboxMode: jsonString(object["sandbox"] ?? object["sandboxMode"] ?? object["sandbox_mode"])
-            .flatMap(SandboxMode.init(rawValue:))
-    )
 }
 
 private func parseCodexMessages(_ turns: [JSONValue]) -> [ConversationMessage] {

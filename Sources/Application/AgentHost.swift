@@ -11,6 +11,7 @@ final class AgentHost {
     private let stateLock = NSLock()
     private var activeRuns: [String: ActiveRun] = [:]
     private var pendingApprovals: [String: PendingApproval] = [:]
+    private var deletingSessionIDs: Set<String> = []
     private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
     private var isShuttingDown = false
 
@@ -64,27 +65,6 @@ final class AgentHost {
         try store.touchSession(sessionID: sessionID)
     }
 
-    func refreshSessions(projectID: String) async throws -> [SessionInfo] {
-        guard let project = try store.project(id: projectID) else {
-            throw AgentHostError.projectNotFound
-        }
-        let availableBackends = withStateLock { backends }
-        for agent in BackendKind.allCases {
-            guard let backend = availableBackends[agent] else { continue }
-            guard let snapshots = try? await backend.listSessions(workingDirectory: project.projectPath) else {
-                continue
-            }
-            for snapshot in snapshots {
-                try store.saveAgentSession(
-                    projectID: projectID,
-                    agent: agent,
-                    snapshot: snapshot
-                )
-            }
-        }
-        return try store.listSessions(projectID: projectID)
-    }
-
     func createSession(
         projectID: String,
         agent: BackendKind,
@@ -112,6 +92,26 @@ final class AgentHost {
         )
         try store.createSession(session)
         return session
+    }
+
+    func deleteSession(sessionID: String) throws {
+        guard try store.session(id: sessionID) != nil else {
+            throw AgentHostError.sessionNotFound
+        }
+        try withStateLock {
+            guard activeRuns[sessionID] == nil else {
+                throw AgentHostError.sessionAlreadyRunning
+            }
+            guard deletingSessionIDs.insert(sessionID).inserted else {
+                throw AgentHostError.sessionDeletionInProgress
+            }
+        }
+        defer {
+            _ = withStateLock {
+                deletingSessionIDs.remove(sessionID)
+            }
+        }
+        try store.deleteSession(sessionID: sessionID)
     }
 
     func loadMessages(sessionID: String) async throws -> [ConversationMessage] {
@@ -212,6 +212,9 @@ final class AgentHost {
             }
             try withStateLock {
                 guard !isShuttingDown else { throw AgentHostError.shuttingDown }
+                guard !deletingSessionIDs.contains(sessionID) else {
+                    throw AgentHostError.sessionDeletionInProgress
+                }
                 guard activeRuns[sessionID] == nil else {
                     throw AgentHostError.sessionAlreadyRunning
                 }
@@ -263,10 +266,19 @@ final class AgentHost {
                 },
                 cancellation: cancellation,
                 reportAgentThreadID: { [weak self] agentThreadID in
-                    try? self?.store.updateAgentThreadID(
-                        sessionID: sessionID,
-                        agentThreadID: agentThreadID
-                    )
+                    guard let self else { return }
+                    do {
+                        try self.store.updateAgentThreadID(
+                            sessionID: sessionID,
+                            agentThreadID: agentThreadID
+                        )
+                        self.eventHandler(.sessionAgentThreadIDUpdated(
+                            sessionID: sessionID,
+                            agentThreadID: agentThreadID
+                        ))
+                    } catch {
+                        return
+                    }
                 },
                 requestApproval: { [weak self] toolName, title, input in
                     guard let self else { return .denied }
@@ -500,6 +512,7 @@ enum AgentHostError: LocalizedError {
     case planModeUnsupported
     case emptyPrompt
     case sessionAlreadyRunning
+    case sessionDeletionInProgress
 
     var errorDescription: String? {
         switch self {
@@ -511,6 +524,7 @@ enum AgentHostError: LocalizedError {
         case .planModeUnsupported: "当前 Provider 不支持计划模式"
         case .emptyPrompt: "请输入内容"
         case .sessionAlreadyRunning: "该会话正在运行"
+        case .sessionDeletionInProgress: "该会话正在删除"
         }
     }
 }

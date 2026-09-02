@@ -37,6 +37,7 @@ struct WorkspaceView: View {
 private struct SidebarView: View {
     @EnvironmentObject private var model: AppModel
     @Binding var expandedProjectIDs: Set<String>
+    @State private var sessionToDelete: SessionInfo?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -70,28 +71,7 @@ private struct SidebarView: View {
                         )
                     ) {
                         ForEach(model.sessionsByProject[project.id] ?? []) { session in
-                            Button {
-                                model.selectSession(session)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: session.agent.systemImage)
-                                        .foregroundStyle(.secondary)
-                                    Text(session.title)
-                                        .lineLimit(1)
-                                    Spacer()
-                                    if model.runningSessionIDs.contains(session.id) {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.vertical, 3)
-                            .listRowBackground(
-                                model.selectedSessionID == session.id
-                                    ? Color.accentColor.opacity(0.12)
-                                    : Color.clear
-                            )
+                            SessionRow(session: session, sessionToDelete: $sessionToDelete)
                         }
                     } label: {
                         Button {
@@ -105,6 +85,10 @@ private struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .onDeleteCommand {
+                guard let session = model.selectedSession else { return }
+                sessionToDelete = session
+            }
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
@@ -120,6 +104,64 @@ private struct SidebarView: View {
                 Spacer()
             }
             .padding(12)
+        }
+        .alert(
+            "删除会话？",
+            isPresented: Binding(
+                get: { sessionToDelete != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        sessionToDelete = nil
+                    }
+                }
+            )
+        ) {
+            Button("取消", role: .cancel) {
+                sessionToDelete = nil
+            }
+            Button("删除", role: .destructive) {
+                guard let session = sessionToDelete else { return }
+                sessionToDelete = nil
+                model.deleteSession(session)
+            }
+        } message: {
+            Text("将从 Disco 中移除“\(sessionToDelete?.title ?? "新对话")”；Provider 中的历史不会被删除。")
+        }
+    }
+}
+
+private struct SessionRow: View {
+    @EnvironmentObject private var model: AppModel
+    let session: SessionInfo
+    @Binding var sessionToDelete: SessionInfo?
+
+    var body: some View {
+        Button {
+            model.selectSession(session)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: session.agent.systemImage)
+                    .foregroundStyle(.secondary)
+                Text(session.title)
+                    .lineLimit(1)
+                Spacer()
+                if model.runningSessionIDs.contains(session.id) {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.vertical, 3)
+        .listRowBackground(
+            model.selectedSessionID == session.id
+                ? Color.accentColor.opacity(0.12)
+                : Color.clear
+        )
+        .contextMenu {
+            Button("删除会话", role: .destructive) {
+                sessionToDelete = session
+            }
         }
     }
 }

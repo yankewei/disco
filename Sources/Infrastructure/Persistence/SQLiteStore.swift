@@ -171,27 +171,6 @@ final class SQLiteStore {
         return session(from: statement)
     }
 
-    func session(agent: BackendKind, agentThreadID: String) throws -> SessionInfo? {
-        databaseLock.lock()
-        defer { databaseLock.unlock() }
-        let statement = try prepare(
-            """
-            SELECT session_id, project_id, agent, model_id, reasoning_effort,
-                   sandbox_mode, agent_thread_id, title, created_at, activated_at
-            FROM sessions
-            WHERE agent = ? AND agent_thread_id = ?
-            """
-        )
-        defer { sqlite3_finalize(statement) }
-        try bind(agent.rawValue, at: 1, in: statement)
-        try bind(agentThreadID, at: 2, in: statement)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
-            try throwIfStepFailed(statement)
-            return nil
-        }
-        return session(from: statement)
-    }
-
     func createSession(_ session: SessionInfo) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }
@@ -217,52 +196,13 @@ final class SQLiteStore {
         try step(statement)
     }
 
-    func saveAgentSession(
-        projectID: String,
-        agent: BackendKind,
-        snapshot: AgentSessionSnapshot
-    ) throws {
-        if let existingSession = try session(agent: agent, agentThreadID: snapshot.agentThreadID) {
-            let statement = try prepare(
-                """
-                UPDATE sessions
-                SET model_id = COALESCE(?, model_id),
-                    reasoning_effort = COALESCE(?, reasoning_effort),
-                    sandbox_mode = COALESCE(?, sandbox_mode),
-                    title = CASE
-                        WHEN title = '新对话' THEN COALESCE(?, title)
-                        ELSE title
-                    END,
-                    activated_at = COALESCE(?, activated_at)
-                WHERE session_id = ? AND project_id = ?
-                """
-            )
-            defer { sqlite3_finalize(statement) }
-            try bind(snapshot.modelID, at: 1, in: statement)
-            try bind(snapshot.reasoningEffort?.rawValue, at: 2, in: statement)
-            try bind(snapshot.sandboxMode?.rawValue, at: 3, in: statement)
-            try bind(snapshot.title, at: 4, in: statement)
-            try bind(snapshot.activatedAt, at: 5, in: statement)
-            try bind(existingSession.sessionID, at: 6, in: statement)
-            try bind(projectID, at: 7, in: statement)
-            try step(statement)
-            return
-        }
-
-        try createSession(
-            SessionInfo(
-                sessionID: UUID().uuidString,
-                projectID: projectID,
-                agent: agent,
-                modelID: snapshot.modelID,
-                reasoningEffort: snapshot.reasoningEffort,
-                sandboxMode: snapshot.sandboxMode,
-                agentThreadID: snapshot.agentThreadID,
-                title: snapshot.title ?? "新对话",
-                createdAt: snapshot.createdAt ?? .timestamp(),
-                activatedAt: snapshot.activatedAt
-            )
-        )
+    func deleteSession(sessionID: String) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare("DELETE FROM sessions WHERE session_id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind(sessionID, at: 1, in: statement)
+        try step(statement)
     }
 
     func updateAgentThreadID(sessionID: String, agentThreadID: String) throws {
@@ -341,7 +281,8 @@ final class SQLiteStore {
             );
             CREATE INDEX IF NOT EXISTS sessions_project_activated_idx
                 ON sessions (project_id, activated_at DESC, created_at DESC);
-            PRAGMA user_version = 2;
+            DROP TABLE IF EXISTS dismissed_sessions;
+            PRAGMA user_version = 4;
             """
         )
         try execute("DROP TABLE IF EXISTS messages")

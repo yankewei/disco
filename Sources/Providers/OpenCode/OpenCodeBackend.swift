@@ -33,20 +33,6 @@ final class OpenCodeBackend: AgentBackend {
         }
     }
 
-    func listSessions(workingDirectory: String) async throws -> [AgentSessionSnapshot] {
-        let cancellation = CancellationToken()
-        let server = try await startServer(cancellation: cancellation, workingDirectory: workingDirectory)
-        defer { stop(server) }
-        let response = try await requestJSON(
-            baseURL: server.baseURL,
-            path: directoryPath("/session", directory: workingDirectory),
-            method: "GET",
-            body: nil,
-            cancellation: cancellation
-        )
-        return parseOpenCodeSessions(response)
-    }
-
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage] {
         let cancellation = CancellationToken()
         let server = try await startServer(cancellation: cancellation, workingDirectory: workingDirectory)
@@ -813,27 +799,6 @@ private func parseSSEEvent(_ data: String) -> [String: JSONValue]? {
         let value = try? JSONDecoder().decode(JSONValue.self, from: jsonData)
     else { return nil }
     return jsonObject(value)
-}
-
-private func parseOpenCodeSessions(_ value: JSONValue?) -> [AgentSessionSnapshot] {
-    let responseObject = jsonObject(value)
-    let sessionValues = value?.arrayValue
-        ?? jsonArray(responseObject?["data"] ?? responseObject?["sessions"])
-    return sessionValues.compactMap { value in
-        guard let session = jsonObject(value), let agentThreadID = jsonString(session["id"]) else {
-            return nil
-        }
-        let time = jsonObject(session["time"])
-        return AgentSessionSnapshot(
-            agentThreadID: agentThreadID,
-            title: jsonString(session["title"]),
-            createdAt: openCodeTimestamp(time?["created"] ?? session["createdAt"]),
-            activatedAt: openCodeTimestamp(time?["updated"] ?? session["updatedAt"]),
-            modelID: nil,
-            reasoningEffort: nil,
-            sandboxMode: nil
-        )
-    }
 }
 
 private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
