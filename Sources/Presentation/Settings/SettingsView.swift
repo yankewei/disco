@@ -4,6 +4,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var model: AppModel
     @State private var selectedSection: SettingsSection? = .providers
+    @State private var hoveredSection: SettingsSection?
     @State private var lastScanAt: Date?
 
     fileprivate enum SettingsSection: String, CaseIterable, Identifiable, Equatable {
@@ -60,7 +61,7 @@ struct SettingsView: View {
                     dismiss()
                 } label: {
                     Label("返回", systemImage: "chevron.left")
-                        .font(.callout)
+                        .font(DiscoTheme.Typography.body)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -74,21 +75,27 @@ struct SettingsView: View {
                                 selectedSection = section
                             } label: {
                                 Label(section.title, systemImage: section.systemImage)
-                                    .font(.callout)
-                                    .foregroundStyle(section == selectedSection ? .primary : .secondary)
+                                    .font(DiscoTheme.Typography.body)
+                                    .foregroundStyle(section == selectedSection ? DiscoTheme.Palette.accent : .secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 7)
                                     .background {
                                         if section == selectedSection {
-                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                                .fill(Color.primary.opacity(0.1))
+                                            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
+                                                .fill(DiscoTheme.Palette.selection)
+                                        } else if hoveredSection == section {
+                                            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
+                                                .fill(DiscoTheme.Palette.hover)
                                         }
                                     }
-                                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                    .clipShape(RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous))
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .onHover { isHovering in
+                                hoveredSection = isHovering ? section : nil
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .accessibilityValue(section == selectedSection ? "已选中" : "")
                         }
@@ -97,9 +104,9 @@ struct SettingsView: View {
                     .padding(.horizontal, 10)
                 }
             }
-            .frame(width: 228)
+            .frame(width: DiscoTheme.Metrics.sidebarWidth)
             .frame(maxHeight: .infinity, alignment: .top)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(DiscoTheme.Palette.sidebar)
 
             Divider()
 
@@ -118,7 +125,9 @@ struct SettingsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DiscoTheme.Palette.canvas)
+        .font(DiscoTheme.Typography.body)
+        .tint(DiscoTheme.Palette.accent)
         .task {
             await refreshProviders()
         }
@@ -160,9 +169,9 @@ private struct ProviderDirectoryCard: View {
             HStack(alignment: .top, spacing: 20) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("编程智能体")
-                        .font(.headline)
+                        .font(DiscoTheme.Typography.sectionTitle)
                     Text("Disco 调用安装在这台电脑上的智能体命令行工具。请先安装相应工具或完成登录，然后刷新。")
-                        .font(.callout)
+                        .font(DiscoTheme.Typography.body)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -178,7 +187,7 @@ private struct ProviderDirectoryCard: View {
                     .controlSize(.regular)
 
                     Text(lastScanAt == nil ? "尚未检查" : "刚刚检查过")
-                        .font(.caption)
+                        .font(DiscoTheme.Typography.caption)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -193,7 +202,7 @@ private struct ProviderDirectoryCard: View {
                     ProgressView()
                         .controlSize(.small)
                     Text("正在扫描本机 CLI…")
-                        .font(.callout)
+                        .font(DiscoTheme.Typography.body)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 22)
@@ -211,8 +220,11 @@ private struct ProviderDirectoryCard: View {
                 }
             }
         }
-        .background(Color.primary.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(DiscoTheme.Palette.surface, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous)
+                .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+        }
     }
 }
 
@@ -248,10 +260,10 @@ private struct ProviderDirectoryRow: View {
                     ForEach(provider.models) { model in
                         HStack(alignment: .firstTextBaseline, spacing: 12) {
                             Text(model.name)
-                                .font(.callout)
+                                .font(DiscoTheme.Typography.body)
                             Spacer(minLength: 12)
                             Text(model.id)
-                                .font(.caption)
+                                .font(DiscoTheme.Typography.caption)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -268,6 +280,7 @@ private struct ProviderDirectoryRow: View {
 private struct ProviderRowLabel: View {
     let provider: ProviderInfo
     let isExpanded: Bool
+    @State private var isHovering = false
 
     var body: some View {
         HStack(spacing: 14) {
@@ -276,11 +289,11 @@ private struct ProviderRowLabel: View {
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(provider.kind.displayName)
-                        .font(.callout.weight(.medium))
+                        .font(DiscoTheme.Typography.bodyEmphasized)
                         .foregroundStyle(provider.available ? .primary : .secondary)
                     if let version = versionLabel {
                         Text(version)
-                            .font(.caption.monospaced())
+                            .font(DiscoTheme.Typography.code)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -296,7 +309,7 @@ private struct ProviderRowLabel: View {
                         Text(provider.detail)
                     }
                 }
-                .font(.caption)
+                .font(DiscoTheme.Typography.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             }
@@ -305,12 +318,14 @@ private struct ProviderRowLabel: View {
 
             Image(systemName: "chevron.right")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isExpanded ? DiscoTheme.Palette.accent : .secondary)
                 .rotationEffect(.degrees(isExpanded ? 90 : 0))
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 11)
+        .background(isHovering ? DiscoTheme.Palette.hover : .clear)
         .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
     }
 
     private var versionLabel: String? {
@@ -334,17 +349,17 @@ private struct ProviderIcon: View {
             .scaledToFit()
             .frame(width: 28, height: 28)
             .frame(width: 36, height: 36)
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.72))
+            .background(DiscoTheme.Palette.canvas)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .opacity(provider.available ? 1 : 0.45)
             .overlay(alignment: .bottomTrailing) {
                 if provider.available {
                     Circle()
-                        .fill(.green)
+                        .fill(DiscoTheme.Palette.successIndicator)
                         .frame(width: 8, height: 8)
                         .overlay {
                             Circle()
-                                .stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2)
+                                .stroke(DiscoTheme.Palette.surface, lineWidth: 2)
                         }
                         .offset(x: 2, y: 2)
                 }
@@ -407,11 +422,11 @@ private struct SettingsPageHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title)
-                .font(.system(size: 24, weight: .semibold))
+                .font(DiscoTheme.Typography.pageTitle)
                 .foregroundStyle(.primary)
             if let subtitle {
                 Text(subtitle)
-                    .font(.callout)
+                    .font(DiscoTheme.Typography.body)
                     .foregroundStyle(.secondary)
             }
         }
@@ -427,7 +442,7 @@ private struct SettingsSectionTitle: View {
 
     var body: some View {
         Text(title)
-            .font(.headline)
+            .font(DiscoTheme.Typography.sectionTitle)
             .foregroundStyle(.primary)
     }
 }
@@ -440,6 +455,7 @@ private struct SettingsValueRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 20) {
             Text(title)
+                .font(DiscoTheme.Typography.body)
                 .foregroundStyle(.primary)
             Spacer(minLength: 16)
             Group {
@@ -450,12 +466,11 @@ private struct SettingsValueRow: View {
                     Text(value)
                 }
             }
-            .font(.callout)
+            .font(DiscoTheme.Typography.body)
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.trailing)
             .fixedSize(horizontal: false, vertical: true)
         }
-        .font(.callout)
         .padding(.horizontal, 18)
         .padding(.vertical, 11)
     }
@@ -472,11 +487,10 @@ private struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             content
         }
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(DiscoTheme.Palette.surface, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 1)
+            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous)
+                .stroke(DiscoTheme.Palette.border, lineWidth: 1)
         }
     }
 }
@@ -499,6 +513,6 @@ private struct SettingsPage<Content: View>: View {
             .padding(.top, 20)
             .padding(.bottom, 28)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DiscoTheme.Palette.canvas)
     }
 }

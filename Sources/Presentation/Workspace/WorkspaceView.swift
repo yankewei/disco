@@ -1,6 +1,9 @@
 import AppKit
 import SwiftUI
 
+private let modelPickerWidth: CGFloat = 500
+private let modelPickerHeight: CGFloat = 340
+
 struct WorkspaceView: View {
     @EnvironmentObject private var model: AppModel
     @State private var expandedProjectIDs: Set<String> = []
@@ -8,11 +11,13 @@ struct WorkspaceView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(expandedProjectIDs: $expandedProjectIDs)
-                .navigationSplitViewColumnWidth(228)
+                .navigationSplitViewColumnWidth(DiscoTheme.Metrics.sidebarWidth)
         } detail: {
             ConversationView()
         }
-        .background(.regularMaterial)
+        .background(DiscoTheme.Palette.canvas)
+        .font(DiscoTheme.Typography.body)
+        .tint(DiscoTheme.Palette.accent)
         .alert(
             "Disco",
             isPresented: Binding(
@@ -45,7 +50,7 @@ private struct SidebarView: View {
         VStack(spacing: 0) {
             HStack {
                 Text("项目")
-                    .font(.headline)
+                    .font(DiscoTheme.Typography.sidebarHeading)
                 Spacer()
                 Button {
                     model.chooseDirectory()
@@ -66,8 +71,9 @@ private struct SidebarView: View {
                         } label: {
                             HStack(spacing: 8) {
                                 Image(systemName: expandedProjectIDs.contains(project.id) ? "folder.fill" : "folder")
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(model.selectedProjectID == project.id ? DiscoTheme.Palette.accent : .secondary)
                                 Text(project.name)
+                                    .font(DiscoTheme.Typography.sidebar)
                                     .lineLimit(1)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -112,11 +118,11 @@ private struct SidebarView: View {
                     .padding(.vertical, 4)
                     .background(
                         model.selectedProjectID == project.id
-                            ? Color.black.opacity(0.10)
+                            ? DiscoTheme.Palette.selection
                             : hoveredProjectID == project.id
-                                ? Color.black.opacity(0.06)
+                                ? DiscoTheme.Palette.hover
                                 : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
                     )
                     .contentShape(Rectangle())
                     .onHover { isHovering in
@@ -142,6 +148,8 @@ private struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .background(DiscoTheme.Palette.sidebar)
             .onDeleteCommand {
                 if let session = model.selectedSession {
                     sessionToDelete = session
@@ -164,7 +172,9 @@ private struct SidebarView: View {
                 Spacer()
             }
             .padding(12)
+            .background(DiscoTheme.Palette.sidebar)
         }
+        .background(DiscoTheme.Palette.sidebar)
         .alert(
             "删除会话？",
             isPresented: Binding(
@@ -280,9 +290,9 @@ private struct SessionRow: View {
         .padding(.vertical, 4)
         .background(
             isSelected
-                ? Color.black.opacity(0.10)
-                : isHovering ? Color.black.opacity(0.06) : Color.clear,
-            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                ? DiscoTheme.Palette.selection
+                : isHovering ? DiscoTheme.Palette.hover : Color.clear,
+            in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
         )
         .onHover { isHovering = $0 }
         .contextMenu {
@@ -312,13 +322,13 @@ private struct ConversationView: View {
                         maxHeight: .infinity
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.white)
+                    .background(DiscoTheme.Palette.surface)
                 }
             } else {
                 WelcomeView()
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DiscoTheme.Palette.canvas)
     }
 
     private let chatColumnMinimumWidth: CGFloat = 420
@@ -361,12 +371,13 @@ private struct WelcomeView: View {
         VStack(spacing: 14) {
             Image(systemName: "sparkles.rectangle.stack")
                 .font(.system(size: 42, weight: .light))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(DiscoTheme.Palette.accent.opacity(0.72))
             Text(hasSelectedProject ? "开始新的会话" : "开始使用 Disco")
-                .font(.title2.weight(.semibold))
+                .font(DiscoTheme.Typography.pageTitle)
             Text(hasSelectedProject
                 ? "选择 Provider 后开始与项目协作。"
                 : "添加一个项目，然后开始与 Codex 或 OpenCode 协作。")
+                .font(DiscoTheme.Typography.body)
                 .foregroundStyle(.secondary)
             Button(hasSelectedProject ? "新建会话" : "添加项目") {
                 if hasSelectedProject {
@@ -394,7 +405,8 @@ private struct MessageView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(Color(red: 0.92, green: 0.92, blue: 0.92), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .font(DiscoTheme.Typography.body)
+                    .background(DiscoTheme.Palette.userMessageSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .frame(maxWidth: 620, alignment: .trailing)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -404,7 +416,7 @@ private struct MessageView: View {
                     HStack {
                         Spacer()
                         Text(statusLabel(status))
-                            .font(.caption)
+                            .font(DiscoTheme.Typography.caption)
                             .foregroundStyle(status == .failed ? .red : .secondary)
                     }
                 }
@@ -429,7 +441,7 @@ private struct MessageView: View {
                 if let error = message.error {
                     Text(error)
                         .foregroundStyle(.red)
-                        .font(.callout)
+                        .font(DiscoTheme.Typography.body)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -455,7 +467,7 @@ private struct MessageItemView: View {
         case let .reasoning(_, text, state):
             DisclosureGroup("分析过程 · \(stateLabel(state))") {
                 Text(text)
-                    .font(.callout)
+                    .font(DiscoTheme.Typography.body)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .padding(.top, 4)
@@ -497,20 +509,24 @@ private struct MessageItemView: View {
         case let .todoList(_, items, state):
             VStack(alignment: .leading, spacing: 6) {
                 Label("计划 · \(stateLabel(state))", systemImage: "checklist")
-                    .font(.subheadline.weight(.medium))
+                    .font(DiscoTheme.Typography.bodyEmphasized)
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     Label(item.text, systemImage: item.completed ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(item.completed ? .secondary : .primary)
                 }
             }
             .padding(12)
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .background(DiscoTheme.Palette.insetSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+            }
         case let .notice(_, message, _):
             Text(message)
-                .font(.callout)
+                .font(DiscoTheme.Typography.body)
                 .foregroundStyle(.orange)
                 .padding(10)
-                .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         case let .error(_, message, state):
             ToolCard(title: "错误", state: stateLabel(state), input: nil, output: nil, error: message)
         case .codexEvent:
@@ -548,13 +564,13 @@ private struct ToolCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 if let input, !input.isEmpty {
                     Text(input)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(DiscoTheme.Typography.code)
                         .textSelection(.enabled)
                 }
                 if let output, !output.isEmpty {
                     Divider()
                     Text(output)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(DiscoTheme.Typography.code)
                         .textSelection(.enabled)
                 }
                 if let error {
@@ -575,7 +591,11 @@ private struct ToolCard: View {
             }
         }
         .padding(12)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+        .background(DiscoTheme.Palette.insetSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+        }
     }
 }
 
@@ -585,10 +605,12 @@ private struct MarkdownText: View {
     var body: some View {
         if let attributedText = try? AttributedString(markdown: text) {
             Text(attributedText)
+                .font(DiscoTheme.Typography.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             Text(text)
+                .font(DiscoTheme.Typography.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -616,10 +638,10 @@ private struct ApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(request.title ?? request.toolName, systemImage: "hand.raised")
-                .font(.subheadline.weight(.semibold))
+                .font(DiscoTheme.Typography.bodyEmphasized)
             if let command = request.input["command"]?.stringValue {
                 Text(command)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(DiscoTheme.Typography.code)
                     .textSelection(.enabled)
             }
             HStack {
@@ -634,33 +656,39 @@ private struct ApprovalCard: View {
             }
         }
         .padding(14)
-        .background(.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+        .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.orange.opacity(0.22), lineWidth: 1)
+        }
     }
 }
 
 private struct ComposerView: View {
     @EnvironmentObject private var model: AppModel
     let availableHeight: CGFloat
-    @State private var isModelPickerPresented = false
+    @StateObject private var modelPickerPanel = AgentModelPickerPanelController()
     @State private var isModelControlHovered = false
+    @State private var isSendButtonHovered = false
+    @State private var editorHeight: CGFloat = 42
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 ZStack(alignment: .topLeading) {
-                    TextEditor(text: $model.draft)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 6)
-                        .disabled(isRunning)
+                    GrowingTextEditor(
+                        text: $model.draft,
+                        height: $editorHeight,
+                        isEditable: !isRunning,
+                        maxHeight: maxEditorHeight
+                    )
 
                     if model.draft.isEmpty {
                         Text("做什么都可以…")
-                            .font(.body)
+                            .font(DiscoTheme.Typography.body)
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 17)
-                            .padding(.top, 12)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 9)
                             .allowsHitTesting(false)
                     }
                 }
@@ -679,15 +707,14 @@ private struct ComposerView: View {
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
             }
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(DiscoTheme.Palette.surface, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.composerCornerRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(Color.black.opacity(0.12), lineWidth: 1)
+                RoundedRectangle(cornerRadius: DiscoTheme.Metrics.composerCornerRadius, style: .continuous)
+                    .strokeBorder(DiscoTheme.Palette.border, lineWidth: 1)
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .frame(height: composerHeight)
     }
 
     private var isRunning: Bool {
@@ -708,40 +735,38 @@ private struct ComposerView: View {
         model.selectedProvider?.supportsPlan == true
     }
 
-    private var composerHeight: CGFloat {
-        max(104, availableHeight * 0.05)
-    }
-
-    private var editorHeight: CGFloat {
-        max(42, composerHeight - 62)
+    private var maxEditorHeight: CGFloat {
+        max(140, min(280, availableHeight * 0.55))
     }
 
     private var agentModelControl: some View {
         Button {
-            isModelPickerPresented = true
+            modelPickerPanel.toggle(model: model)
         } label: {
             HStack(spacing: 6) {
                 agentLogo
                 Text(selectedModelName)
                     .lineLimit(1)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(DiscoTheme.Typography.bodyEmphasized)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .contentShape(Rectangle())
             .background(
-                isModelControlHovered || isModelPickerPresented
-                    ? Color.black.opacity(0.06)
+                isModelControlHovered || modelPickerPanel.isPresented
+                    ? DiscoTheme.Palette.hover
                     : Color.clear,
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
             )
         }
         .buttonStyle(.plain)
         .onHover { isModelControlHovered = $0 }
         .disabled(isRunning)
         .help("切换 Agent 和模型")
-        .popover(isPresented: $isModelPickerPresented, arrowEdge: .bottom) {
-            AgentModelPickerView(initialAgent: model.selectedAgent)
+        .background {
+            ModelPickerPanelAnchor { anchorView in
+                modelPickerPanel.setAnchorView(anchorView)
+            }
         }
     }
 
@@ -755,7 +780,7 @@ private struct ComposerView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         } else {
             Image(systemName: "sparkles")
-                .font(.system(size: 13, weight: .semibold))
+                .font(DiscoTheme.Typography.control)
                 .frame(width: 18, height: 18)
         }
     }
@@ -772,7 +797,11 @@ private struct ComposerView: View {
             }
         } label: {
             Text(reasoningLabel(model.selectedReasoningEffort))
-                .font(.system(size: 12, weight: .medium))
+                .font(DiscoTheme.Typography.control)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(DiscoTheme.Palette.controlSurface, in: Capsule())
         }
         .menuStyle(.borderlessButton)
         .disabled(isRunning || selectedReasoningEfforts.isEmpty)
@@ -793,7 +822,11 @@ private struct ComposerView: View {
                 Image(systemName: "lock")
                 Text(authorizationLabel)
             }
-            .font(.system(size: 12, weight: .medium))
+            .font(DiscoTheme.Typography.control)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(DiscoTheme.Palette.controlSurface, in: Capsule())
         }
         .menuStyle(.borderlessButton)
         .disabled(isRunning || model.selectedAgent != .codex)
@@ -806,26 +839,26 @@ private struct ComposerView: View {
                 model.planMode = false
             }
             .buttonStyle(.plain)
-            .font(.system(size: 11, weight: .semibold))
+            .font(DiscoTheme.Typography.captionEmphasized)
             .foregroundStyle(model.planMode ? Color.primary : Color.white)
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
-            .background(model.planMode ? Color.clear : Color.black, in: Capsule())
+            .background(model.planMode ? Color.clear : DiscoTheme.Palette.accent, in: Capsule())
             .disabled(isRunning)
 
             Button("Plan") {
                 model.planMode = true
             }
             .buttonStyle(.plain)
-            .font(.system(size: 11, weight: .semibold))
+            .font(DiscoTheme.Typography.captionEmphasized)
             .foregroundStyle(model.planMode ? Color.white : Color.primary)
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
-            .background(model.planMode ? Color.black : Color.clear, in: Capsule())
+            .background(model.planMode ? DiscoTheme.Palette.accent : Color.clear, in: Capsule())
             .disabled(isRunning || !supportsPlan)
         }
         .padding(2)
-        .background(Color.black.opacity(0.07), in: Capsule())
+        .background(DiscoTheme.Palette.controlSurface, in: Capsule())
         .opacity(isRunning ? 0.55 : 1)
         .help("切换 Build 和 Plan 模式")
     }
@@ -839,17 +872,20 @@ private struct ComposerView: View {
             }
         } label: {
             Image(systemName: isRunning ? "stop.fill" : "arrow.up")
-                .font(.system(size: 14, weight: .semibold))
-                .frame(width: 34, height: 34)
-                .foregroundStyle(canSend || isRunning ? .white : .black)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 30, height: 30)
+                .foregroundStyle(canSend || isRunning ? .white : .secondary)
                 .background(
-                    (canSend || isRunning ? Color.black : Color(red: 0.82, green: 0.82, blue: 0.82)),
+                    canSend || isRunning
+                        ? (isSendButtonHovered ? DiscoTheme.Palette.accent.opacity(0.84) : DiscoTheme.Palette.accent)
+                        : DiscoTheme.Palette.insetSurface,
                     in: Circle()
                 )
         }
         .buttonStyle(.plain)
         .keyboardShortcut(.return, modifiers: [.command])
         .disabled(!canSend && !isRunning)
+        .onHover { isSendButtonHovered = $0 }
         .help(isRunning ? "停止（Esc）" : "发送（⌘↩）")
     }
 
@@ -896,13 +932,337 @@ private struct ComposerView: View {
     }
 }
 
+private struct GrowingTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var height: CGFloat
+    let isEditable: Bool
+    let maxHeight: CGFloat
+
+    private let minHeight: CGFloat = 42
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            text: $text,
+            height: $height,
+            minHeight: minHeight,
+            maxHeight: maxHeight
+        )
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView(frame: .zero)
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 1, height: minHeight))
+        textView.isRichText = false
+        textView.isEditable = isEditable
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.drawsBackground = false
+        textView.font = .systemFont(ofSize: 14)
+        textView.textContainerInset = NSSize(width: 12, height: 6)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: 1,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.string = text
+        textView.delegate = context.coordinator
+
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.scrollView = scrollView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+
+        context.coordinator.maxHeight = maxHeight
+        context.coordinator.textView = textView
+        context.coordinator.scrollView = scrollView
+        textView.isEditable = isEditable
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+
+        if textView.string != text {
+            textView.delegate = nil
+            textView.string = text
+            textView.delegate = context.coordinator
+        }
+
+        context.coordinator.updateHeight()
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        let text: Binding<String>
+        let height: Binding<CGFloat>
+        let minHeight: CGFloat
+        var maxHeight: CGFloat
+        weak var textView: NSTextView?
+        weak var scrollView: NSScrollView?
+
+        init(
+            text: Binding<String>,
+            height: Binding<CGFloat>,
+            minHeight: CGFloat,
+            maxHeight: CGFloat
+        ) {
+            self.text = text
+            self.height = height
+            self.minHeight = minHeight
+            self.maxHeight = maxHeight
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView,
+                  let changedTextView = notification.object as? NSTextView,
+                  changedTextView === textView else { return }
+            text.wrappedValue = textView.string
+            updateHeight()
+        }
+
+        func updateHeight() {
+            guard let textView, let textContainer = textView.textContainer else { return }
+
+            if let scrollView {
+                let contentWidth = scrollView.contentView.bounds.width
+                if contentWidth > 0 {
+                    var frame = textView.frame
+                    frame.size.width = contentWidth
+                    textView.frame = frame
+                    textContainer.containerSize = NSSize(
+                        width: contentWidth,
+                        height: CGFloat.greatestFiniteMagnitude
+                    )
+                }
+                scrollView.hasVerticalScroller = false
+                scrollView.hasHorizontalScroller = false
+            }
+
+            textView.layoutManager?.ensureLayout(for: textContainer)
+            let usedHeight = textView.layoutManager?.usedRect(for: textContainer).height ?? minHeight
+            let fittingHeight = ceil(usedHeight + textView.textContainerInset.height * 2 + 2)
+            let nextHeight = min(maxHeight, max(minHeight, fittingHeight))
+
+            var frame = textView.frame
+            frame.size.height = nextHeight
+            textView.frame = frame
+
+            guard abs(height.wrappedValue - nextHeight) > 0.5 else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, abs(self.height.wrappedValue - nextHeight) > 0.5 else { return }
+                self.height.wrappedValue = nextHeight
+            }
+        }
+    }
+}
+
+private struct ModelPickerPanelAnchor: NSViewRepresentable {
+    let onResolve: (NSView) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.postsFrameChangedNotifications = true
+        onResolve(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        onResolve(nsView)
+    }
+}
+
+@MainActor
+private final class AgentModelPickerPanelController: NSObject, ObservableObject, NSWindowDelegate {
+    @Published private(set) var isPresented = false
+
+    private var panel: AgentModelPickerPanel?
+    private weak var anchorView: NSView?
+    private var outsideClickMonitor: Any?
+    private var windowObservers: [NSObjectProtocol] = []
+
+    func setAnchorView(_ anchorView: NSView) {
+        self.anchorView = anchorView
+    }
+
+    func toggle(model: AppModel) {
+        if panel == nil {
+            present(model: model)
+        } else {
+            close()
+        }
+    }
+
+    func close() {
+        removeObservers()
+        panel?.onCancel = nil
+        panel?.orderOut(nil)
+        panel?.delegate = nil
+        panel = nil
+        isPresented = false
+    }
+
+    private func present(model: AppModel) {
+        guard let anchorView, let anchorWindow = anchorView.window else { return }
+
+        let pickerView = AgentModelPickerView(initialAgent: model.selectedAgent) { [weak self] in
+            self?.close()
+        }
+        .environmentObject(model)
+
+        let hostingView = NSHostingView(rootView: pickerView)
+        hostingView.frame = NSRect(
+            origin: .zero,
+            size: NSSize(width: modelPickerWidth, height: modelPickerHeight)
+        )
+        hostingView.autoresizingMask = [.width, .height]
+
+        let panel = AgentModelPickerPanel(
+            contentRect: NSRect(
+                origin: .zero,
+                size: NSSize(width: modelPickerWidth, height: modelPickerHeight)
+            ),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = hostingView
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.collectionBehavior = [.transient, .moveToActiveSpace]
+        panel.hidesOnDeactivate = true
+        panel.acceptsMouseMovedEvents = true
+        panel.onCancel = { [weak self] in
+            self?.close()
+        }
+        panel.delegate = self
+
+        self.panel = panel
+        isPresented = true
+        observe(anchorView: anchorView, window: anchorWindow)
+        repositionPanel()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func observe(anchorView: NSView, window: NSWindow) {
+        let notificationCenter = NotificationCenter.default
+        windowObservers = [
+            notificationCenter.addObserver(
+                forName: NSWindow.didMoveNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.repositionPanel()
+                }
+            },
+            notificationCenter.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.repositionPanel()
+                }
+            },
+            notificationCenter.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: anchorView,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.repositionPanel()
+                }
+            },
+            notificationCenter.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.close()
+                }
+            }
+        ]
+
+        outsideClickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            guard let self, let panel = self.panel else { return event }
+
+            let location = NSEvent.mouseLocation
+            let isInsidePanel = panel.frame.contains(location)
+            let isInsideAnchor = self.anchorView.flatMap { self.screenFrame(for: $0)?.contains(location) } ?? false
+            if !isInsidePanel && !isInsideAnchor {
+                self.close()
+            }
+            return event
+        }
+    }
+
+    private func repositionPanel() {
+        guard let panel, let anchorView, let screenRect = screenFrame(for: anchorView) else { return }
+        let visibleFrame = anchorView.window?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+        guard let visibleFrame else { return }
+
+        var origin = NSPoint(x: screenRect.minX, y: screenRect.maxY + 8)
+        if origin.y + panel.frame.height > visibleFrame.maxY {
+            origin.y = screenRect.minY - panel.frame.height - 8
+        }
+
+        let minimumX = visibleFrame.minX + 8
+        let maximumX = visibleFrame.maxX - panel.frame.width - 8
+        origin.x = min(max(origin.x, minimumX), maximumX)
+        panel.setFrameOrigin(origin)
+    }
+
+    private func screenFrame(for view: NSView) -> NSRect? {
+        guard let window = view.window else { return nil }
+        return window.convertToScreen(view.convert(view.bounds, to: nil))
+    }
+
+    private func removeObservers() {
+        let notificationCenter = NotificationCenter.default
+        windowObservers.forEach(notificationCenter.removeObserver)
+        windowObservers.removeAll()
+
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+    }
+}
+
+private final class AgentModelPickerPanel: NSPanel {
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+}
+
 private struct AgentModelPickerView: View {
     @EnvironmentObject private var model: AppModel
-    @Environment(\.dismiss) private var dismiss
+    let onDismiss: () -> Void
     @State private var highlightedAgent: BackendKind
     @State private var hoveredAgent: BackendKind?
 
-    init(initialAgent: BackendKind) {
+    init(initialAgent: BackendKind, onDismiss: @escaping () -> Void) {
+        self.onDismiss = onDismiss
         _highlightedAgent = State(initialValue: initialAgent)
     }
 
@@ -918,7 +1278,13 @@ private struct AgentModelPickerView: View {
             modelList
                 .frame(maxWidth: .infinity)
         }
-        .frame(width: 500, height: 340)
+        .frame(width: modelPickerWidth, height: modelPickerHeight)
+        .background(DiscoTheme.Palette.surface, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.cardCornerRadius, style: .continuous)
+                .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+        }
     }
 
     private var agentList: some View {
@@ -939,7 +1305,7 @@ private struct AgentModelPickerView: View {
                     .contentShape(Rectangle())
                     .background(
                         agentBackground(for: provider.kind),
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
                     )
                     .help(provider.kind.displayName)
                     .accessibilityLabel(provider.kind.displayName)
@@ -958,14 +1324,15 @@ private struct AgentModelPickerView: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        .background(DiscoTheme.Palette.sidebar)
     }
 
     private func agentBackground(for agent: BackendKind) -> Color {
         if highlightedAgent == agent {
-            return Color.accentColor.opacity(0.15)
+            return DiscoTheme.Palette.selectionStrong
         }
         if hoveredAgent == agent {
-            return Color.black.opacity(0.06)
+            return DiscoTheme.Palette.hover
         }
         return .clear
     }
@@ -973,7 +1340,7 @@ private struct AgentModelPickerView: View {
     private var modelList: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("模型")
-                .font(.caption)
+                .font(DiscoTheme.Typography.captionEmphasized)
                 .foregroundStyle(.secondary)
 
             if let highlightedProvider, !highlightedProvider.models.isEmpty {
@@ -1014,7 +1381,7 @@ private struct AgentModelPickerView: View {
             model.updateAgent(highlightedAgent)
         }
         model.updateModel(modelID)
-        dismiss()
+        onDismiss()
     }
 }
 
@@ -1037,15 +1404,16 @@ private struct PickerRow<Label: View>: View {
                 Spacer(minLength: 8)
                 if selected {
                     Image(systemName: "checkmark")
-                        .font(.caption.weight(.semibold))
+                        .font(DiscoTheme.Typography.captionEmphasized)
                         .foregroundStyle(.secondary)
                 }
             }
+            .font(DiscoTheme.Typography.body)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .contentShape(Rectangle())
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
@@ -1053,8 +1421,8 @@ private struct PickerRow<Label: View>: View {
 
     private var backgroundColor: Color {
         if selected {
-            return Color.black.opacity(0.12)
+            return DiscoTheme.Palette.selection
         }
-        return isHovering ? Color.black.opacity(0.04) : .clear
+        return isHovering ? DiscoTheme.Palette.hover : .clear
     }
 }

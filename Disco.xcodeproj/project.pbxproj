@@ -14,6 +14,7 @@
 		428A4CB14E717A25D9F8EE40 /* NativeCoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4237147A7FDBFAAC680672CF /* NativeCoreTests.swift */; };
 		59CE0D1376F331F358B7C462 /* AppDependencies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 816E25151B3A6D2ACD398B38 /* AppDependencies.swift */; };
 		5BE75337E46CD000A2B88350 /* OpenCodeBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70557DB81E227C5A8E160FF2 /* OpenCodeBackend.swift */; };
+		5CD2346DE7A32201167119E0 /* DiscoDesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8241E1BF26C69563DEEACB66 /* DiscoDesignSystem.swift */; };
 		66487360EB51708C08B8872A /* AgentHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E765B6BF628731F16CC269A /* AgentHost.swift */; };
 		6BC9E69C44624E1C9FCFA2FF /* Environment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9348B04783190622CA2D234D /* Environment.swift */; };
 		76BC2B3AD46C54E9AD0EB36A /* WorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCC0A16F861D8AD597CDEA0A /* WorkspaceView.swift */; };
@@ -48,6 +49,7 @@
 		6A5B3755C187C96AEFF6E1ED /* SQLiteStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLiteStore.swift; sourceTree = "<group>"; };
 		70557DB81E227C5A8E160FF2 /* OpenCodeBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCodeBackend.swift; sourceTree = "<group>"; };
 		816E25151B3A6D2ACD398B38 /* AppDependencies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDependencies.swift; sourceTree = "<group>"; };
+		8241E1BF26C69563DEEACB66 /* DiscoDesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoDesignSystem.swift; sourceTree = "<group>"; };
 		8DE2EC6F59F8AC95A4AC97E4 /* ProcessSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessSupport.swift; sourceTree = "<group>"; };
 		9348B04783190622CA2D234D /* Environment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Environment.swift; sourceTree = "<group>"; };
 		95B34EACB7DF9BBCEDF7B64E /* DiscoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DiscoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -107,6 +109,7 @@
 		3FDE72AA737F5126C949CE92 /* Presentation */ = {
 			isa = PBXGroup;
 			children = (
+				8241E1BF26C69563DEEACB66 /* DiscoDesignSystem.swift */,
 				B6B63CBF1A7247DCD8AC92F6 /* Settings */,
 				1E4EC4A43C64AAB38AB56F4D /* Workspace */,
 			);
@@ -333,6 +336,7 @@
 				D6FEF36552425470D413F861 /* AppModel.swift in Sources */,
 				8D1B4442ECBCD9732C59231E /* CodexBackend.swift in Sources */,
 				F71BD3E2A966834D491C2E3C /* DiscoApp.swift in Sources */,
+				5CD2346DE7A32201167119E0 /* DiscoDesignSystem.swift in Sources */,
 				6BC9E69C44624E1C9FCFA2FF /* Environment.swift in Sources */,
 				DA97EF0089AE2616C313BD27 /* JSONHelpers.swift in Sources */,
 				37AAEEDD2D2D4AAFAF0BF492 /* JSONRPC.swift in Sources */,
