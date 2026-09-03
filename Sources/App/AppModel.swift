@@ -186,10 +186,15 @@ final class AppModel: ObservableObject {
     }
 
     func createSession() {
-        guard let host, let project = selectedProject else {
+        guard let project = selectedProject else {
             workspaceError = "请先选择一个项目"
             return
         }
+        createSession(in: project)
+    }
+
+    func createSession(in project: ProjectInfo) {
+        guard let host else { return }
         let provider = providers.first { $0.kind == selectedAgent }
         guard provider?.available == true else {
             workspaceError = "Provider 不可用：\(selectedAgent.displayName)"
@@ -281,8 +286,24 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换模型"
             return
         }
-        if selectedSession != nil, selectedSession?.modelID != modelID {
-            startNewSessionSelection()
+        if let session = selectedSession, session.modelID != modelID {
+            if session.agentThreadID == nil {
+                guard let host else { return }
+                do {
+                    try host.updateSessionModel(sessionID: session.id, modelID: modelID)
+                    if var sessions = sessionsByProject[session.projectID],
+                       let index = sessions.firstIndex(where: { $0.id == session.id })
+                    {
+                        sessions[index].modelID = modelID
+                        sessionsByProject[session.projectID] = sessions
+                    }
+                } catch {
+                    workspaceError = error.localizedDescription
+                    return
+                }
+            } else {
+                startNewSessionSelection()
+            }
         }
         selectedModelID = modelID
     }

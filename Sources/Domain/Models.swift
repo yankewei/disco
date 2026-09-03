@@ -19,15 +19,6 @@ enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
         }
     }
 
-    var systemImage: String {
-        switch self {
-        case .codex:
-            "sparkles"
-        case .opencode:
-            "terminal"
-        }
-    }
-
     var iconAssetName: String {
         switch self {
         case .codex:

@@ -233,6 +233,11 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(storedSession.agentThreadID, session.agentThreadID)
         XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
 
+        try store.updateSessionModel(sessionID: session.id, modelID: "gpt-5")
+        XCTAssertEqual(try store.session(id: session.id)?.modelID, "gpt-5")
+        try store.updateSessionModel(sessionID: session.id, modelID: nil)
+        XCTAssertNil(try store.session(id: session.id)?.modelID)
+
         store.close()
     }
 

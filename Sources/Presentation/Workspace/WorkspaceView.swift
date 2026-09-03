@@ -60,25 +60,62 @@ private struct SidebarView: View {
 
             List {
                 ForEach(model.projects) { project in
-                    Button {
-                        toggleProject(project)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: expandedProjectIDs.contains(project.id) ? "folder.fill" : "folder")
-                                .foregroundStyle(.secondary)
-                            Text(project.name)
-                                .lineLimit(1)
+                    HStack(spacing: 0) {
+                        Button {
+                            toggleProject(project)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: expandedProjectIDs.contains(project.id) ? "folder.fill" : "folder")
+                                    .foregroundStyle(.secondary)
+                                Text(project.name)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+
+                        HStack(spacing: 0) {
+                            if hoveredProjectID == project.id {
+                                Menu {
+                                    projectContextMenu(project)
+                                } label: {
+                                    Image(systemName: "ellipsis")
+                                        .frame(width: 22, height: 22)
+                                        .contentShape(Rectangle())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .help("更多操作")
+                                .accessibilityLabel("更多操作")
+
+                                Button {
+                                    expandedProjectIDs.insert(project.id)
+                                    model.createSession(in: project)
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .frame(width: 22, height: 22)
+                                        .contentShape(Rectangle())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.borderless)
+                                .help("新建会话")
+                                .accessibilityLabel("新建会话")
+                            } else {
+                                Color.clear
+                                    .frame(width: 44, height: 22)
+                            }
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 10)
                     .padding(.vertical, 4)
                     .background(
-                        hoveredProjectID == project.id
-                            ? Color.black.opacity(0.06)
-                            : Color.clear,
+                        model.selectedProjectID == project.id
+                            ? Color.black.opacity(0.10)
+                            : hoveredProjectID == project.id
+                                ? Color.black.opacity(0.06)
+                                : Color.clear,
                         in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                     )
                     .contentShape(Rectangle())
@@ -90,27 +127,16 @@ private struct SidebarView: View {
                         }
                     }
                     .contextMenu {
-                        Button {
-                            revealProject(project)
-                        } label: {
-                            Label("在 Finder 中显示", systemImage: "folder")
-                        }
-
-                        Divider()
-
-                        Button(role: .destructive) {
-                            projectToDelete = project
-                        } label: {
-                            Label("删除项目", systemImage: "xmark")
-                        }
+                        projectContextMenu(project)
                     }
                     .transaction { transaction in
                         transaction.animation = nil
                     }
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                     if expandedProjectIDs.contains(project.id) {
                         ForEach(model.sessionsByProject[project.id] ?? []) { session in
                             SessionRow(session: session, sessionToDelete: $sessionToDelete)
-                                .padding(.leading, 18)
+                                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                         }
                     }
                 }
@@ -189,6 +215,23 @@ private struct SidebarView: View {
         NSWorkspace.shared.open(URL(fileURLWithPath: project.projectPath))
     }
 
+    @ViewBuilder
+    private func projectContextMenu(_ project: ProjectInfo) -> some View {
+        Button {
+            revealProject(project)
+        } label: {
+            Label("在 Finder 中显示", systemImage: "folder")
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            projectToDelete = project
+        } label: {
+            Label("删除项目", systemImage: "xmark")
+        }
+    }
+
     private func toggleProject(_ project: ProjectInfo) {
         if expandedProjectIDs.contains(project.id) {
             expandedProjectIDs.remove(project.id)
@@ -203,14 +246,24 @@ private struct SessionRow: View {
     @EnvironmentObject private var model: AppModel
     let session: SessionInfo
     @Binding var sessionToDelete: SessionInfo?
+    @State private var isHovering = false
+
+    private var isSelected: Bool {
+        model.selectedSessionID == session.id
+    }
 
     var body: some View {
         Button {
             model.selectSession(session)
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: session.agent.systemImage)
-                    .foregroundStyle(.secondary)
+                Color.clear
+                    .frame(width: 10, height: 1)
+                Image(session.agent.iconAssetName)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 16, height: 16)
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 Text(session.title)
                     .lineLimit(1)
                 Spacer()
@@ -219,14 +272,19 @@ private struct SessionRow: View {
                         .controlSize(.small)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.vertical, 3)
-        .listRowBackground(
-            model.selectedSessionID == session.id
-                ? Color.accentColor.opacity(0.12)
-                : Color.clear
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(
+            isSelected
+                ? Color.black.opacity(0.10)
+                : isHovering ? Color.black.opacity(0.06) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
         )
+        .onHover { isHovering = $0 }
         .contextMenu {
             Button("删除会话", role: .destructive) {
                 sessionToDelete = session
@@ -240,13 +298,10 @@ private struct ConversationView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            conversationHeader
-            Divider()
             if model.selectedSession != nil {
                 GeometryReader { geometry in
                     VStack(spacing: 0) {
                         messageList
-                        Divider()
                         ApprovalList()
                         ComposerView(availableHeight: geometry.size.height)
                     }
@@ -269,37 +324,6 @@ private struct ConversationView: View {
     private let chatColumnMinimumWidth: CGFloat = 420
     private let chatColumnIdealWidth: CGFloat = 640
     private let chatColumnMaximumWidth: CGFloat = 720
-
-    private var conversationHeader: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.selectedSession?.title ?? model.selectedProject?.name ?? "Disco")
-                    .font(.headline)
-                if let project = model.selectedProject {
-                        Text(project.projectPath)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            Spacer()
-            if model.selectedProject != nil {
-                Button {
-                    model.startNewSession()
-                } label: {
-                    Image(systemName: "plus.message")
-                }
-                .buttonStyle(.borderless)
-                .help("新建会话")
-            }
-            if model.isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-    }
 
     private var messageList: some View {
         ScrollViewReader { scrollProxy in
@@ -617,6 +641,8 @@ private struct ApprovalCard: View {
 private struct ComposerView: View {
     @EnvironmentObject private var model: AppModel
     let availableHeight: CGFloat
+    @State private var isModelPickerPresented = false
+    @State private var isModelControlHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -641,7 +667,7 @@ private struct ComposerView: View {
                 .frame(height: editorHeight)
 
                 HStack(spacing: 8) {
-                    agentModelMenu
+                    agentModelControl
                     reasoningMenu
                     sandboxMenu
                     modeSwitcher
@@ -670,7 +696,7 @@ private struct ComposerView: View {
     }
 
     private var selectedModelName: String {
-        guard let selectedModelID = model.selectedModelID else { return "默认模型" }
+        guard let selectedModelID = model.selectedModelID else { return "Provider 默认" }
         return model.selectedProvider?.models.first { $0.id == selectedModelID }?.name ?? selectedModelID
     }
 
@@ -690,61 +716,47 @@ private struct ComposerView: View {
         max(42, composerHeight - 62)
     }
 
-    private var agentModelMenu: some View {
-        HStack(spacing: 6) {
-            agentIcon
-
-            Menu {
-                Section("Agent") {
-                    ForEach(model.availableProviders) { provider in
-                        Button {
-                            model.updateAgent(provider.kind)
-                        } label: {
-                            Label(provider.kind.displayName, systemImage: provider.kind.systemImage)
-                        }
-                    }
-                }
-
-                Section("模型") {
-                    Button("默认模型") {
-                        model.updateModel(nil)
-                    }
-                    ForEach(model.selectedProvider?.models ?? []) { modelInfo in
-                        Button(modelInfo.name) {
-                            model.updateModel(modelInfo.id)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Text(selectedModelName)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.down")
-                        .font(.caption2.weight(.semibold))
-                }
-                .font(.system(size: 12, weight: .medium))
+    private var agentModelControl: some View {
+        Button {
+            isModelPickerPresented = true
+        } label: {
+            HStack(spacing: 6) {
+                agentLogo
+                Text(selectedModelName)
+                    .lineLimit(1)
+                    .font(.system(size: 13, weight: .medium))
             }
-            .menuStyle(.borderlessButton)
-            .help("切换 Agent 和模型")
-            .disabled(isRunning)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .background(
+                isModelControlHovered || isModelPickerPresented
+                    ? Color.black.opacity(0.06)
+                    : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+            )
         }
-        .frame(maxWidth: 130, alignment: .leading)
+        .buttonStyle(.plain)
+        .onHover { isModelControlHovered = $0 }
+        .disabled(isRunning)
+        .help("切换 Agent 和模型")
+        .popover(isPresented: $isModelPickerPresented, arrowEdge: .bottom) {
+            AgentModelPickerView(initialAgent: model.selectedAgent)
+        }
     }
 
     @ViewBuilder
-    private var agentIcon: some View {
+    private var agentLogo: some View {
         if let provider = model.selectedProvider {
             Image(provider.kind.iconAssetName)
                 .resizable()
                 .scaledToFit()
-                .frame(width: 20, height: 20)
-                .clipped()
-                .frame(width: 34, height: 34)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(width: 18, height: 18)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
         } else {
             Image(systemName: "sparkles")
-                .font(.system(size: 15, weight: .semibold))
-                .frame(width: 34, height: 34)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 18, height: 18)
         }
     }
 
@@ -881,5 +893,168 @@ private struct ComposerView: View {
         case .workspaceWrite: "lock.open"
         case .dangerFullAccess: "lock.open.fill"
         }
+    }
+}
+
+private struct AgentModelPickerView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var highlightedAgent: BackendKind
+    @State private var hoveredAgent: BackendKind?
+
+    init(initialAgent: BackendKind) {
+        _highlightedAgent = State(initialValue: initialAgent)
+    }
+
+    private var highlightedProvider: ProviderInfo? {
+        model.availableProviders.first { $0.kind == highlightedAgent }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            agentList
+                .frame(width: 58)
+            Divider()
+            modelList
+                .frame(maxWidth: .infinity)
+        }
+        .frame(width: 500, height: 340)
+    }
+
+    private var agentList: some View {
+        List {
+            ForEach(model.availableProviders) { provider in
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        highlightedAgent = provider.kind
+                    } label: {
+                        Image(provider.kind.iconAssetName)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+                    .background(
+                        agentBackground(for: provider.kind),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .help(provider.kind.displayName)
+                    .accessibilityLabel(provider.kind.displayName)
+                    .onHover { isHovering in
+                        if isHovering {
+                            hoveredAgent = provider.kind
+                        } else if hoveredAgent == provider.kind {
+                            hoveredAgent = nil
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                .listRowBackground(Color.clear)
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+    }
+
+    private func agentBackground(for agent: BackendKind) -> Color {
+        if highlightedAgent == agent {
+            return Color.accentColor.opacity(0.15)
+        }
+        if hoveredAgent == agent {
+            return Color.black.opacity(0.06)
+        }
+        return .clear
+    }
+
+    private var modelList: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("模型")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let highlightedProvider, !highlightedProvider.models.isEmpty {
+                List {
+                    PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == nil) {
+                        selectModel(nil)
+                    } label: {
+                        Text("Provider 默认")
+                    }
+                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                    .listRowBackground(Color.clear)
+
+                    ForEach(highlightedProvider.models) { modelInfo in
+                        PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == modelInfo.id) {
+                            selectModel(modelInfo.id)
+                        } label: {
+                            Text(modelInfo.name)
+                                .lineLimit(1)
+                        }
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                        .listRowBackground(Color.clear)
+                    }
+                }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+            } else {
+                Text("暂无模型")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(.top, 8)
+            }
+        }
+        .padding(8)
+    }
+
+    private func selectModel(_ modelID: String?) {
+        if model.selectedAgent != highlightedAgent {
+            model.updateAgent(highlightedAgent)
+        }
+        model.updateModel(modelID)
+        dismiss()
+    }
+}
+
+private struct PickerRow<Label: View>: View {
+    let selected: Bool
+    private let label: Label
+    private let action: () -> Void
+    @State private var isHovering = false
+
+    init(selected: Bool, action: @escaping () -> Void, @ViewBuilder label: () -> Label) {
+        self.selected = selected
+        self.action = action
+        self.label = label()
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                label
+                Spacer(minLength: 8)
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+
+    private var backgroundColor: Color {
+        if selected {
+            return Color.black.opacity(0.12)
+        }
+        return isHovering ? Color.black.opacity(0.04) : .clear
     }
 }

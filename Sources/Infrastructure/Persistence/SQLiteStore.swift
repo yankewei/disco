@@ -214,6 +214,18 @@ final class SQLiteStore {
         try step(statement)
     }
 
+    func updateSessionModel(sessionID: String, modelID: String?) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare(
+            "UPDATE sessions SET model_id = ? WHERE session_id = ?"
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(modelID, at: 1, in: statement)
+        try bind(sessionID, at: 2, in: statement)
+        try step(statement)
+    }
+
     func updateAgentThreadID(sessionID: String, agentThreadID: String) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }

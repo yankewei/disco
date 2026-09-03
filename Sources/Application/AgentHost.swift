@@ -66,6 +66,16 @@ final class AgentHost {
         try store.touchSession(sessionID: sessionID)
     }
 
+    func updateSessionModel(sessionID: String, modelID: String?) throws {
+        guard let session = try store.session(id: sessionID) else {
+            throw AgentHostError.sessionNotFound
+        }
+        guard session.agentThreadID == nil else {
+            throw AgentHostError.sessionHasAgentConversation
+        }
+        try store.updateSessionModel(sessionID: sessionID, modelID: modelID)
+    }
+
     func createSession(
         projectID: String,
         agent: BackendKind,
@@ -543,6 +553,7 @@ enum AgentHostError: LocalizedError {
     case planModeUnsupported
     case emptyPrompt
     case sessionAlreadyRunning
+    case sessionHasAgentConversation
     case sessionDeletionInProgress
     case projectHasRunningSession
     case projectDeletionInProgress
@@ -557,6 +568,7 @@ enum AgentHostError: LocalizedError {
         case .planModeUnsupported: "当前 Provider 不支持计划模式"
         case .emptyPrompt: "请输入内容"
         case .sessionAlreadyRunning: "该会话正在运行"
+        case .sessionHasAgentConversation: "该会话已经开始与 Agent 对话"
         case .sessionDeletionInProgress: "该会话正在删除"
         case .projectHasRunningSession: "项目中有会话正在运行"
         case .projectDeletionInProgress: "该项目正在删除"
