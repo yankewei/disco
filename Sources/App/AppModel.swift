@@ -70,9 +70,8 @@ final class AppModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            await host.refreshBackends()
-            providers = await host.providers()
-            guard !isShuttingDown else { return }
+            // Load local projects and sessions first so the sidebar renders
+            // without waiting for provider processes to be discovered or booted.
             let projectList = try host.listProjects()
             projects = projectList
             var nextSessions: [String: [SessionInfo]] = [:]
@@ -80,6 +79,14 @@ final class AppModel: ObservableObject {
                 nextSessions[project.id] = try host.listSessions(projectID: project.id)
             }
             sessionsByProject = nextSessions
+
+            // Provider discovery, model enumeration and version probing are slow
+            // (they spawn login shells and provider processes); do them only
+            // after the local data is already on screen.
+            await host.refreshBackends()
+            providers = await host.providers()
+            guard !isShuttingDown else { return }
+
             if selectedProjectID == nil || !projectList.contains(where: { $0.id == selectedProjectID }) {
                 selectedProjectID = projectList.first?.id
             }
