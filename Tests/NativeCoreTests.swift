@@ -371,6 +371,81 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertTrue(try reopenedStore.listSessions(projectID: project.id).isEmpty)
     }
 
+    func testSQLiteStoreDeletesProjectAndCascadesLocalData() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let databaseURL = folder.appendingPathComponent("disco.sqlite")
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let store = try SQLiteStore(databaseURL: databaseURL)
+        let project = ProjectInfo(
+            projectID: "project-1",
+            name: "Disco",
+            projectPath: "/tmp/disco",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        let remainingProject = ProjectInfo(
+            projectID: "project-2",
+            name: "Other",
+            projectPath: "/tmp/other",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createProject(project)
+        try store.createProject(remainingProject)
+
+        let deletedSession = SessionInfo(
+            sessionID: "session-1",
+            projectID: project.id,
+            agent: .codex,
+            modelID: nil,
+            reasoningEffort: nil,
+            sandboxMode: nil,
+            agentThreadID: "agent-thread-1",
+            title: "待删除会话",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        let remainingSession = SessionInfo(
+            sessionID: "session-2",
+            projectID: remainingProject.id,
+            agent: .opencode,
+            modelID: nil,
+            reasoningEffort: nil,
+            sandboxMode: nil,
+            agentThreadID: "agent-thread-2",
+            title: "保留会话",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createSession(deletedSession)
+        try store.createSession(remainingSession)
+        try store.replaceMessages([
+            ConversationMessage(
+                id: "message-1",
+                role: .user,
+                text: "本地消息",
+                reasoning: nil,
+                toolCalls: nil,
+                items: nil,
+                timeline: nil,
+                status: nil,
+                error: nil,
+                createdAt: "2026-01-01T00:00:00Z"
+            ),
+        ], sessionID: deletedSession.id)
+
+        try store.deleteProject(projectID: project.id)
+
+        XCTAssertNil(try store.project(id: project.id))
+        XCTAssertTrue(try store.listSessions(projectID: project.id).isEmpty)
+        XCTAssertTrue(try store.loadMessages(sessionID: deletedSession.id).isEmpty)
+        XCTAssertNotNil(try store.project(id: remainingProject.id))
+        XCTAssertEqual(try store.listSessions(projectID: remainingProject.id), [remainingSession])
+        store.close()
+    }
+
     private func prepareStatement(
         database: OpaquePointer?,
         sql: String

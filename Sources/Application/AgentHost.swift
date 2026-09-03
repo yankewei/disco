@@ -11,6 +11,7 @@ final class AgentHost {
     private let stateLock = NSLock()
     private var activeRuns: [String: ActiveRun] = [:]
     private var pendingApprovals: [String: PendingApproval] = [:]
+    private var deletingProjectIDs: Set<String> = []
     private var deletingSessionIDs: Set<String> = []
     private var shutdownWaiters: [CheckedContinuation<Void, Never>] = []
     private var isShuttingDown = false
@@ -92,6 +93,27 @@ final class AgentHost {
         )
         try store.createSession(session)
         return session
+    }
+
+    func deleteProject(projectID: String) throws {
+        guard try store.project(id: projectID) != nil else {
+            throw AgentHostError.projectNotFound
+        }
+        let sessions = try store.listSessions(projectID: projectID)
+        try withStateLock {
+            guard sessions.allSatisfy({ activeRuns[$0.sessionID] == nil }) else {
+                throw AgentHostError.projectHasRunningSession
+            }
+            guard deletingProjectIDs.insert(projectID).inserted else {
+                throw AgentHostError.projectDeletionInProgress
+            }
+        }
+        defer {
+            _ = withStateLock {
+                deletingProjectIDs.remove(projectID)
+            }
+        }
+        try store.deleteProject(projectID: projectID)
     }
 
     func deleteSession(sessionID: String) throws {
@@ -218,6 +240,9 @@ final class AgentHost {
             }
             try withStateLock {
                 guard !isShuttingDown else { throw AgentHostError.shuttingDown }
+                guard !deletingProjectIDs.contains(session.projectID) else {
+                    throw AgentHostError.projectDeletionInProgress
+                }
                 guard !deletingSessionIDs.contains(sessionID) else {
                     throw AgentHostError.sessionDeletionInProgress
                 }
@@ -519,6 +544,8 @@ enum AgentHostError: LocalizedError {
     case emptyPrompt
     case sessionAlreadyRunning
     case sessionDeletionInProgress
+    case projectHasRunningSession
+    case projectDeletionInProgress
 
     var errorDescription: String? {
         switch self {
@@ -531,6 +558,8 @@ enum AgentHostError: LocalizedError {
         case .emptyPrompt: "请输入内容"
         case .sessionAlreadyRunning: "该会话正在运行"
         case .sessionDeletionInProgress: "该会话正在删除"
+        case .projectHasRunningSession: "项目中有会话正在运行"
+        case .projectDeletionInProgress: "该项目正在删除"
         }
     }
 }

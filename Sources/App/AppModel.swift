@@ -209,6 +209,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func deleteProject(_ project: ProjectInfo) {
+        guard let host else { return }
+        let sessionIDs = Set((sessionsByProject[project.id] ?? []).map(\.id))
+        do {
+            try host.deleteProject(projectID: project.id)
+            projects.removeAll { $0.id == project.id }
+            sessionsByProject.removeValue(forKey: project.id)
+            approvalRequests.removeAll { sessionIDs.contains($0.sessionID) }
+            for sessionID in sessionIDs {
+                activeTimelineBuilders.removeValue(forKey: sessionID)
+                runningSessionIDs.remove(sessionID)
+            }
+
+            guard selectedProjectID == project.id else { return }
+            if let nextProject = projects.first {
+                selectProject(nextProject)
+            } else {
+                selectedProjectID = nil
+                selectedSessionID = nil
+                messages = []
+            }
+        } catch {
+            workspaceError = error.localizedDescription
+        }
+    }
+
     func deleteSession(_ session: SessionInfo) {
         guard let host else { return }
         do {

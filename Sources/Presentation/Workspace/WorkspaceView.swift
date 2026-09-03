@@ -37,6 +37,8 @@ struct WorkspaceView: View {
 private struct SidebarView: View {
     @EnvironmentObject private var model: AppModel
     @Binding var expandedProjectIDs: Set<String>
+    @State private var hoveredProjectID: String?
+    @State private var projectToDelete: ProjectInfo?
     @State private var sessionToDelete: SessionInfo?
 
     var body: some View {
@@ -58,36 +60,68 @@ private struct SidebarView: View {
 
             List {
                 ForEach(model.projects) { project in
-                    DisclosureGroup(
-                        isExpanded: Binding(
-                            get: { expandedProjectIDs.contains(project.id) },
-                            set: { isExpanded in
-                                if isExpanded {
-                                    expandedProjectIDs.insert(project.id)
-                                } else {
-                                    expandedProjectIDs.remove(project.id)
-                                }
-                            }
-                        )
-                    ) {
-                        ForEach(model.sessionsByProject[project.id] ?? []) { session in
-                            SessionRow(session: session, sessionToDelete: $sessionToDelete)
-                        }
+                    Button {
+                        toggleProject(project)
                     } label: {
-                        Button {
-                            model.selectProject(project)
-                        } label: {
-                            Label(project.name, systemImage: "folder")
+                        HStack(spacing: 8) {
+                            Image(systemName: expandedProjectIDs.contains(project.id) ? "folder.fill" : "folder")
+                                .foregroundStyle(.secondary)
+                            Text(project.name)
                                 .lineLimit(1)
                         }
-                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(
+                        hoveredProjectID == project.id
+                            ? Color.black.opacity(0.06)
+                            : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
+                    .onHover { isHovering in
+                        if isHovering {
+                            hoveredProjectID = project.id
+                        } else if hoveredProjectID == project.id {
+                            hoveredProjectID = nil
+                        }
+                    }
+                    .contextMenu {
+                        Button {
+                            revealProject(project)
+                        } label: {
+                            Label("在 Finder 中显示", systemImage: "folder")
+                        }
+
+                        Divider()
+
+                        Button(role: .destructive) {
+                            projectToDelete = project
+                        } label: {
+                            Label("删除项目", systemImage: "xmark")
+                        }
+                    }
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    if expandedProjectIDs.contains(project.id) {
+                        ForEach(model.sessionsByProject[project.id] ?? []) { session in
+                            SessionRow(session: session, sessionToDelete: $sessionToDelete)
+                                .padding(.leading, 18)
+                        }
                     }
                 }
             }
             .listStyle(.sidebar)
             .onDeleteCommand {
-                guard let session = model.selectedSession else { return }
-                sessionToDelete = session
+                if let session = model.selectedSession {
+                    sessionToDelete = session
+                } else if let project = model.selectedProject {
+                    projectToDelete = project
+                }
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -127,6 +161,41 @@ private struct SidebarView: View {
         } message: {
             Text("将从 Disco 中移除“\(sessionToDelete?.title ?? "新对话")”；Provider 中的历史不会被删除。")
         }
+        .alert(
+            "删除项目？",
+            isPresented: Binding(
+                get: { projectToDelete != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        projectToDelete = nil
+                    }
+                }
+            )
+        ) {
+            Button("取消", role: .cancel) {
+                projectToDelete = nil
+            }
+            Button("删除", role: .destructive) {
+                guard let project = projectToDelete else { return }
+                projectToDelete = nil
+                model.deleteProject(project)
+            }
+        } message: {
+            Text("将从 Disco 中删除项目“\(projectToDelete?.name ?? "")”及其本地会话和消息；Provider 中的历史不会被删除。")
+        }
+    }
+
+    private func revealProject(_ project: ProjectInfo) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: project.projectPath))
+    }
+
+    private func toggleProject(_ project: ProjectInfo) {
+        if expandedProjectIDs.contains(project.id) {
+            expandedProjectIDs.remove(project.id)
+        } else {
+            expandedProjectIDs.insert(project.id)
+        }
+        model.selectProject(project)
     }
 }
 
@@ -175,15 +244,18 @@ private struct ConversationView: View {
             Divider()
             if model.selectedSession != nil {
                 GeometryReader { geometry in
-                    let chatColumnWidth = chatColumnWidth(for: geometry.size.width)
-
                     VStack(spacing: 0) {
                         messageList
                         Divider()
                         ApprovalList()
                         ComposerView(availableHeight: geometry.size.height)
                     }
-                    .frame(width: chatColumnWidth)
+                    .frame(
+                        minWidth: chatColumnMinimumWidth,
+                        idealWidth: chatColumnIdealWidth,
+                        maxWidth: chatColumnMaximumWidth,
+                        maxHeight: .infinity
+                    )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.white)
                 }
@@ -194,11 +266,9 @@ private struct ConversationView: View {
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private func chatColumnWidth(for availableWidth: CGFloat) -> CGFloat {
-        let targetWidth = availableWidth * 0.4
-        let minimumWidth: CGFloat = 400
-        return min(max(targetWidth, minimumWidth), max(availableWidth - 32, 0))
-    }
+    private let chatColumnMinimumWidth: CGFloat = 420
+    private let chatColumnIdealWidth: CGFloat = 640
+    private let chatColumnMaximumWidth: CGFloat = 720
 
     private var conversationHeader: some View {
         HStack {

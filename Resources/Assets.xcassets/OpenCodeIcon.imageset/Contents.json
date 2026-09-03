@@ -21,6 +21,26 @@
       "filename" : "opencode-logo-dark-square.svg",
       "idiom" : "mac",
       "scale" : "1x"
+    },
+    {
+      "appearances" : [
+        {
+          "appearance" : "luminosity",
+          "value" : "light"
+        }
+      ],
+      "idiom" : "mac",
+      "scale" : "2x"
+    },
+    {
+      "appearances" : [
+        {
+          "appearance" : "luminosity",
+          "value" : "dark"
+        }
+      ],
+      "idiom" : "mac",
+      "scale" : "2x"
     }
   ],
   "info" : {

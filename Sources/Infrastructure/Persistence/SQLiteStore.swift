@@ -205,6 +205,15 @@ final class SQLiteStore {
         try step(statement)
     }
 
+    func deleteProject(projectID: String) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare("DELETE FROM projects WHERE project_id = ?")
+        defer { sqlite3_finalize(statement) }
+        try bind(projectID, at: 1, in: statement)
+        try step(statement)
+    }
+
     func updateAgentThreadID(sessionID: String, agentThreadID: String) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }
