@@ -76,6 +76,19 @@ final class AgentHost {
         try store.updateSessionModel(sessionID: sessionID, modelID: modelID)
     }
 
+    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
+        guard let session = try store.session(id: sessionID) else {
+            throw AgentHostError.sessionNotFound
+        }
+        guard session.agentThreadID == nil else {
+            throw AgentHostError.sessionHasAgentConversation
+        }
+        guard backend(for: agent) != nil else {
+            throw AgentHostError.providerUnavailable(agent.displayName)
+        }
+        try store.updateSessionAgent(sessionID: sessionID, agent: agent)
+    }
+
     func createSession(
         projectID: String,
         agent: BackendKind,

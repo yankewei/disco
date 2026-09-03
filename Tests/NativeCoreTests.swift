@@ -238,6 +238,25 @@ final class NativeCoreTests: XCTestCase {
         try store.updateSessionModel(sessionID: session.id, modelID: nil)
         XCTAssertNil(try store.session(id: session.id)?.modelID)
 
+        let emptySession = SessionInfo(
+            sessionID: "empty-session-1",
+            projectID: project.id,
+            agent: .codex,
+            modelID: "o3",
+            reasoningEffort: .high,
+            sandboxMode: .workspaceWrite,
+            agentThreadID: nil,
+            title: "新对话",
+            createdAt: "2026-01-01T00:00:02Z",
+            activatedAt: nil
+        )
+        try store.createSession(emptySession)
+        try store.updateSessionAgent(sessionID: emptySession.id, agent: .opencode)
+        let updatedSession = try XCTUnwrap(store.session(id: emptySession.id))
+        XCTAssertEqual(updatedSession.agent, .opencode)
+        XCTAssertNil(updatedSession.modelID)
+        XCTAssertNil(updatedSession.reasoningEffort)
+
         store.close()
     }
 

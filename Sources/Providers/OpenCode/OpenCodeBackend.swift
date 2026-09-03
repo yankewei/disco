@@ -389,11 +389,18 @@ final class OpenCodeBackend: AgentBackend {
             )
         case "session.next.text.delta":
             let partID = jsonString(properties["textID"])
-            if let partID {
-                eventStreamState.streamedPartIDs.insert(partID)
-            }
-            if let delta = jsonString(properties["delta"]) {
-                context.emit(.text(text: delta, itemID: partID))
+            if eventStreamState.acceptsStreamDelta(
+                messageID: jsonString(properties["assistantMessageID"]),
+                partID: partID,
+                field: .text,
+                source: .sessionNext
+            ) {
+                if let partID {
+                    eventStreamState.streamedPartIDs.insert(partID)
+                }
+                if let delta = jsonString(properties["delta"]) {
+                    context.emit(.text(text: delta, itemID: partID))
+                }
             }
         case "session.next.text.ended":
             let partID = jsonString(properties["textID"])
@@ -404,11 +411,18 @@ final class OpenCodeBackend: AgentBackend {
             }
         case "session.next.reasoning.delta":
             let partID = jsonString(properties["reasoningID"])
-            if let partID {
-                eventStreamState.streamedPartIDs.insert(partID)
-            }
-            if let delta = jsonString(properties["delta"]) {
-                context.emit(.reasoning(text: delta, itemID: partID))
+            if eventStreamState.acceptsStreamDelta(
+                messageID: jsonString(properties["assistantMessageID"]),
+                partID: partID,
+                field: .reasoning,
+                source: .sessionNext
+            ) {
+                if let partID {
+                    eventStreamState.streamedPartIDs.insert(partID)
+                }
+                if let delta = jsonString(properties["delta"]) {
+                    context.emit(.reasoning(text: delta, itemID: partID))
+                }
             }
         case "session.next.reasoning.ended":
             let partID = jsonString(properties["reasoningID"])
@@ -491,11 +505,23 @@ final class OpenCodeBackend: AgentBackend {
         let messageID = jsonString(properties["messageID"])
         guard !eventStreamState.userMessageIDs.contains(messageID ?? "") else { return }
         if field == "text" {
+            guard eventStreamState.acceptsStreamDelta(
+                messageID: messageID,
+                partID: partID,
+                field: .text,
+                source: .messagePart
+            ) else { return }
             if let partID {
                 eventStreamState.streamedPartIDs.insert(partID)
             }
             context.emit(.text(text: delta, itemID: partID))
         } else if field == "reasoning" {
+            guard eventStreamState.acceptsStreamDelta(
+                messageID: messageID,
+                partID: partID,
+                field: .reasoning,
+                source: .messagePart
+            ) else { return }
             if let partID {
                 eventStreamState.streamedPartIDs.insert(partID)
             }
@@ -718,11 +744,44 @@ final class OpenCodeBackend: AgentBackend {
     }
 }
 
+private enum OpenCodeStreamSource: Equatable {
+    case messagePart
+    case sessionNext
+}
+
+private enum OpenCodeStreamField: Hashable {
+    case text
+    case reasoning
+}
+
+private struct OpenCodeStreamKey: Hashable {
+    let streamID: String
+    let field: OpenCodeStreamField
+}
+
 private final class OpenCodeEventStreamState {
     var userMessageIDs: Set<String> = []
     var streamedPartIDs: Set<String> = []
     private let stateLock = NSLock()
     private var promptSubmitted = false
+    private var streamSourceByKey: [OpenCodeStreamKey: OpenCodeStreamSource] = [:]
+
+    func acceptsStreamDelta(
+        messageID: String?,
+        partID: String?,
+        field: OpenCodeStreamField,
+        source: OpenCodeStreamSource
+    ) -> Bool {
+        guard let streamID = messageID ?? partID else { return true }
+        let key = OpenCodeStreamKey(streamID: streamID, field: field)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let existingSource = streamSourceByKey[key] {
+            return existingSource == source
+        }
+        streamSourceByKey[key] = source
+        return true
+    }
 
     var promptWasSubmitted: Bool {
         stateLock.lock()

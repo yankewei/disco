@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Textual
 
 private let modelPickerWidth: CGFloat = 500
 private let modelPickerHeight: CGFloat = 340
@@ -336,29 +337,98 @@ private struct ConversationView: View {
     private let chatColumnMaximumWidth: CGFloat = 720
 
     private var messageList: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    ForEach(model.messages) { message in
-                        MessageView(
-                            message: message,
-                            isStreaming: model.selectedSessionID.map { sessionID in
-                                model.runningSessionIDs.contains(sessionID)
-                                    && message.id == "active-\(sessionID)"
-                            } ?? false
-                        )
-                            .id(message.id)
-                    }
-                }
-                .padding(24)
-            }
-            .onChange(of: model.messages.count) {
-                if let lastMessage = model.messages.last {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        scrollProxy.scrollTo(lastMessage.id, anchor: .bottom)
-                    }
+        ChatScrollView(itemCount: model.messages.count) {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                ForEach(model.messages) { message in
+                    MessageView(
+                        message: message,
+                        isStreaming: model.selectedSessionID.map { sessionID in
+                            model.runningSessionIDs.contains(sessionID)
+                                && message.id == "active-\(sessionID)"
+                        } ?? false
+                    )
                 }
             }
+            .padding(24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct ChatScrollView<Content: View>: NSViewRepresentable {
+    let itemCount: Int
+    let content: Content
+
+    init(itemCount: Int, @ViewBuilder content: () -> Content) {
+        self.itemCount = itemCount
+        self.content = content()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(itemCount: itemCount)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView(frame: .zero)
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.verticalScrollElasticity = .automatic
+        scrollView.horizontalScrollElasticity = .none
+
+        let hostingView = NSHostingView(rootView: content)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = hostingView
+
+        let clipView = scrollView.contentView
+        NSLayoutConstraint.activate([
+            hostingView.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
+            hostingView.topAnchor.constraint(equalTo: clipView.topAnchor),
+            hostingView.widthAnchor.constraint(equalTo: clipView.widthAnchor),
+            hostingView.heightAnchor.constraint(greaterThanOrEqualTo: clipView.heightAnchor),
+        ])
+        context.coordinator.hostingView = hostingView
+
+        DispatchQueue.main.async { [weak scrollView] in
+            if let scrollView {
+                context.coordinator.scrollToBottom(in: scrollView)
+            }
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.hostingView?.rootView = content
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+
+        guard context.coordinator.itemCount != itemCount else { return }
+        context.coordinator.itemCount = itemCount
+        DispatchQueue.main.async { [weak scrollView] in
+            if let scrollView {
+                context.coordinator.scrollToBottom(in: scrollView)
+            }
+        }
+    }
+
+    final class Coordinator {
+        var itemCount: Int
+        weak var hostingView: NSHostingView<Content>?
+
+        init(itemCount: Int) {
+            self.itemCount = itemCount
+        }
+
+        func scrollToBottom(in scrollView: NSScrollView) {
+            scrollView.layoutSubtreeIfNeeded()
+            guard let documentView = scrollView.documentView else { return }
+            let maximumY = max(
+                0,
+                documentView.frame.height - scrollView.contentView.bounds.height
+            )
+            scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: maximumY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
     }
 }
@@ -406,6 +476,8 @@ private struct MessageView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .font(DiscoTheme.Typography.body)
+                    .lineSpacing(DiscoTheme.Typography.messageLineSpacing)
+                    .tracking(DiscoTheme.Typography.messageTracking)
                     .background(DiscoTheme.Palette.userMessageSurface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .frame(maxWidth: 620, alignment: .trailing)
             }
@@ -468,6 +540,8 @@ private struct MessageItemView: View {
             DisclosureGroup("分析过程 · \(stateLabel(state))") {
                 Text(text)
                     .font(DiscoTheme.Typography.body)
+                    .lineSpacing(DiscoTheme.Typography.messageLineSpacing)
+                    .tracking(DiscoTheme.Typography.messageTracking)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .padding(.top, 4)
@@ -603,17 +677,23 @@ private struct MarkdownText: View {
     let text: String
 
     var body: some View {
-        if let attributedText = try? AttributedString(markdown: text) {
-            Text(attributedText)
-                .font(DiscoTheme.Typography.body)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Text(text)
-                .font(DiscoTheme.Typography.body)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
+        StructuredText(markdown: text)
+            .textual.structuredTextStyle(.gitHub)
+            .textual.paragraphStyle(DiscoMarkdownParagraphStyle())
+            .textual.overflowMode(.wrap)
+            .textual.textSelection(.enabled)
+            .font(DiscoTheme.Typography.body)
+            .foregroundStyle(.primary)
+            .tracking(DiscoTheme.Typography.messageTracking)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct DiscoMarkdownParagraphStyle: StructuredText.ParagraphStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .textual.lineSpacing(.fontScaled(0.45))
+            .textual.blockSpacing(.fontScaled(top: 0, bottom: 1.1))
     }
 }
 

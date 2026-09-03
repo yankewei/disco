@@ -273,8 +273,26 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换 Provider"
             return
         }
-        if selectedSession != nil, selectedSession?.agent != agent {
-            startNewSessionSelection()
+        if let session = selectedSession, session.agent != agent {
+            if session.agentThreadID == nil && messages.isEmpty {
+                guard let host else { return }
+                do {
+                    try host.updateSessionAgent(sessionID: session.id, agent: agent)
+                    if var sessions = sessionsByProject[session.projectID],
+                       let index = sessions.firstIndex(where: { $0.id == session.id })
+                    {
+                        sessions[index].agent = agent
+                        sessions[index].modelID = nil
+                        sessions[index].reasoningEffort = nil
+                        sessionsByProject[session.projectID] = sessions
+                    }
+                } catch {
+                    workspaceError = error.localizedDescription
+                    return
+                }
+            } else {
+                startNewSessionSelection()
+            }
         }
         selectedAgent = agent
         selectedModelID = nil

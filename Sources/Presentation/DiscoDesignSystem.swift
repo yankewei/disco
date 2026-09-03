@@ -41,6 +41,8 @@ enum DiscoTheme {
         static let sectionTitle = Font.system(size: 15, weight: .semibold)
         static let body = Font.system(size: 14)
         static let bodyEmphasized = Font.system(size: 14, weight: .medium)
+        static let messageLineSpacing: CGFloat = 6
+        static let messageTracking: CGFloat = 0.08
         static let sidebar = Font.system(size: 13)
         static let sidebarHeading = Font.system(size: 13, weight: .semibold)
         static let control = Font.system(size: 12, weight: .medium)
