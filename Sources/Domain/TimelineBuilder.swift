@@ -10,10 +10,8 @@ struct TimelineBuilder {
     mutating func apply(_ event: BackendEvent) {
         switch event {
         case let .text(text, itemID):
-            assistantText += text
             appendText(type: .text, text: text, itemID: itemID)
         case let .reasoning(text, itemID):
-            reasoning += text
             appendText(type: .reasoning, text: text, itemID: itemID)
         case let .item(item):
             upsertItem(item)
@@ -51,6 +49,7 @@ struct TimelineBuilder {
         itemID: String?
     ) {
         guard !text.isEmpty else { return }
+        defer { synchronizeTextAggregates() }
         if let itemID,
            let index = timeline.firstIndex(where: { $0.id == itemID && $0.textItemKind == type })
         {
@@ -89,6 +88,12 @@ struct TimelineBuilder {
         if case .codexEvent = item {
             return
         }
+        switch item {
+        case let .text(_, text, _), let .reasoning(_, text, _):
+            guard !text.isEmpty else { return }
+        default:
+            break
+        }
         if let index = items.firstIndex(where: { $0.id == item.id }) {
             items[index] = item
         } else {
@@ -99,6 +104,18 @@ struct TimelineBuilder {
         } else {
             timeline.append(item)
         }
+        synchronizeTextAggregates()
+    }
+
+    private mutating func synchronizeTextAggregates() {
+        assistantText = timeline.compactMap { item in
+            guard case let .text(_, text, _) = item else { return nil }
+            return text
+        }.joined()
+        reasoning = timeline.compactMap { item in
+            guard case let .reasoning(_, text, _) = item else { return nil }
+            return text
+        }.joined()
     }
 
     private mutating func upsertToolCall(

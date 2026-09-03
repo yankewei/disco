@@ -84,6 +84,74 @@ final class NativeCoreTests: XCTestCase {
         ))
     }
 
+    func testTimelineBuilderReplacesSnapshotsAndIgnoresEmptyTextItems() {
+        var builder = TimelineBuilder()
+        builder.apply(.item(.reasoning(id: "reasoning-1", text: "", state: .updated)))
+        XCTAssertTrue(builder.timeline.isEmpty)
+
+        builder.apply(.item(.reasoning(id: "reasoning-1", text: "初始分析", state: .updated)))
+        builder.apply(.item(.reasoning(id: "reasoning-1", text: "完整分析", state: .completed)))
+        builder.apply(.item(.text(id: "text-1", text: "最终答案", state: .completed)))
+
+        XCTAssertEqual(builder.reasoning, "完整分析")
+        XCTAssertEqual(builder.assistantText, "最终答案")
+        XCTAssertEqual(builder.timeline, [
+            .reasoning(id: "reasoning-1", text: "完整分析", state: .completed),
+            .text(id: "text-1", text: "最终答案", state: .completed),
+        ])
+    }
+
+    func testOpenCodeStreamStateUsesPartKindAndOneAuthoritativeSource() {
+        let state = OpenCodeEventStreamState()
+        state.registerPartKind(.reasoning, partID: "reasoning-1")
+
+        XCTAssertEqual(state.partKind(for: "reasoning-1"), .reasoning)
+        XCTAssertTrue(state.acceptsStreamDelta(
+            messageID: "message-1",
+            partID: "reasoning-1",
+            kind: .reasoning,
+            source: .messagePartDelta
+        ))
+        XCTAssertFalse(state.acceptsPartSnapshot(
+            partID: "reasoning-1",
+            kind: .reasoning,
+            hasContent: true
+        ))
+        XCTAssertFalse(state.acceptsStreamDelta(
+            messageID: "message-1",
+            partID: "reasoning-1",
+            kind: .reasoning,
+            source: .sessionNextDelta
+        ))
+    }
+
+    func testOpenCodeStreamStateAllowsReplacingSnapshotsButBlocksLaterDeltas() {
+        let state = OpenCodeEventStreamState()
+        state.registerPartKind(.text, partID: "text-1")
+
+        XCTAssertFalse(state.acceptsPartSnapshot(
+            partID: "text-1",
+            kind: .text,
+            hasContent: false
+        ))
+        XCTAssertTrue(state.acceptsPartSnapshot(
+            partID: "text-1",
+            kind: .text,
+            hasContent: true
+        ))
+        XCTAssertTrue(state.acceptsPartSnapshot(
+            partID: "text-1",
+            kind: .text,
+            hasContent: true
+        ))
+        XCTAssertFalse(state.acceptsStreamDelta(
+            messageID: "message-1",
+            partID: "text-1",
+            kind: .text,
+            source: .messagePartDelta
+        ))
+    }
+
     func testTimelineBuilderIgnoresProtocolEvents() {
         var builder = TimelineBuilder()
         builder.apply(.item(

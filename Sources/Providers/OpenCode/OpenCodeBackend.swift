@@ -389,14 +389,17 @@ final class OpenCodeBackend: AgentBackend {
             )
         case "session.next.text.delta":
             let partID = jsonString(properties["textID"])
+            if let partID {
+                eventStreamState.registerPartKind(.text, partID: partID)
+            }
             if eventStreamState.acceptsStreamDelta(
                 messageID: jsonString(properties["assistantMessageID"]),
                 partID: partID,
-                field: .text,
-                source: .sessionNext
+                kind: .text,
+                source: .sessionNextDelta
             ) {
                 if let partID {
-                    eventStreamState.streamedPartIDs.insert(partID)
+                    eventStreamState.markPartAsStreamed(partID)
                 }
                 if let delta = jsonString(properties["delta"]) {
                     context.emit(.text(text: delta, itemID: partID))
@@ -404,21 +407,24 @@ final class OpenCodeBackend: AgentBackend {
             }
         case "session.next.text.ended":
             let partID = jsonString(properties["textID"])
-            if let partID, !eventStreamState.streamedPartIDs.contains(partID),
+            if let partID, !eventStreamState.isPartStreamed(partID),
                let text = jsonString(properties["text"])
             {
                 context.emit(.item(.text(id: partID, text: text, state: .completed)))
             }
         case "session.next.reasoning.delta":
             let partID = jsonString(properties["reasoningID"])
+            if let partID {
+                eventStreamState.registerPartKind(.reasoning, partID: partID)
+            }
             if eventStreamState.acceptsStreamDelta(
                 messageID: jsonString(properties["assistantMessageID"]),
                 partID: partID,
-                field: .reasoning,
-                source: .sessionNext
+                kind: .reasoning,
+                source: .sessionNextDelta
             ) {
                 if let partID {
-                    eventStreamState.streamedPartIDs.insert(partID)
+                    eventStreamState.markPartAsStreamed(partID)
                 }
                 if let delta = jsonString(properties["delta"]) {
                     context.emit(.reasoning(text: delta, itemID: partID))
@@ -426,7 +432,7 @@ final class OpenCodeBackend: AgentBackend {
             }
         case "session.next.reasoning.ended":
             let partID = jsonString(properties["reasoningID"])
-            if let partID, !eventStreamState.streamedPartIDs.contains(partID),
+            if let partID, !eventStreamState.isPartStreamed(partID),
                let text = jsonString(properties["text"])
             {
                 context.emit(.item(.reasoning(id: partID, text: text, state: .completed)))
@@ -499,33 +505,92 @@ final class OpenCodeBackend: AgentBackend {
         context: BackendRunContext,
         eventStreamState: OpenCodeEventStreamState
     ) {
-        guard let delta = jsonString(properties["delta"]) else { return }
+        guard
+            let delta = jsonString(properties["delta"]),
+            let partID = jsonString(properties["partID"])
+        else { return }
         let field = jsonString(properties["field"])
-        let partID = jsonString(properties["partID"])
         let messageID = jsonString(properties["messageID"])
         guard !eventStreamState.userMessageIDs.contains(messageID ?? "") else { return }
-        if field == "text" {
-            guard eventStreamState.acceptsStreamDelta(
-                messageID: messageID,
+        guard field == "text" || field == "reasoning" else { return }
+
+        if let kind = eventStreamState.partKind(for: partID) {
+            emitPartDelta(
+                delta,
                 partID: partID,
-                field: .text,
-                source: .messagePart
-            ) else { return }
-            if let partID {
-                eventStreamState.streamedPartIDs.insert(partID)
-            }
-            context.emit(.text(text: delta, itemID: partID))
+                kind: kind,
+                context: context,
+                eventStreamState: eventStreamState
+            )
         } else if field == "reasoning" {
-            guard eventStreamState.acceptsStreamDelta(
-                messageID: messageID,
+            eventStreamState.registerPartKind(.reasoning, partID: partID)
+            emitPartDelta(
+                delta,
                 partID: partID,
-                field: .reasoning,
-                source: .messagePart
-            ) else { return }
-            if let partID {
-                eventStreamState.streamedPartIDs.insert(partID)
-            }
+                kind: .reasoning,
+                context: context,
+                eventStreamState: eventStreamState
+            )
+        } else {
+            eventStreamState.bufferPartDelta(delta, partID: partID)
+        }
+    }
+
+    private func emitPartDelta(
+        _ delta: String,
+        partID: String,
+        kind: OpenCodePartKind,
+        context: BackendRunContext,
+        eventStreamState: OpenCodeEventStreamState
+    ) {
+        guard eventStreamState.acceptsStreamDelta(
+            messageID: nil,
+            partID: partID,
+            kind: kind,
+            source: .messagePartDelta
+        ) else { return }
+        eventStreamState.markPartAsStreamed(partID)
+        switch kind {
+        case .text:
+            context.emit(.text(text: delta, itemID: partID))
+        case .reasoning:
             context.emit(.reasoning(text: delta, itemID: partID))
+        }
+    }
+
+    private func emitPartSnapshot(
+        _ text: String,
+        partID: String,
+        kind: OpenCodePartKind,
+        state: MessageItemState,
+        context: BackendRunContext,
+        eventStreamState: OpenCodeEventStreamState
+    ) {
+        let bufferedDeltas = eventStreamState.takeBufferedPartDeltas(partID)
+        if !bufferedDeltas.isEmpty {
+            for bufferedDelta in bufferedDeltas {
+                emitPartDelta(
+                    bufferedDelta,
+                    partID: partID,
+                    kind: kind,
+                    context: context,
+                    eventStreamState: eventStreamState
+                )
+            }
+            return
+        }
+
+        guard eventStreamState.acceptsPartSnapshot(
+            partID: partID,
+            kind: kind,
+            hasContent: !text.isEmpty
+        ) else { return }
+        guard !text.isEmpty else { return }
+        switch kind {
+        case .text:
+            context.emit(.item(.text(id: partID, text: text, state: state)))
+        case .reasoning:
+            context.emit(.item(.reasoning(id: partID, text: text, state: state)))
         }
     }
 
@@ -543,11 +608,25 @@ final class OpenCodeBackend: AgentBackend {
         let state = messageItemState(part)
         switch type {
         case "text":
-            guard !eventStreamState.streamedPartIDs.contains(partID) else { return }
-            context.emit(.item(.text(id: partID, text: jsonString(part["text"]) ?? "", state: state)))
+            eventStreamState.registerPartKind(.text, partID: partID)
+            emitPartSnapshot(
+                jsonString(part["text"]) ?? "",
+                partID: partID,
+                kind: .text,
+                state: state,
+                context: context,
+                eventStreamState: eventStreamState
+            )
         case "reasoning":
-            guard !eventStreamState.streamedPartIDs.contains(partID) else { return }
-            context.emit(.item(.reasoning(id: partID, text: jsonString(part["text"]) ?? "", state: state)))
+            eventStreamState.registerPartKind(.reasoning, partID: partID)
+            emitPartSnapshot(
+                jsonString(part["text"]) ?? "",
+                partID: partID,
+                kind: .reasoning,
+                state: state,
+                context: context,
+                eventStreamState: eventStreamState
+            )
         case "tool":
             let toolState = jsonObject(part["state"])
             let status = jsonString(toolState?["status"])
@@ -744,36 +823,65 @@ final class OpenCodeBackend: AgentBackend {
     }
 }
 
-private enum OpenCodeStreamSource: Equatable {
-    case messagePart
-    case sessionNext
-}
-
-private enum OpenCodeStreamField: Hashable {
+enum OpenCodePartKind: Hashable {
     case text
     case reasoning
 }
 
-private struct OpenCodeStreamKey: Hashable {
-    let streamID: String
-    let field: OpenCodeStreamField
+enum OpenCodeStreamSource: Equatable {
+    case messagePartDelta
+    case sessionNextDelta
+    case partSnapshot
 }
 
-private final class OpenCodeEventStreamState {
+private struct OpenCodeStreamKey: Hashable {
+    let streamID: String
+    let kind: OpenCodePartKind
+}
+
+final class OpenCodeEventStreamState {
     var userMessageIDs: Set<String> = []
-    var streamedPartIDs: Set<String> = []
     private let stateLock = NSLock()
     private var promptSubmitted = false
+    private var partKindByID: [String: OpenCodePartKind] = [:]
+    private var bufferedDeltasByPartID: [String: [String]] = [:]
+    private var streamedPartIDs: Set<String> = []
     private var streamSourceByKey: [OpenCodeStreamKey: OpenCodeStreamSource] = [:]
+
+    func registerPartKind(_ kind: OpenCodePartKind, partID: String) {
+        stateLock.lock()
+        if partKindByID[partID] == nil {
+            partKindByID[partID] = kind
+        }
+        stateLock.unlock()
+    }
+
+    func partKind(for partID: String) -> OpenCodePartKind? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return partKindByID[partID]
+    }
+
+    func bufferPartDelta(_ delta: String, partID: String) {
+        stateLock.lock()
+        bufferedDeltasByPartID[partID, default: []].append(delta)
+        stateLock.unlock()
+    }
+
+    func takeBufferedPartDeltas(_ partID: String) -> [String] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return bufferedDeltasByPartID.removeValue(forKey: partID) ?? []
+    }
 
     func acceptsStreamDelta(
         messageID: String?,
         partID: String?,
-        field: OpenCodeStreamField,
+        kind: OpenCodePartKind,
         source: OpenCodeStreamSource
     ) -> Bool {
-        guard let streamID = messageID ?? partID else { return true }
-        let key = OpenCodeStreamKey(streamID: streamID, field: field)
+        guard let streamID = partID ?? messageID else { return true }
+        let key = OpenCodeStreamKey(streamID: streamID, kind: kind)
         stateLock.lock()
         defer { stateLock.unlock() }
         if let existingSource = streamSourceByKey[key] {
@@ -781,6 +889,34 @@ private final class OpenCodeEventStreamState {
         }
         streamSourceByKey[key] = source
         return true
+    }
+
+    func acceptsPartSnapshot(
+        partID: String,
+        kind: OpenCodePartKind,
+        hasContent: Bool
+    ) -> Bool {
+        let key = OpenCodeStreamKey(streamID: partID, kind: kind)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let existingSource = streamSourceByKey[key] {
+            return existingSource == .partSnapshot
+        }
+        guard hasContent else { return false }
+        streamSourceByKey[key] = .partSnapshot
+        return true
+    }
+
+    func markPartAsStreamed(_ partID: String) {
+        stateLock.lock()
+        streamedPartIDs.insert(partID)
+        stateLock.unlock()
+    }
+
+    func isPartStreamed(_ partID: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return streamedPartIDs.contains(partID)
     }
 
     var promptWasSubmitted: Bool {
