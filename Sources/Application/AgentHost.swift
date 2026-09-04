@@ -66,14 +66,30 @@ final class AgentHost {
         try store.touchSession(sessionID: sessionID)
     }
 
-    func updateSessionModel(sessionID: String, modelID: String?) throws {
+    func lastAgentSelection() throws -> LastAgentSelection? {
+        try store.lastAgentSelection()
+    }
+
+    func saveLastAgentSelection(_ selection: LastAgentSelection) throws {
+        try store.saveLastAgentSelection(selection)
+    }
+
+    func updateSessionModel(
+        sessionID: String,
+        modelID: String?,
+        reasoningEffort: ReasoningEffort?
+    ) throws {
         guard let session = try store.session(id: sessionID) else {
             throw AgentHostError.sessionNotFound
         }
         guard session.agentThreadID == nil else {
             throw AgentHostError.sessionHasAgentConversation
         }
-        try store.updateSessionModel(sessionID: sessionID, modelID: modelID)
+        try store.updateSessionModel(
+            sessionID: sessionID,
+            modelID: modelID,
+            reasoningEffort: reasoningEffort
+        )
     }
 
     func updateSessionAgent(sessionID: String, agent: BackendKind) throws {

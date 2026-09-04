@@ -101,6 +101,26 @@ final class NativeCoreTests: XCTestCase {
         ])
     }
 
+    func testOpenCodeMessageParsingReplacesDuplicatePartIDs() throws {
+        let response = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        [{
+          "info": {"id": "message-1", "role": "assistant"},
+          "parts": [
+            {"id": "prt-1", "type": "text", "text": "旧内容"},
+            {"id": "prt-1", "type": "text", "text": "新内容"}
+          ]
+        }]
+        """#.utf8))
+
+        let messages = parseOpenCodeMessages(response)
+
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages[0].text, "新内容")
+        XCTAssertEqual(messages[0].timeline, [
+            .text(id: "prt-1", text: "新内容", state: .started),
+        ])
+    }
+
     func testOpenCodeStreamStateUsesPartKindAndOneAuthoritativeSource() {
         let state = OpenCodeEventStreamState()
         state.registerPartKind(.reasoning, partID: "reasoning-1")
@@ -253,6 +273,7 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(session.agent, .codex)
         XCTAssertEqual(session.agentThreadID, "thread-1")
         XCTAssertNil(session.modelID)
+        XCTAssertNil(try store.lastAgentSelection())
         store.close()
 
         var migratedDatabase: OpaquePointer?
@@ -301,10 +322,36 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(storedSession.agentThreadID, session.agentThreadID)
         XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
 
-        try store.updateSessionModel(sessionID: session.id, modelID: "gpt-5")
+        try store.updateSessionModel(
+            sessionID: session.id,
+            modelID: "gpt-5",
+            reasoningEffort: .medium
+        )
         XCTAssertEqual(try store.session(id: session.id)?.modelID, "gpt-5")
-        try store.updateSessionModel(sessionID: session.id, modelID: nil)
+        XCTAssertEqual(try store.session(id: session.id)?.reasoningEffort, .medium)
+        try store.updateSessionModel(
+            sessionID: session.id,
+            modelID: nil,
+            reasoningEffort: nil
+        )
         XCTAssertNil(try store.session(id: session.id)?.modelID)
+        XCTAssertNil(try store.session(id: session.id)?.reasoningEffort)
+
+        let firstAgentSelection = LastAgentSelection(
+            agent: .codex,
+            modelID: "o3",
+            reasoningEffort: .high
+        )
+        try store.saveLastAgentSelection(firstAgentSelection)
+        XCTAssertEqual(try store.lastAgentSelection(), firstAgentSelection)
+
+        let latestAgentSelection = LastAgentSelection(
+            agent: .opencode,
+            modelID: "anthropic/claude",
+            reasoningEffort: nil
+        )
+        try store.saveLastAgentSelection(latestAgentSelection)
+        XCTAssertEqual(try store.lastAgentSelection(), latestAgentSelection)
 
         let emptySession = SessionInfo(
             sessionID: "empty-session-1",
@@ -326,6 +373,10 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertNil(updatedSession.reasoningEffort)
 
         store.close()
+
+        let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
+        XCTAssertEqual(try reopenedStore.lastAgentSelection(), latestAgentSelection)
+        reopenedStore.close()
     }
 
     func testSQLiteStorePersistsConversationTimeline() throws {

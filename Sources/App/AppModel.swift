@@ -25,6 +25,11 @@ final class AppModel: ObservableObject {
     private let store: SQLiteStore?
     private let host: AgentHost?
     private var activeTimelineBuilders: [String: TimelineBuilder] = [:]
+    private var lastAgentSelection = LastAgentSelection(
+        agent: .codex,
+        modelID: nil,
+        reasoningEffort: nil
+    )
     private var isShuttingDown = false
 
     var selectedProject: ProjectInfo? {
@@ -86,6 +91,9 @@ final class AppModel: ObservableObject {
             await host.refreshBackends()
             providers = await host.providers()
             guard !isShuttingDown else { return }
+            if let savedAgentSelection = try host.lastAgentSelection() {
+                lastAgentSelection = savedAgentSelection
+            }
 
             if selectedProjectID == nil || !projectList.contains(where: { $0.id == selectedProjectID }) {
                 selectedProjectID = projectList.first?.id
@@ -98,11 +106,13 @@ final class AppModel: ObservableObject {
                     } else {
                         selectedSessionID = nil
                         messages = []
+                        applyLastAgentSelection()
                     }
                 }
             } else {
                 selectedSessionID = nil
                 messages = []
+                applyLastAgentSelection()
             }
             if selectedSession == nil, !availableProviders.contains(where: { $0.kind == selectedAgent }) {
                 selectedAgent = availableProviders.first?.kind ?? .codex
@@ -124,6 +134,8 @@ final class AppModel: ObservableObject {
         let sessions = sessionsByProject[project.id] ?? []
         if let session = sessions.first {
             selectSession(session)
+        } else {
+            applyLastAgentSelection()
         }
     }
 
@@ -195,17 +207,17 @@ final class AppModel: ObservableObject {
 
     func createSession(in project: ProjectInfo) {
         guard let host else { return }
-        let provider = providers.first { $0.kind == selectedAgent }
+        let provider = providers.first { $0.kind == lastAgentSelection.agent }
         guard provider?.available == true else {
-            workspaceError = "Provider 不可用：\(selectedAgent.displayName)"
+            workspaceError = "Provider 不可用：\(lastAgentSelection.agent.displayName)"
             return
         }
         do {
             let session = try host.createSession(
                 projectID: project.id,
-                agent: selectedAgent,
-                modelID: selectedModelID,
-                reasoningEffort: selectedReasoningEffort,
+                agent: lastAgentSelection.agent,
+                modelID: lastAgentSelection.modelID,
+                reasoningEffort: lastAgentSelection.reasoningEffort,
                 sandboxMode: selectedSandboxMode
             )
             sessionsByProject[project.id, default: []].insert(session, at: 0)
@@ -262,6 +274,8 @@ final class AppModel: ObservableObject {
             planMode = false
             if let nextSession = sessionsByProject[session.projectID]?.first {
                 selectSession(nextSession)
+            } else {
+                applyLastAgentSelection()
             }
         } catch {
             workspaceError = error.localizedDescription
@@ -297,6 +311,8 @@ final class AppModel: ObservableObject {
         selectedAgent = agent
         selectedModelID = nil
         selectedReasoningEffort = nil
+        lastAgentSelection = LastAgentSelection(agent: agent, modelID: nil, reasoningEffort: nil)
+        saveLastAgentSelection()
     }
 
     func updateModel(_ modelID: String?) {
@@ -304,15 +320,21 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换模型"
             return
         }
+        let nextReasoningEffort = modelID == selectedModelID ? selectedReasoningEffort : nil
         if let session = selectedSession, session.modelID != modelID {
             if session.agentThreadID == nil {
                 guard let host else { return }
                 do {
-                    try host.updateSessionModel(sessionID: session.id, modelID: modelID)
+                    try host.updateSessionModel(
+                        sessionID: session.id,
+                        modelID: modelID,
+                        reasoningEffort: nextReasoningEffort
+                    )
                     if var sessions = sessionsByProject[session.projectID],
                        let index = sessions.firstIndex(where: { $0.id == session.id })
                     {
                         sessions[index].modelID = modelID
+                        sessions[index].reasoningEffort = nextReasoningEffort
                         sessionsByProject[session.projectID] = sessions
                     }
                 } catch {
@@ -324,6 +346,10 @@ final class AppModel: ObservableObject {
             }
         }
         selectedModelID = modelID
+        selectedReasoningEffort = nextReasoningEffort
+        lastAgentSelection.modelID = modelID
+        lastAgentSelection.reasoningEffort = nextReasoningEffort
+        saveLastAgentSelection()
     }
 
     func updateReasoningEffort(_ reasoningEffort: ReasoningEffort?) {
@@ -335,6 +361,8 @@ final class AppModel: ObservableObject {
             startNewSessionSelection()
         }
         selectedReasoningEffort = reasoningEffort
+        lastAgentSelection.reasoningEffort = reasoningEffort
+        saveLastAgentSelection()
     }
 
     func updateSandboxMode(_ sandboxMode: SandboxMode) {
@@ -386,6 +414,21 @@ final class AppModel: ObservableObject {
         }
         await host?.shutdown()
         store?.close()
+    }
+
+    private func applyLastAgentSelection() {
+        selectedAgent = lastAgentSelection.agent
+        selectedModelID = lastAgentSelection.modelID
+        selectedReasoningEffort = lastAgentSelection.reasoningEffort
+    }
+
+    private func saveLastAgentSelection() {
+        guard let host else { return }
+        do {
+            try host.saveLastAgentSelection(lastAgentSelection)
+        } catch {
+            workspaceError = error.localizedDescription
+        }
     }
 
     private func startNewSessionSelection() {

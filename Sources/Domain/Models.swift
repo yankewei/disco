@@ -115,6 +115,12 @@ struct SessionInfo: Codable, Identifiable, Hashable {
     var activatedAt: String?
 }
 
+struct LastAgentSelection: Codable, Hashable {
+    var agent: BackendKind
+    var modelID: String?
+    var reasoningEffort: ReasoningEffort?
+}
+
 struct ModelInfo: Codable, Identifiable, Hashable {
     let id: String
     var name: String

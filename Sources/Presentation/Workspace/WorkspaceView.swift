@@ -500,10 +500,10 @@ private struct MessageView: View {
                 }
                 if !visibleTimeline.isEmpty {
                     ForEach(visibleTimeline) { item in
-                        MessageItemView(item: item)
+                        MessageItemView(item: item, isStreaming: isStreaming)
                     }
                 } else if !message.text.isEmpty {
-                    MarkdownText(text: message.text)
+                    MarkdownText(text: message.text, isTextSelectionEnabled: !isStreaming)
                 }
                 if isStreaming {
                     ProgressView()
@@ -531,11 +531,12 @@ private struct MessageView: View {
 
 private struct MessageItemView: View {
     let item: MessageItem
+    let isStreaming: Bool
 
     var body: some View {
         switch item {
         case let .text(_, text, _):
-            MarkdownText(text: text)
+            MarkdownText(text: text, isTextSelectionEnabled: !isStreaming)
         case let .reasoning(_, text, state):
             DisclosureGroup("分析过程 · \(stateLabel(state))") {
                 Text(text)
@@ -675,13 +676,23 @@ private struct ToolCard: View {
 
 private struct MarkdownText: View {
     let text: String
+    let isTextSelectionEnabled: Bool
 
     var body: some View {
+        Group {
+            if isTextSelectionEnabled {
+                markdown.textual.textSelection(.enabled)
+            } else {
+                markdown
+            }
+        }
+    }
+
+    private var markdown: some View {
         StructuredText(markdown: text)
             .textual.structuredTextStyle(.gitHub)
             .textual.paragraphStyle(DiscoMarkdownParagraphStyle())
             .textual.overflowMode(.wrap)
-            .textual.textSelection(.enabled)
             .font(DiscoTheme.Typography.body)
             .foregroundStyle(.primary)
             .tracking(DiscoTheme.Typography.messageTracking)

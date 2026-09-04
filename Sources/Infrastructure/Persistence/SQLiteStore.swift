@@ -171,6 +171,47 @@ final class SQLiteStore {
         return session(from: statement)
     }
 
+    func lastAgentSelection() throws -> LastAgentSelection? {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare(
+            "SELECT agent, model_id, reasoning_effort FROM last_agent_selection WHERE id = 1"
+        )
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            try throwIfStepFailed(statement)
+            return nil
+        }
+        guard let agent = BackendKind(rawValue: text(statement, column: 0)) else {
+            return nil
+        }
+        return LastAgentSelection(
+            agent: agent,
+            modelID: nullableText(statement, column: 1),
+            reasoningEffort: nullableText(statement, column: 2).flatMap(ReasoningEffort.init(rawValue:))
+        )
+    }
+
+    func saveLastAgentSelection(_ selection: LastAgentSelection) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare(
+            """
+            INSERT INTO last_agent_selection (id, agent, model_id, reasoning_effort)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                agent = excluded.agent,
+                model_id = excluded.model_id,
+                reasoning_effort = excluded.reasoning_effort
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(selection.agent.rawValue, at: 1, in: statement)
+        try bind(selection.modelID, at: 2, in: statement)
+        try bind(selection.reasoningEffort?.rawValue, at: 3, in: statement)
+        try step(statement)
+    }
+
     func createSession(_ session: SessionInfo) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }
@@ -214,15 +255,20 @@ final class SQLiteStore {
         try step(statement)
     }
 
-    func updateSessionModel(sessionID: String, modelID: String?) throws {
+    func updateSessionModel(
+        sessionID: String,
+        modelID: String?,
+        reasoningEffort: ReasoningEffort?
+    ) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }
         let statement = try prepare(
-            "UPDATE sessions SET model_id = ? WHERE session_id = ?"
+            "UPDATE sessions SET model_id = ?, reasoning_effort = ? WHERE session_id = ?"
         )
         defer { sqlite3_finalize(statement) }
         try bind(modelID, at: 1, in: statement)
-        try bind(sessionID, at: 2, in: statement)
+        try bind(reasoningEffort?.rawValue, at: 2, in: statement)
+        try bind(sessionID, at: 3, in: statement)
         try step(statement)
     }
 
@@ -383,6 +429,12 @@ final class SQLiteStore {
             );
             CREATE INDEX IF NOT EXISTS sessions_project_activated_idx
                 ON sessions (project_id, activated_at DESC, created_at DESC);
+            CREATE TABLE IF NOT EXISTS last_agent_selection (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                agent TEXT NOT NULL,
+                model_id TEXT,
+                reasoning_effort TEXT
+            );
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 message_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -396,7 +448,7 @@ final class SQLiteStore {
             CREATE INDEX IF NOT EXISTS conversation_messages_session_position_idx
                 ON conversation_messages (session_id, position ASC);
             DROP TABLE IF EXISTS dismissed_sessions;
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
             """
         )
         try execute("DROP TABLE IF EXISTS messages")

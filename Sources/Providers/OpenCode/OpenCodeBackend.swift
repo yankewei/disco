@@ -201,7 +201,7 @@ final class OpenCodeBackend: AgentBackend {
             arguments: ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
             workingDirectory: workingDirectory,
             environment: await providerEnvironment(for: executableURL),
-            captureStandardOutput: false,
+            captureStandardOutput: true,
             captureStandardError: false
         )
         try process.launch()
@@ -214,7 +214,7 @@ final class OpenCodeBackend: AgentBackend {
             throw OpenCodeBackendError.shuttingDown
         }
         do {
-            try await waitForHealth(server: server, cancellation: cancellation)
+            try await waitForServerReady(server: server, cancellation: cancellation)
             return server
         } catch {
             stop(server)
@@ -222,37 +222,45 @@ final class OpenCodeBackend: AgentBackend {
         }
     }
 
-    private func waitForHealth(
+    private func waitForServerReady(
         server: RunningOpenCodeServer,
         cancellation: CancellationToken
     ) async throws {
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
-            if cancellation.isCancelled {
-                throw OpenCodeBackendError.cancelled
-            }
-            if !server.process.process.isRunning {
+        guard let output = server.process.standardOutput else {
+            throw OpenCodeBackendError.requestFailed("无法读取 OpenCode 服务输出")
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for try await line in lineStream(from: output) {
+                    if line.contains("opencode server listening on ") {
+                        return
+                    }
+                }
                 throw OpenCodeBackendError.requestFailed("OpenCode 服务已退出")
             }
-            do {
-                let (_, response) = try await request(
-                    baseURL: server.baseURL,
-                    path: "/global/health",
-                    method: "GET",
-                    body: nil,
-                    cancellation: cancellation
-                )
-                if (response as? HTTPURLResponse)?.statusCode == 200 {
-                    return
+            group.addTask {
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    if cancellation.isCancelled {
+                        throw OpenCodeBackendError.cancelled
+                    }
+                    if !server.process.process.isRunning {
+                        throw OpenCodeBackendError.requestFailed("OpenCode 服务已退出")
+                    }
+                    try await Task.sleep(nanoseconds: 100_000_000)
                 }
-            } catch {
-                if cancellation.isCancelled {
-                    throw OpenCodeBackendError.cancelled
-                }
+                throw OpenCodeBackendError.startupTimeout
             }
-            try await Task.sleep(nanoseconds: 100_000_000)
+            defer { group.cancelAll() }
+            _ = try await group.next()
         }
-        throw OpenCodeBackendError.startupTimeout
+        _ = try await request(
+            baseURL: server.baseURL,
+            path: "/global/health",
+            method: "GET",
+            body: nil,
+            cancellation: cancellation
+        )
     }
 
     private func openEventStream(
@@ -996,7 +1004,7 @@ private func parseSSEEvent(_ data: String) -> [String: JSONValue]? {
     return jsonObject(value)
 }
 
-private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
+func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
     let responseObject = jsonObject(value)
     let messageValues = value?.arrayValue
         ?? jsonArray(responseObject?["data"] ?? responseObject?["messages"])
@@ -1009,8 +1017,7 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
         let messageID = jsonString(info["id"]) ?? UUID().uuidString
         let time = jsonObject(info["time"])
         let createdAt = openCodeTimestamp(time?["created"] ?? info["createdAt"]) ?? .timestamp()
-        var text = jsonString(info["text"]) ?? ""
-        var reasoning = ""
+        let fallbackText = jsonString(info["text"]) ?? ""
         var timeline: [MessageItem] = []
 
         for partValue in jsonArray(message["parts"]) {
@@ -1022,12 +1029,10 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
             switch type {
             case "text":
                 let partText = jsonString(part["text"]) ?? ""
-                text += partText
-                timeline.append(.text(id: partID, text: partText, state: state))
+                upsertTimelineItem(.text(id: partID, text: partText, state: state), in: &timeline)
             case "reasoning":
                 let partText = jsonString(part["text"]) ?? ""
-                reasoning += partText
-                timeline.append(.reasoning(id: partID, text: partText, state: state))
+                upsertTimelineItem(.reasoning(id: partID, text: partText, state: state), in: &timeline)
             case "tool":
                 let toolState = jsonObject(part["state"])
                 let status = jsonString(toolState?["status"])
@@ -1038,7 +1043,7 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
                 }
                 let error = jsonString(toolState?["error"])
                     ?? jsonObject(toolState?["error"]).flatMap { jsonString($0["message"]) }
-                timeline.append(
+                upsertTimelineItem(
                     .toolCall(
                         id: jsonString(part["callID"]) ?? partID,
                         name: jsonString(part["tool"]) ?? "工具调用",
@@ -1046,20 +1051,22 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
                         output: formatJSONValue(toolState?["output"]),
                         error: error,
                         state: toolStatus
-                    )
+                    ),
+                    in: &timeline
                 )
             case "patch":
                 let files = jsonStringArray(part["files"]).map {
                     FileChange(path: $0, kind: .update, diff: nil)
                 }
                 if !files.isEmpty {
-                    timeline.append(
+                    upsertTimelineItem(
                         .fileChange(
                             id: partID,
                             changes: files,
                             patchOutput: jsonString(part["hash"]),
                             state: state
-                        )
+                        ),
+                        in: &timeline
                     )
                 }
             default:
@@ -1067,11 +1074,19 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
             }
         }
 
+        let text = timeline.compactMap { item in
+            guard case let .text(_, partText, _) = item else { return nil }
+            return partText
+        }.joined()
+        let reasoning = timeline.compactMap { item in
+            guard case let .reasoning(_, partText, _) = item else { return nil }
+            return partText
+        }.joined()
         let errorValue = info["error"].flatMap { $0 == .null ? nil : $0 }
         return ConversationMessage(
             id: messageID,
             role: role,
-            text: text,
+            text: text.isEmpty ? fallbackText : text,
             reasoning: reasoning.isEmpty ? nil : reasoning,
             toolCalls: nil,
             items: timeline.isEmpty ? nil : timeline,
@@ -1080,6 +1095,14 @@ private func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage]
             error: errorValue.map(formatError),
             createdAt: createdAt
         )
+    }
+}
+
+private func upsertTimelineItem(_ item: MessageItem, in timeline: inout [MessageItem]) {
+    if let index = timeline.firstIndex(where: { $0.id == item.id }) {
+        timeline[index] = item
+    } else {
+        timeline.append(item)
     }
 }
 
