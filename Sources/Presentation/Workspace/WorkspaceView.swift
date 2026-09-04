@@ -1,9 +1,12 @@
 import AppKit
+import Combine
 import SwiftUI
 import Textual
 
 private let modelPickerWidth: CGFloat = 500
 private let modelPickerHeight: CGFloat = 340
+private let chatColumnContentPadding: CGFloat = 12
+private let chatColumnMaximumWidth: CGFloat = 720
 
 struct WorkspaceView: View {
     @EnvironmentObject private var model: AppModel
@@ -311,20 +314,19 @@ private struct ConversationView: View {
         VStack(spacing: 0) {
             if model.selectedSession != nil {
                 GeometryReader { geometry in
-                    messageList
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            VStack(spacing: 0) {
-                                ApprovalList()
-                                ComposerView(availableHeight: geometry.size.height)
-                            }
-                            .frame(maxWidth: chatColumnMaximumWidth)
-                            .frame(maxWidth: .infinity)
-                            .background(DiscoTheme.Palette.surface)
+                    VStack(spacing: 0) {
+                        messageList(viewportWidth: geometry.size.width)
+                        VStack(spacing: 0) {
+                            ApprovalList()
+                            ComposerView(availableHeight: geometry.size.height)
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(DiscoTheme.Palette.surface)
-                        .background(ScrollWheelRouter())
+                        .frame(maxWidth: chatColumnMaximumWidth)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(ScrollWheelRouter())
                 }
+                .background(DiscoTheme.Palette.surface)
             } else {
                 WelcomeView()
             }
@@ -332,43 +334,8 @@ private struct ConversationView: View {
         .background(DiscoTheme.Palette.canvas)
     }
 
-    private let chatColumnMaximumWidth: CGFloat = 720
-    private let messageListEndID = "message-list-end"
-
-    private var messageList: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    ForEach(model.messages) { message in
-                        MessageView(
-                            message: message,
-                            isStreaming: model.selectedSessionID.map { sessionID in
-                                model.runningSessionIDs.contains(sessionID)
-                                    && message.id == "active-\(sessionID)"
-                            } ?? false
-                        )
-                    }
-                    Color.clear
-                        .frame(height: 0)
-                        .id(messageListEndID)
-                }
-                .frame(maxWidth: chatColumnMaximumWidth)
-                .frame(maxWidth: .infinity)
-                .padding(24)
-            }
-            .scrollIndicators(.hidden)
-            .onAppear {
-                DispatchQueue.main.async {
-                    proxy.scrollTo(messageListEndID, anchor: .bottom)
-                }
-            }
-            .onChange(of: model.messages.count) { _ in
-                DispatchQueue.main.async {
-                    proxy.scrollTo(messageListEndID, anchor: .bottom)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    private func messageList(viewportWidth: CGFloat) -> some View {
+        MessageListScrollView(viewportWidth: viewportWidth)
     }
 }
 
@@ -473,79 +440,82 @@ private struct MessageItemView: View {
     let isStreaming: Bool
 
     var body: some View {
-        switch item {
-        case let .text(_, text, _):
-            MarkdownText(text: text, isTextSelectionEnabled: !isStreaming)
-        case let .reasoning(_, text, state):
-            DisclosureGroup("分析过程 · \(stateLabel(state))") {
-                Text(text)
-                    .font(DiscoTheme.Typography.body)
-                    .lineSpacing(DiscoTheme.Typography.messageLineSpacing)
-                    .tracking(DiscoTheme.Typography.messageTracking)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.top, 4)
-            }
-        case let .toolCall(_, name, input, output, error, state):
-            ToolCard(
-                title: name,
-                state: toolStateLabel(state),
-                input: input?.prettyPrinted(),
-                output: output,
-                error: error
-            )
-        case let .commandExecution(_, command, output, _, exitCode, _, terminalInput, state):
-            ToolCard(
-                title: command.isEmpty ? "命令执行" : command,
-                state: stateLabel(state),
-                input: terminalInput,
-                output: output,
-                error: exitCode.map { $0 == 0 ? nil : "退出码：\($0)" } ?? nil
-            )
-        case let .fileChange(_, changes, patchOutput, state):
-            ToolCard(
-                title: "文件变更（\(changes.count)）",
-                state: stateLabel(state),
-                input: changes.map(\.path).joined(separator: "\n"),
-                output: patchOutput,
-                error: nil
-            )
-        case let .mcpToolCall(_, server, tool, arguments, result, error, progress, state):
-            ToolCard(
-                title: "MCP · \(server) / \(tool)",
-                state: stateLabel(state),
-                input: arguments.prettyPrinted(),
-                output: [progress ?? [], result.map { [$0.prettyPrinted()] } ?? []].flatMap { $0 }.joined(separator: "\n"),
-                error: error
-            )
-        case let .webSearch(_, query, state):
-            ToolCard(title: "网页搜索", state: stateLabel(state), input: query, output: nil, error: nil)
-        case let .todoList(_, items, state):
-            VStack(alignment: .leading, spacing: 6) {
-                Label("计划 · \(stateLabel(state))", systemImage: "checklist")
-                    .font(DiscoTheme.Typography.bodyEmphasized)
-                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    Label(item.text, systemImage: item.completed ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(item.completed ? .secondary : .primary)
+        Group {
+            switch item {
+            case let .text(_, text, _):
+                MarkdownText(text: text, isTextSelectionEnabled: !isStreaming)
+            case let .reasoning(_, text, state):
+                DisclosureGroup("分析过程 · \(stateLabel(state))") {
+                    Text(text)
+                        .font(DiscoTheme.Typography.body)
+                        .lineSpacing(DiscoTheme.Typography.messageLineSpacing)
+                        .tracking(DiscoTheme.Typography.messageTracking)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.top, 4)
                 }
+            case let .toolCall(_, name, input, output, error, state):
+                ToolCard(
+                    title: name,
+                    state: toolStateLabel(state),
+                    input: input?.prettyPrinted(),
+                    output: output,
+                    error: error
+                )
+            case let .commandExecution(_, command, output, _, exitCode, _, terminalInput, state):
+                ToolCard(
+                    title: command.isEmpty ? "命令执行" : command,
+                    state: stateLabel(state),
+                    input: terminalInput,
+                    output: output,
+                    error: exitCode.map { $0 == 0 ? nil : "退出码：\($0)" } ?? nil
+                )
+            case let .fileChange(_, changes, patchOutput, state):
+                ToolCard(
+                    title: "文件变更（\(changes.count)）",
+                    state: stateLabel(state),
+                    input: changes.map(\.path).joined(separator: "\n"),
+                    output: patchOutput,
+                    error: nil
+                )
+            case let .mcpToolCall(_, server, tool, arguments, result, error, progress, state):
+                ToolCard(
+                    title: "MCP · \(server) / \(tool)",
+                    state: stateLabel(state),
+                    input: arguments.prettyPrinted(),
+                    output: [progress ?? [], result.map { [$0.prettyPrinted()] } ?? []].flatMap { $0 }.joined(separator: "\n"),
+                    error: error
+                )
+            case let .webSearch(_, query, state):
+                ToolCard(title: "网页搜索", state: stateLabel(state), input: query, output: nil, error: nil)
+            case let .todoList(_, items, state):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("计划 · \(stateLabel(state))", systemImage: "checklist")
+                        .font(DiscoTheme.Typography.bodyEmphasized)
+                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                        Label(item.text, systemImage: item.completed ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(item.completed ? .secondary : .primary)
+                    }
+                }
+                .padding(12)
+                .background(DiscoTheme.Palette.insetSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+                }
+            case let .notice(_, message, _):
+                Text(message)
+                    .font(DiscoTheme.Typography.body)
+                    .foregroundStyle(.orange)
+                    .padding(10)
+                    .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            case let .error(_, message, state):
+                ToolCard(title: "错误", state: stateLabel(state), input: nil, output: nil, error: message)
+            case .codexEvent:
+                EmptyView()
             }
-            .padding(12)
-            .background(DiscoTheme.Palette.insetSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(DiscoTheme.Palette.border, lineWidth: 1)
-            }
-        case let .notice(_, message, _):
-            Text(message)
-                .font(DiscoTheme.Typography.body)
-                .foregroundStyle(.orange)
-                .padding(10)
-                .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        case let .error(_, message, state):
-            ToolCard(title: "错误", state: stateLabel(state), input: nil, output: nil, error: message)
-        case .codexEvent:
-            EmptyView()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func stateLabel(_ state: MessageItemState) -> String {
@@ -654,7 +624,6 @@ private struct ApprovalList: View {
         if let sessionID = model.selectedSessionID {
             ForEach(model.approvalRequests.filter { $0.sessionID == sessionID }) { request in
                 ApprovalCard(request: request)
-                    .padding(.horizontal, 20)
                     .padding(.top, 12)
             }
         }
@@ -685,7 +654,8 @@ private struct ApprovalCard: View {
                 .buttonStyle(.borderedProminent)
             }
         }
-        .padding(14)
+        .padding(.horizontal, chatColumnContentPadding)
+        .padding(.vertical, 14)
         .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -717,7 +687,7 @@ private struct ComposerView: View {
                         Text("做什么都可以…")
                             .font(DiscoTheme.Typography.body)
                             .foregroundStyle(.secondary)
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, chatColumnContentPadding)
                             .padding(.top, 9)
                             .allowsHitTesting(false)
                     }
@@ -734,16 +704,16 @@ private struct ComposerView: View {
 
                     sendButton
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, chatColumnContentPadding)
                 .padding(.bottom, 8)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(DiscoTheme.Palette.surface, in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.composerCornerRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: DiscoTheme.Metrics.composerCornerRadius, style: .continuous)
                     .strokeBorder(DiscoTheme.Palette.border, lineWidth: 1)
             }
         }
-        .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .onExitCommand {
             if isRunning {
@@ -967,6 +937,177 @@ private struct ComposerView: View {
     }
 }
 
+// SwiftUI document hosted inside the AppKit-owned message-list scroll view. Its
+// content column width comes from `MessageListMetrics`, kept in sync by the
+// coordinator, so messages wrap at the fixed column width and stay centered.
+private struct MessageListDocument: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var metrics: MessageListMetrics
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 18) {
+            ForEach(model.messages) { message in
+                MessageView(
+                    message: message,
+                    isStreaming: model.selectedSessionID.map { sessionID in
+                        model.runningSessionIDs.contains(sessionID)
+                            && message.id == "active-\(sessionID)"
+                    } ?? false
+                )
+            }
+        }
+        .frame(width: max(1, metrics.columnWidth - chatColumnContentPadding * 2))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, chatColumnContentPadding)
+    }
+}
+
+private final class MessageListMetrics: ObservableObject {
+    @Published var columnWidth: CGFloat = chatColumnMaximumWidth
+}
+
+// The message list scroll view is AppKit-owned instead of a SwiftUI ScrollView:
+// SwiftUI owns the NSScrollView behind its ScrollView and keeps re-forcing a
+// legacy, always-visible scroll bar, with no public API for an overlay scroller
+// that only shows while scrolling. Owning the NSScrollView here lets us set the
+// overlay + autohide scrollers once; the SwiftUI content is hosted as its document.
+@MainActor
+private struct MessageListScrollView: NSViewRepresentable {
+    typealias Coordinator = MessageListScrollCoordinator
+    @EnvironmentObject private var model: AppModel
+    let viewportWidth: CGFloat
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(model: model)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        context.coordinator.makeScrollView(viewportWidth: viewportWidth)
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.update(viewportWidth: viewportWidth)
+    }
+}
+
+@MainActor
+private final class MessageListScrollCoordinator: NSObject {
+    private let model: AppModel
+    private let metrics = MessageListMetrics()
+    private weak var scrollView: NSScrollView?
+    private weak var documentView: MessageListDocumentView?
+    private var hosting: NSHostingView<MessageListDocument>?
+    private var messagesCancellable: AnyCancellable?
+    private var reconcileWorkItem: DispatchWorkItem?
+    private var lastMessageCount = -1
+    private var lastConversationStartID: String?
+    private var didAutoScrollToBottom = false
+
+    init(model: AppModel) {
+        self.model = model
+        super.init()
+    }
+
+    func makeScrollView(viewportWidth: CGFloat) -> NSScrollView {
+        metrics.columnWidth = columnWidth(for: viewportWidth)
+
+        let scrollView = MessageListNSScrollView(frame: .zero)
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.scrollerKnobStyle = .default
+        scrollView.verticalScrollElasticity = .allowed
+
+        let documentView = MessageListDocumentView(frame: .zero)
+        let hosting = NSHostingView(
+            rootView: MessageListDocument(model: model, metrics: metrics)
+        )
+        hosting.autoresizingMask = [.width, .height]
+        hosting.frame = documentView.bounds
+        documentView.addSubview(hosting)
+        scrollView.documentView = documentView
+
+        self.scrollView = scrollView
+        self.documentView = documentView
+        self.hosting = hosting
+        lastMessageCount = model.messages.count
+        didAutoScrollToBottom = false
+        observeMessages()
+        scheduleReconcile(scrollToBottom: true)
+        return scrollView
+    }
+
+    func update(viewportWidth: CGFloat) {
+        let columnWidth = columnWidth(for: viewportWidth)
+        if abs(columnWidth - metrics.columnWidth) > 0.5 {
+            metrics.columnWidth = columnWidth
+        }
+        scheduleReconcile(scrollToBottom: false)
+    }
+
+    private func columnWidth(for viewportWidth: CGFloat) -> CGFloat {
+        max(1, min(viewportWidth, chatColumnMaximumWidth))
+    }
+
+    private func observeMessages() {
+        messagesCancellable = model.$messages
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] messages in
+                guard let self else { return }
+                let startID = messages.first?.id
+                let conversationChanged = startID != nil && startID != self.lastConversationStartID
+                self.lastConversationStartID = startID
+                let shouldScrollToBottom = messages.count > self.lastMessageCount
+                    || conversationChanged
+                    || !self.didAutoScrollToBottom
+                self.lastMessageCount = messages.count
+                self.scheduleReconcile(scrollToBottom: shouldScrollToBottom)
+            }
+    }
+
+    private func scheduleReconcile(scrollToBottom: Bool) {
+        reconcileWorkItem?.cancel()
+        if scrollToBottom {
+            didAutoScrollToBottom = false
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.reconcile()
+        }
+        reconcileWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: workItem)
+    }
+
+    private func reconcile() {
+        guard let scrollView, let documentView, let hosting else { return }
+        hosting.layoutSubtreeIfNeeded()
+
+        // The document tracks the clip width (so the overlay scroller sits at the
+        // conversation's right edge and the column stays centered) and its height
+        // matches the SwiftUI content's fitting height.
+        let clipWidth = max(scrollView.contentSize.width, 1)
+        let clipHeight = max(scrollView.contentSize.height, 1)
+        let contentHeight = max(hosting.fittingSize.height, 1)
+        documentView.setFrameSize(NSSize(width: clipWidth, height: contentHeight))
+
+        if !didAutoScrollToBottom {
+            let maxScrollY = max(0, contentHeight - clipHeight)
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: maxScrollY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            didAutoScrollToBottom = true
+        }
+    }
+}
+
+private final class MessageListDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+// Marker subclass so each router can resolve the message list in its own window.
+private final class MessageListNSScrollView: NSScrollView {}
+
 // Marker subclass so ScrollWheelRouter can recognize the composer's editor.
 private final class ComposerScrollView: NSScrollView {}
 
@@ -982,7 +1123,7 @@ private struct ScrollWheelRouter: NSViewRepresentable {
 
     final class RouterView: NSView {
         private var monitor: Any?
-        private weak var messageListScrollView: NSScrollView?
+        private weak var messageListScrollView: MessageListNSScrollView?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -1028,35 +1169,27 @@ private struct ScrollWheelRouter: NSViewRepresentable {
             }
 
             guard let messageListScrollView = resolveMessageListScrollView() else { return event }
-            let frame = messageListScrollView.convert(messageListScrollView.bounds, to: nil)
-            let location = event.locationInWindow
-            let isOverMessageColumn = (frame.minX...frame.maxX).contains(location.x)
-                && location.y <= frame.maxY
-            guard isOverMessageColumn else { return event }
+            let columnFrame = convert(bounds, to: nil)
+            guard columnFrame.contains(event.locationInWindow) else { return event }
 
             messageListScrollView.scrollWheel(with: event)
             return nil
         }
 
-        private func resolveMessageListScrollView() -> NSScrollView? {
+        private func resolveMessageListScrollView() -> MessageListNSScrollView? {
             if let messageListScrollView, messageListScrollView.window === window {
                 return messageListScrollView
             }
             guard let contentView = window?.contentView else { return nil }
-            // The message list is the widest scroll view in the window; the editor
-            // and the sidebar's list are both narrower.
-            var stack: [NSView] = [contentView]
-            var widest: NSScrollView?
-            while let view = stack.popLast() {
-                if let scrollView = view as? NSScrollView, !(scrollView is ComposerScrollView),
-                    widest == nil || scrollView.frame.width > widest!.frame.width
-                {
-                    widest = scrollView
+            var views = [contentView]
+            while let view = views.popLast() {
+                if let scrollView = view as? MessageListNSScrollView {
+                    messageListScrollView = scrollView
+                    return scrollView
                 }
-                stack.append(contentsOf: view.subviews)
+                views.append(contentsOf: view.subviews)
             }
-            messageListScrollView = widest
-            return widest
+            return nil
         }
     }
 }
@@ -1093,7 +1226,7 @@ private struct GrowingTextEditor: NSViewRepresentable {
         textView.allowsUndo = true
         textView.drawsBackground = false
         textView.font = .systemFont(ofSize: 14)
-        textView.textContainerInset = NSSize(width: 12, height: 6)
+        textView.textContainerInset = NSSize(width: chatColumnContentPadding, height: 6)
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(
