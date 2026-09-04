@@ -945,7 +945,7 @@ private struct MessageListDocument: View {
     @ObservedObject var metrics: MessageListMetrics
 
     var body: some View {
-        LazyVStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 18) {
             ForEach(model.messages) { message in
                 MessageView(
                     message: message,
