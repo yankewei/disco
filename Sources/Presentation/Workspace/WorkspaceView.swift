@@ -311,19 +311,19 @@ private struct ConversationView: View {
         VStack(spacing: 0) {
             if model.selectedSession != nil {
                 GeometryReader { geometry in
-                    VStack(spacing: 0) {
-                        messageList
-                        ApprovalList()
-                        ComposerView(availableHeight: geometry.size.height)
-                    }
-                    .frame(
-                        minWidth: chatColumnMinimumWidth,
-                        idealWidth: chatColumnIdealWidth,
-                        maxWidth: chatColumnMaximumWidth,
-                        maxHeight: .infinity
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(DiscoTheme.Palette.surface)
+                    messageList
+                        .safeAreaInset(edge: .bottom, spacing: 0) {
+                            VStack(spacing: 0) {
+                                ApprovalList()
+                                ComposerView(availableHeight: geometry.size.height)
+                            }
+                            .frame(maxWidth: chatColumnMaximumWidth)
+                            .frame(maxWidth: .infinity)
+                            .background(DiscoTheme.Palette.surface)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(DiscoTheme.Palette.surface)
+                        .background(ScrollWheelRouter())
                 }
             } else {
                 WelcomeView()
@@ -332,8 +332,6 @@ private struct ConversationView: View {
         .background(DiscoTheme.Palette.canvas)
     }
 
-    private let chatColumnMinimumWidth: CGFloat = 420
-    private let chatColumnIdealWidth: CGFloat = 640
     private let chatColumnMaximumWidth: CGFloat = 720
     private let messageListEndID = "message-list-end"
 
@@ -354,6 +352,8 @@ private struct ConversationView: View {
                         .frame(height: 0)
                         .id(messageListEndID)
                 }
+                .frame(maxWidth: chatColumnMaximumWidth)
+                .frame(maxWidth: .infinity)
                 .padding(24)
             }
             .scrollIndicators(.hidden)
@@ -967,6 +967,100 @@ private struct ComposerView: View {
     }
 }
 
+// Marker subclass so ScrollWheelRouter can recognize the composer's editor.
+private final class ComposerScrollView: NSScrollView {}
+
+// Routes scroll wheel events over the composer chrome and approval cards to the
+// message list, so the whole conversation column scrolls. The message list's
+// own region and the sidebar are handled natively and pass through untouched.
+private struct ScrollWheelRouter: NSViewRepresentable {
+    func makeNSView(context: Context) -> RouterView {
+        RouterView()
+    }
+
+    func updateNSView(_ nsView: RouterView, context: Context) {}
+
+    final class RouterView: NSView {
+        private var monitor: Any?
+        private weak var messageListScrollView: NSScrollView?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window != nil, monitor == nil {
+                monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                    self?.route(event) ?? event
+                }
+            } else if window == nil, let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        deinit {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+            }
+        }
+
+        private func route(_ event: NSEvent) -> NSEvent? {
+            guard let window = event.window, window === self.window,
+                let hitView = window.contentView?.hitTest(event.locationInWindow)
+            else { return event }
+
+            var enclosingScrollView: NSScrollView?
+            var current: NSView? = hitView
+            while let view = current, enclosingScrollView == nil {
+                enclosingScrollView = view as? NSScrollView
+                current = view.superview
+            }
+
+            if let scrollView = enclosingScrollView {
+                // Scroll views handle their own events; the composer editor is the
+                // exception: it only needs them once its content overflows.
+                let isComposerEditor = scrollView is ComposerScrollView
+                if !isComposerEditor {
+                    return event
+                }
+                let contentHeight = scrollView.documentView?.frame.height ?? 0
+                if contentHeight > scrollView.contentView.bounds.height {
+                    return event
+                }
+            }
+
+            guard let messageListScrollView = resolveMessageListScrollView() else { return event }
+            let frame = messageListScrollView.convert(messageListScrollView.bounds, to: nil)
+            let location = event.locationInWindow
+            let isOverMessageColumn = (frame.minX...frame.maxX).contains(location.x)
+                && location.y <= frame.maxY
+            guard isOverMessageColumn else { return event }
+
+            messageListScrollView.scrollWheel(with: event)
+            return nil
+        }
+
+        private func resolveMessageListScrollView() -> NSScrollView? {
+            if let messageListScrollView, messageListScrollView.window === window {
+                return messageListScrollView
+            }
+            guard let contentView = window?.contentView else { return nil }
+            // The message list is the widest scroll view in the window; the editor
+            // and the sidebar's list are both narrower.
+            var stack: [NSView] = [contentView]
+            var widest: NSScrollView?
+            while let view = stack.popLast() {
+                if let scrollView = view as? NSScrollView, !(scrollView is ComposerScrollView),
+                    widest == nil || scrollView.frame.width > widest!.frame.width
+                {
+                    widest = scrollView
+                }
+                stack.append(contentsOf: view.subviews)
+            }
+            messageListScrollView = widest
+            return widest
+        }
+    }
+}
+
 private struct GrowingTextEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
@@ -985,7 +1079,7 @@ private struct GrowingTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView(frame: .zero)
+        let scrollView = ComposerScrollView(frame: .zero)
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = false
