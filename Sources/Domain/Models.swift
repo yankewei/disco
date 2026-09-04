@@ -134,7 +134,9 @@ struct ProviderInfo: Identifiable, Hashable {
     let version: String?
     let executablePath: String?
     let supportsPlan: Bool
+    let isLoadingModels: Bool
     var models: [ModelInfo]
+    let modelLoadFailureDescription: String?
 
     var id: BackendKind {
         kind

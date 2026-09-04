@@ -379,101 +379,6 @@ final class NativeCoreTests: XCTestCase {
         reopenedStore.close()
     }
 
-    func testSQLiteStorePersistsConversationTimeline() throws {
-        let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let databaseURL = folder.appendingPathComponent("disco.sqlite")
-        defer { try? FileManager.default.removeItem(at: folder) }
-
-        let store = try SQLiteStore(databaseURL: databaseURL)
-        let project = ProjectInfo(
-            projectID: "project-1",
-            name: "Disco",
-            projectPath: "/tmp/disco",
-            createdAt: "2026-01-01T00:00:00Z",
-            activatedAt: nil
-        )
-        try store.createProject(project)
-        let session = SessionInfo(
-            sessionID: "session-1",
-            projectID: project.id,
-            agent: .codex,
-            modelID: nil,
-            reasoningEffort: nil,
-            sandboxMode: nil,
-            agentThreadID: nil,
-            title: "测试会话",
-            createdAt: "2026-01-01T00:00:00Z",
-            activatedAt: nil
-        )
-        try store.createSession(session)
-
-        let messages = [
-            ConversationMessage(
-                id: "user-1",
-                role: .user,
-                text: "读取 README",
-                reasoning: nil,
-                toolCalls: nil,
-                items: nil,
-                timeline: nil,
-                status: nil,
-                error: nil,
-                createdAt: "2026-01-01T00:00:00Z"
-            ),
-            ConversationMessage(
-                id: "assistant-1",
-                role: .assistant,
-                text: "README 内容如下",
-                reasoning: "先读取文件",
-                toolCalls: [
-                    ToolCall(
-                        id: "tool-1",
-                        name: "读取文件",
-                        status: .completed,
-                        input: .object(["path": .string("README.md")]),
-                        output: "内容",
-                        error: nil
-                    ),
-                ],
-                items: [
-                    .reasoning(id: "reasoning-1", text: "先读取文件", state: .completed),
-                    .toolCall(
-                        id: "tool-1",
-                        name: "读取文件",
-                        input: .object(["path": .string("README.md")]),
-                        output: "内容",
-                        error: nil,
-                        state: .completed
-                    ),
-                ],
-                timeline: [
-                    .reasoning(id: "reasoning-1", text: "先读取文件", state: .completed),
-                    .toolCall(
-                        id: "tool-1",
-                        name: "读取文件",
-                        input: .object(["path": .string("README.md")]),
-                        output: "内容",
-                        error: nil,
-                        state: .completed
-                    ),
-                    .text(id: "text-1", text: "README 内容如下", state: .completed),
-                ],
-                status: .completed,
-                error: nil,
-                createdAt: "2026-01-01T00:00:01Z"
-            ),
-        ]
-
-        try store.replaceMessages(messages, sessionID: session.id)
-        XCTAssertEqual(try store.loadMessages(sessionID: session.id), messages)
-        store.close()
-
-        let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
-        defer { reopenedStore.close() }
-        XCTAssertEqual(try reopenedStore.loadMessages(sessionID: session.id), messages)
-    }
-
     func testSQLiteStoreDeletesSession() throws {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -564,29 +469,43 @@ final class NativeCoreTests: XCTestCase {
         )
         try store.createSession(deletedSession)
         try store.createSession(remainingSession)
-        try store.replaceMessages([
-            ConversationMessage(
-                id: "message-1",
-                role: .user,
-                text: "本地消息",
-                reasoning: nil,
-                toolCalls: nil,
-                items: nil,
-                timeline: nil,
-                status: nil,
-                error: nil,
-                createdAt: "2026-01-01T00:00:00Z"
-            ),
-        ], sessionID: deletedSession.id)
 
         try store.deleteProject(projectID: project.id)
 
         XCTAssertNil(try store.project(id: project.id))
         XCTAssertTrue(try store.listSessions(projectID: project.id).isEmpty)
-        XCTAssertTrue(try store.loadMessages(sessionID: deletedSession.id).isEmpty)
         XCTAssertNotNil(try store.project(id: remainingProject.id))
         XCTAssertEqual(try store.listSessions(projectID: remainingProject.id), [remainingSession])
         store.close()
+    }
+
+    func testSQLiteStoreRemovesConversationMessageCache() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let databaseURL = folder.appendingPathComponent("disco.sqlite")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(databaseURL.path, &database), SQLITE_OK)
+        defer { sqlite3_close(database) }
+        XCTAssertEqual(sqlite3_exec(
+            database,
+            "CREATE TABLE conversation_messages (message_id TEXT PRIMARY KEY)",
+            nil,
+            nil,
+            nil
+        ), SQLITE_OK)
+
+        let store = try SQLiteStore(databaseURL: databaseURL)
+        store.close()
+
+        let statement = try XCTUnwrap(try prepareStatement(
+            database: database,
+            sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_messages'"
+        ))
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
     }
 
     private func prepareStatement(

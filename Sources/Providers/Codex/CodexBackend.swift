@@ -16,7 +16,7 @@ final class CodexBackend: AgentBackend {
         appServer = CodexAppServer(executableURL: executableURL)
     }
 
-    func listModels() async -> [ModelInfo] {
+    func listModels() async -> ModelListResult {
         do {
             try await startIfNeeded()
             var models: [ModelInfo] = []
@@ -38,9 +38,12 @@ final class CodexBackend: AgentBackend {
                 }
                 cursor = jsonString(responseObject["nextCursor"])
             } while cursor != nil
-            return models
+            return ModelListResult(models: models, failureDescription: nil)
         } catch {
-            return []
+            return ModelListResult(
+                models: [],
+                failureDescription: "无法加载模型，请检查 Codex 登录状态后重试"
+            )
         }
     }
 

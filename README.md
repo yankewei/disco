@@ -10,7 +10,7 @@ Disco 是仅面向 macOS 14+ 的原生 coding agent 桌面应用，使用 SwiftU
 - Claude Code：原生 v1 暂不支持，历史数据仍会保留
 - Provider 登录态：由各自的 CLI 管理，Disco 不读取或复制凭据
 
-本地数据库保存项目、会话、最近一次 Agent 选择和消息时间线。`projects.project_path` 保存项目目录，`sessions.project_id` 关联项目并保存 Agent、Agent 线程 ID 以及会话配置；最近一次 Agent 选择用于创建新会话；消息历史优先通过 Agent 接口加载，并保留本地时间线缓存。删除会话只移除 Disco 中的绑定，不删除 Provider 管理的历史。
+本地数据库保存项目、会话和最近一次 Agent 选择。`projects.project_path` 保存项目目录，`sessions.project_id` 关联项目并保存 Agent、Agent 线程 ID 以及会话配置；最近一次 Agent 选择用于创建新会话。消息历史始终通过 Agent 接口恢复，不在 Disco 的 SQLite 中缓存。删除会话只移除 Disco 中的绑定，不删除 Provider 管理的历史。
 
 ## 项目结构
 

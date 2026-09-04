@@ -107,9 +107,14 @@ struct BackendRunContext {
     ) async -> ApprovalDecision
 }
 
+struct ModelListResult {
+    let models: [ModelInfo]
+    let failureDescription: String?
+}
+
 protocol AgentBackend: AnyObject {
     var supportsPlan: Bool { get }
-    func listModels() async -> [ModelInfo]
+    func listModels() async -> ModelListResult
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage]
     func run(context: BackendRunContext) async throws -> String
     func shutdown()

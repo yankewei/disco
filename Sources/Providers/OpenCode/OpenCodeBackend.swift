@@ -15,7 +15,7 @@ final class OpenCodeBackend: AgentBackend {
         self.session = session
     }
 
-    func listModels() async -> [ModelInfo] {
+    func listModels() async -> ModelListResult {
         let cancellation = CancellationToken()
         do {
             let server = try await startServer(cancellation: cancellation, workingDirectory: nil)
@@ -27,9 +27,15 @@ final class OpenCodeBackend: AgentBackend {
                 body: nil,
                 cancellation: cancellation
             )
-            return parseOpenCodeModels(response)
+            return ModelListResult(
+                models: parseOpenCodeModels(response),
+                failureDescription: nil
+            )
         } catch {
-            return []
+            return ModelListResult(
+                models: [],
+                failureDescription: "无法加载模型，请检查 OpenCode 登录状态后重试"
+            )
         }
     }
 
@@ -201,7 +207,7 @@ final class OpenCodeBackend: AgentBackend {
             arguments: ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
             workingDirectory: workingDirectory,
             environment: await providerEnvironment(for: executableURL),
-            captureStandardOutput: true,
+            captureStandardOutput: false,
             captureStandardError: false
         )
         try process.launch()
@@ -226,41 +232,33 @@ final class OpenCodeBackend: AgentBackend {
         server: RunningOpenCodeServer,
         cancellation: CancellationToken
     ) async throws {
-        guard let output = server.process.standardOutput else {
-            throw OpenCodeBackendError.requestFailed("无法读取 OpenCode 服务输出")
-        }
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                for try await line in lineStream(from: output) {
-                    if line.contains("opencode server listening on ") {
-                        return
-                    }
-                }
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if cancellation.isCancelled {
+                throw OpenCodeBackendError.cancelled
+            }
+            if !server.process.process.isRunning {
                 throw OpenCodeBackendError.requestFailed("OpenCode 服务已退出")
             }
-            group.addTask {
-                let deadline = Date().addingTimeInterval(10)
-                while Date() < deadline {
-                    if cancellation.isCancelled {
-                        throw OpenCodeBackendError.cancelled
-                    }
-                    if !server.process.process.isRunning {
-                        throw OpenCodeBackendError.requestFailed("OpenCode 服务已退出")
-                    }
-                    try await Task.sleep(nanoseconds: 100_000_000)
+            do {
+                let (_, response) = try await request(
+                    baseURL: server.baseURL,
+                    path: "/global/health",
+                    method: "GET",
+                    body: nil,
+                    cancellation: cancellation
+                )
+                if (response as? HTTPURLResponse)?.statusCode == 200 {
+                    return
                 }
-                throw OpenCodeBackendError.startupTimeout
+            } catch {
+                if cancellation.isCancelled {
+                    throw OpenCodeBackendError.cancelled
+                }
             }
-            defer { group.cancelAll() }
-            _ = try await group.next()
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
-        _ = try await request(
-            baseURL: server.baseURL,
-            path: "/global/health",
-            method: "GET",
-            body: nil,
-            cancellation: cancellation
-        )
+        throw OpenCodeBackendError.startupTimeout
     }
 
     private func openEventStream(
@@ -1162,7 +1160,11 @@ private func openCodeModel(
         guard let reasoningEffort = ReasoningEffort(rawValue: effort), !efforts.contains(reasoningEffort) else { continue }
         efforts.append(reasoningEffort)
     }
-    return ModelInfo(id: id, name: id, reasoningEfforts: efforts.isEmpty ? nil : efforts)
+    return ModelInfo(
+        id: id,
+        name: jsonString(model?["name"]) ?? id,
+        reasoningEfforts: efforts.isEmpty ? nil : efforts
+    )
 }
 
 private func parseModelSelection(_ modelID: String?) -> (providerID: String, modelID: String)? {

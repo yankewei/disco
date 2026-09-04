@@ -212,46 +212,55 @@ final class AgentHost {
         }
     }
 
-    func providers() async -> [ProviderInfo] {
-        var providers: [ProviderInfo] = []
+    func providers() -> [ProviderInfo] {
         let (backends, executableURLs) = withStateLock { (self.backends, self.executableURLs) }
-        for backendKind in BackendKind.allCases {
+        return BackendKind.allCases.map { backendKind in
             guard let backend = backends[backendKind] else {
-                providers.append(
-                    ProviderInfo(
-                        kind: backendKind,
-                        available: false,
-                        detail: "未找到 \(backendKind.displayName) 命令",
-                        version: nil,
-                        executablePath: nil,
-                        supportsPlan: backendKind == .codex,
-                        models: []
-                    )
-                )
-                continue
+                return unavailableProviderInfo(for: backendKind)
             }
-            let models = await backend.listModels()
-            let version: String?
-            if let executableURL = executableURLs[backendKind] {
-                version = await Task.detached(priority: .utility) {
-                    ExecutableMetadataLocator.version(for: executableURL)
-                }.value
-            } else {
-                version = nil
-            }
-            providers.append(
-                ProviderInfo(
-                    kind: backendKind,
-                    available: true,
-                    detail: "已检测到 \(backendKind.displayName)",
-                    version: version,
-                    executablePath: executableURLs[backendKind]?.path,
-                    supportsPlan: backend.supportsPlan,
-                    models: models
-                )
+            return ProviderInfo(
+                kind: backendKind,
+                available: true,
+                detail: "已检测到 \(backendKind.displayName)",
+                version: nil,
+                executablePath: executableURLs[backendKind]?.path,
+                supportsPlan: backend.supportsPlan,
+                isLoadingModels: true,
+                models: [],
+                modelLoadFailureDescription: nil
             )
         }
-        return providers
+    }
+
+    func refreshProvider(_ backendKind: BackendKind) async -> ProviderInfo {
+        let (backend, executableURL) = withStateLock {
+            (backends[backendKind], executableURLs[backendKind])
+        }
+        guard let backend else {
+            return unavailableProviderInfo(for: backendKind)
+        }
+
+        async let modelListResult = backend.listModels()
+        let version: String?
+        if let executableURL {
+            version = await Task.detached(priority: .utility) {
+                ExecutableMetadataLocator.version(for: executableURL)
+            }.value
+        } else {
+            version = nil
+        }
+        let resolvedModelListResult = await modelListResult
+        return ProviderInfo(
+            kind: backendKind,
+            available: true,
+            detail: "已检测到 \(backendKind.displayName)",
+            version: version,
+            executablePath: executableURL?.path,
+            supportsPlan: backend.supportsPlan,
+            isLoadingModels: false,
+            models: resolvedModelListResult.models,
+            modelLoadFailureDescription: resolvedModelListResult.failureDescription
+        )
     }
 
     func prompt(
@@ -549,6 +558,20 @@ final class AgentHost {
 
     private func backend(for kind: BackendKind) -> AgentBackend? {
         withStateLock { backends[kind] }
+    }
+
+    private func unavailableProviderInfo(for backendKind: BackendKind) -> ProviderInfo {
+        ProviderInfo(
+            kind: backendKind,
+            available: false,
+            detail: "未找到 \(backendKind.displayName) 命令",
+            version: nil,
+            executablePath: nil,
+            supportsPlan: backendKind == .codex,
+            isLoadingModels: false,
+            models: [],
+            modelLoadFailureDescription: nil
+        )
     }
 
     private func titleFromPrompt(_ prompt: String) -> String {

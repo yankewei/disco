@@ -25,6 +25,8 @@ final class AppModel: ObservableObject {
     private let store: SQLiteStore?
     private let host: AgentHost?
     private var activeTimelineBuilders: [String: TimelineBuilder] = [:]
+    private var streamingRenderTasks: [String: Task<Void, Never>] = [:]
+    private let streamingRenderIntervalNanoseconds: UInt64 = 33_000_000
     private var lastAgentSelection = LastAgentSelection(
         agent: .codex,
         modelID: nil,
@@ -71,7 +73,13 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() async {
-        guard let host, !isLoading, !isShuttingDown else { return }
+        guard let host, !isShuttingDown else { return }
+        if isLoading {
+            while isLoading, !isShuttingDown {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return
+        }
         isLoading = true
         defer { isLoading = false }
         do {
@@ -89,7 +97,19 @@ final class AppModel: ObservableObject {
             // (they spawn login shells and provider processes); do them only
             // after the local data is already on screen.
             await host.refreshBackends()
-            providers = await host.providers()
+            providers = host.providers()
+            await withTaskGroup(of: ProviderInfo.self) { group in
+                for provider in providers where provider.available {
+                    group.addTask {
+                        await host.refreshProvider(provider.kind)
+                    }
+                }
+                for await provider in group {
+                    if let index = providers.firstIndex(where: { $0.kind == provider.kind }) {
+                        providers[index] = provider
+                    }
+                }
+            }
             guard !isShuttingDown else { return }
             if let savedAgentSelection = try host.lastAgentSelection() {
                 lastAgentSelection = savedAgentSelection
@@ -243,6 +263,7 @@ final class AppModel: ObservableObject {
             approvalRequests.removeAll { sessionIDs.contains($0.sessionID) }
             for sessionID in sessionIDs {
                 activeTimelineBuilders.removeValue(forKey: sessionID)
+                streamingRenderTasks.removeValue(forKey: sessionID)?.cancel()
                 runningSessionIDs.remove(sessionID)
             }
 
@@ -266,6 +287,7 @@ final class AppModel: ObservableObject {
             sessionsByProject[session.projectID]?.removeAll { $0.id == session.id }
             approvalRequests.removeAll { $0.sessionID == session.id }
             activeTimelineBuilders.removeValue(forKey: session.id)
+            streamingRenderTasks.removeValue(forKey: session.id)?.cancel()
             runningSessionIDs.remove(session.id)
 
             guard selectedSessionID == session.id else { return }
@@ -412,6 +434,8 @@ final class AppModel: ObservableObject {
         while isLoading {
             await Task.yield()
         }
+        streamingRenderTasks.values.forEach { $0.cancel() }
+        streamingRenderTasks.removeAll()
         await host?.shutdown()
         store?.close()
     }
@@ -472,7 +496,7 @@ final class AppModel: ObservableObject {
         messages.append(activeAssistantMessage)
         runningSessionIDs.insert(session.id)
         activeTimelineBuilders[session.id] = TimelineBuilder()
-        persistMessages(sessionID: session.id)
+        streamingRenderTasks.removeValue(forKey: session.id)?.cancel()
 
         let runMode: RunMode = planMode ? .plan : .agent
         Task {
@@ -489,6 +513,7 @@ final class AppModel: ObservableObject {
         case let .runStarted(sessionID, _):
             runningSessionIDs.insert(sessionID)
             activeTimelineBuilders[sessionID] = TimelineBuilder()
+            streamingRenderTasks.removeValue(forKey: sessionID)?.cancel()
         case let .sessionAgentThreadIDUpdated(sessionID, agentThreadID):
             updateSessionAgentThreadID(sessionID: sessionID, agentThreadID: agentThreadID)
         case let .text(sessionID, _, text, itemID):
@@ -523,6 +548,7 @@ final class AppModel: ObservableObject {
             approvalRequests.removeAll { $0.id == approvalID }
         case let .runFinished(sessionID, _, status, sessionTitle, error):
             runningSessionIDs.remove(sessionID)
+            streamingRenderTasks.removeValue(forKey: sessionID)?.cancel()
             if let selectedSessionID, selectedSessionID == sessionID {
                 if let sessionTitle {
                     updateSessionTitle(sessionID: sessionID, title: sessionTitle)
@@ -552,7 +578,6 @@ final class AppModel: ObservableObject {
                 if status == .failed, let error {
                     workspaceError = error
                 }
-                persistMessages(sessionID: sessionID)
             }
             activeTimelineBuilders.removeValue(forKey: sessionID)
         }
@@ -562,7 +587,19 @@ final class AppModel: ObservableObject {
         var builder = activeTimelineBuilders[sessionID] ?? TimelineBuilder()
         builder.apply(event)
         activeTimelineBuilders[sessionID] = builder
-        guard selectedSessionID == sessionID else { return }
+        guard selectedSessionID == sessionID, streamingRenderTasks[sessionID] == nil else { return }
+
+        streamingRenderTasks[sessionID] = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: streamingRenderIntervalNanoseconds)
+            guard !Task.isCancelled else { return }
+            streamingRenderTasks.removeValue(forKey: sessionID)
+            renderActiveMessage(sessionID: sessionID)
+        }
+    }
+
+    private func renderActiveMessage(sessionID: String) {
+        guard selectedSessionID == sessionID, let builder = activeTimelineBuilders[sessionID] else { return }
         let renderedMessage = ConversationMessage(
             id: "active-\(sessionID)",
             role: .assistant,
@@ -584,48 +621,12 @@ final class AppModel: ObservableObject {
 
     private func loadMessages(sessionID: String) async {
         guard let host else { return }
-
-        if let store,
-           let localMessages = try? store.loadMessages(sessionID: sessionID),
-           !localMessages.isEmpty,
-           !localMessages.contains(where: { $0.id.hasPrefix("active-") })
-        {
-            guard selectedSessionID == sessionID else { return }
-            messages = localMessages
-            return
-        }
-
         do {
             let loadedMessages = try await host.loadMessages(sessionID: sessionID)
             guard selectedSessionID == sessionID else { return }
-            if !loadedMessages.isEmpty {
-                messages = loadedMessages
-                persistMessages(sessionID: sessionID)
-            } else if let store,
-                      let localMessages = try? store.loadMessages(sessionID: sessionID)
-            {
-                messages = localMessages.filter { !$0.id.hasPrefix("active-") }
-            } else {
-                messages = []
-            }
+            messages = loadedMessages
         } catch {
             guard selectedSessionID == sessionID else { return }
-            if let store,
-               let localMessages = try? store.loadMessages(sessionID: sessionID),
-               !localMessages.isEmpty
-            {
-                messages = localMessages.filter { !$0.id.hasPrefix("active-") }
-            } else {
-                workspaceError = error.localizedDescription
-            }
-        }
-    }
-
-    private func persistMessages(sessionID: String) {
-        guard let store else { return }
-        do {
-            try store.replaceMessages(messages, sessionID: sessionID)
-        } catch {
             workspaceError = error.localizedDescription
         }
     }

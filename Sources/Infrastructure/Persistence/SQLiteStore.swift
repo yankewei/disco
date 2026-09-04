@@ -319,75 +319,6 @@ final class SQLiteStore {
         try step(statement)
     }
 
-    func loadMessages(sessionID: String) throws -> [ConversationMessage] {
-        databaseLock.lock()
-        defer { databaseLock.unlock() }
-        let statement = try prepare(
-            "SELECT payload_json FROM conversation_messages WHERE session_id = ? ORDER BY position ASC"
-        )
-        defer { sqlite3_finalize(statement) }
-        try bind(sessionID, at: 1, in: statement)
-
-        var messages: [ConversationMessage] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let payload = text(statement, column: 0)
-            guard let data = payload.data(using: .utf8) else {
-                throw SQLiteStoreError.invalidData("无法读取本地消息")
-            }
-            do {
-                messages.append(try JSONDecoder().decode(ConversationMessage.self, from: data))
-            } catch {
-                throw SQLiteStoreError.invalidData("本地消息格式无效：\(error.localizedDescription)")
-            }
-        }
-        try throwIfStepFailed(statement)
-        return messages
-    }
-
-    func replaceMessages(_ messages: [ConversationMessage], sessionID: String) throws {
-        let payloads = try messages.enumerated().map { index, message in
-            let data = try JSONEncoder().encode(message)
-            guard let payload = String(data: data, encoding: .utf8) else {
-                throw SQLiteStoreError.invalidData("无法编码本地消息")
-            }
-            return (index, message.id, payload)
-        }
-
-        databaseLock.lock()
-        defer { databaseLock.unlock() }
-        try execute("BEGIN IMMEDIATE TRANSACTION")
-        do {
-            let deleteStatement = try prepare(
-                "DELETE FROM conversation_messages WHERE session_id = ?"
-            )
-            defer { sqlite3_finalize(deleteStatement) }
-            try bind(sessionID, at: 1, in: deleteStatement)
-            try step(deleteStatement)
-
-            let insertStatement = try prepare(
-                """
-                INSERT INTO conversation_messages (
-                    message_id, session_id, position, payload_json
-                ) VALUES (?, ?, ?, ?)
-                """
-            )
-            defer { sqlite3_finalize(insertStatement) }
-            for (index, messageID, payload) in payloads {
-                sqlite3_reset(insertStatement)
-                sqlite3_clear_bindings(insertStatement)
-                try bind(messageID, at: 1, in: insertStatement)
-                try bind(sessionID, at: 2, in: insertStatement)
-                try bind(index, at: 3, in: insertStatement)
-                try bind(payload, at: 4, in: insertStatement)
-                try step(insertStatement)
-            }
-            try execute("COMMIT")
-        } catch {
-            try? execute("ROLLBACK")
-            throw error
-        }
-    }
-
     private func createSchema() throws {
         try execute("PRAGMA foreign_keys = ON;")
         let projectColumns = try tableColumns(for: "projects")
@@ -435,20 +366,9 @@ final class SQLiteStore {
                 model_id TEXT,
                 reasoning_effort TEXT
             );
-            CREATE TABLE IF NOT EXISTS conversation_messages (
-                message_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                payload_json TEXT NOT NULL,
-                FOREIGN KEY (session_id)
-                    REFERENCES sessions(session_id)
-                    ON DELETE CASCADE,
-                UNIQUE (session_id, position)
-            );
-            CREATE INDEX IF NOT EXISTS conversation_messages_session_position_idx
-                ON conversation_messages (session_id, position ASC);
+            DROP TABLE IF EXISTS conversation_messages;
             DROP TABLE IF EXISTS dismissed_sessions;
-            PRAGMA user_version = 6;
+            PRAGMA user_version = 7;
             """
         )
         try execute("DROP TABLE IF EXISTS messages")
@@ -690,7 +610,6 @@ final class SQLiteStore {
 enum SQLiteStoreError: LocalizedError {
     case openFailed(String)
     case queryFailed(String)
-    case invalidData(String)
 
     var errorDescription: String? {
         switch self {
@@ -698,8 +617,6 @@ enum SQLiteStoreError: LocalizedError {
             "无法打开本地数据库：\(message)"
         case let .queryFailed(message):
             "本地数据库操作失败：\(message)"
-        case let .invalidData(message):
-            message
         }
     }
 }

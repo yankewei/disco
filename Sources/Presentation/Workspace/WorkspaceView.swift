@@ -335,101 +335,40 @@ private struct ConversationView: View {
     private let chatColumnMinimumWidth: CGFloat = 420
     private let chatColumnIdealWidth: CGFloat = 640
     private let chatColumnMaximumWidth: CGFloat = 720
+    private let messageListEndID = "message-list-end"
 
     private var messageList: some View {
-        ChatScrollView(itemCount: model.messages.count) {
-            LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(model.messages) { message in
-                    MessageView(
-                        message: message,
-                        isStreaming: model.selectedSessionID.map { sessionID in
-                            model.runningSessionIDs.contains(sessionID)
-                                && message.id == "active-\(sessionID)"
-                        } ?? false
-                    )
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(model.messages) { message in
+                        MessageView(
+                            message: message,
+                            isStreaming: model.selectedSessionID.map { sessionID in
+                                model.runningSessionIDs.contains(sessionID)
+                                    && message.id == "active-\(sessionID)"
+                            } ?? false
+                        )
+                    }
+                    Color.clear
+                        .frame(height: 0)
+                        .id(messageListEndID)
+                }
+                .padding(24)
+            }
+            .scrollIndicators(.hidden)
+            .onAppear {
+                DispatchQueue.main.async {
+                    proxy.scrollTo(messageListEndID, anchor: .bottom)
                 }
             }
-            .padding(24)
+            .onChange(of: model.messages.count) { _ in
+                DispatchQueue.main.async {
+                    proxy.scrollTo(messageListEndID, anchor: .bottom)
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-private struct ChatScrollView<Content: View>: NSViewRepresentable {
-    let itemCount: Int
-    let content: Content
-
-    init(itemCount: Int, @ViewBuilder content: () -> Content) {
-        self.itemCount = itemCount
-        self.content = content()
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(itemCount: itemCount)
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView(frame: .zero)
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.verticalScrollElasticity = .automatic
-        scrollView.horizontalScrollElasticity = .none
-
-        let hostingView = NSHostingView(rootView: content)
-        hostingView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = hostingView
-
-        let clipView = scrollView.contentView
-        NSLayoutConstraint.activate([
-            hostingView.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
-            hostingView.topAnchor.constraint(equalTo: clipView.topAnchor),
-            hostingView.widthAnchor.constraint(equalTo: clipView.widthAnchor),
-            hostingView.heightAnchor.constraint(greaterThanOrEqualTo: clipView.heightAnchor),
-        ])
-        context.coordinator.hostingView = hostingView
-
-        DispatchQueue.main.async { [weak scrollView] in
-            if let scrollView {
-                context.coordinator.scrollToBottom(in: scrollView)
-            }
-        }
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.hostingView?.rootView = content
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-
-        guard context.coordinator.itemCount != itemCount else { return }
-        context.coordinator.itemCount = itemCount
-        DispatchQueue.main.async { [weak scrollView] in
-            if let scrollView {
-                context.coordinator.scrollToBottom(in: scrollView)
-            }
-        }
-    }
-
-    final class Coordinator {
-        var itemCount: Int
-        weak var hostingView: NSHostingView<Content>?
-
-        init(itemCount: Int) {
-            self.itemCount = itemCount
-        }
-
-        func scrollToBottom(in scrollView: NSScrollView) {
-            scrollView.layoutSubtreeIfNeeded()
-            guard let documentView = scrollView.documentView else { return }
-            let maximumY = max(
-                0,
-                documentView.frame.height - scrollView.contentView.bounds.height
-            )
-            scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: maximumY))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-        }
     }
 }
 
@@ -806,6 +745,11 @@ private struct ComposerView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+        .onExitCommand {
+            if isRunning {
+                model.cancelRun()
+            }
+        }
     }
 
     private var isRunning: Bool {
@@ -1351,6 +1295,7 @@ private struct AgentModelPickerView: View {
     let onDismiss: () -> Void
     @State private var highlightedAgent: BackendKind
     @State private var hoveredAgent: BackendKind?
+    @State private var modelSearchText = ""
 
     init(initialAgent: BackendKind, onDismiss: @escaping () -> Void) {
         self.onDismiss = onDismiss
@@ -1385,6 +1330,7 @@ private struct AgentModelPickerView: View {
                     Spacer(minLength: 0)
                     Button {
                         highlightedAgent = provider.kind
+                        modelSearchText = ""
                     } label: {
                         Image(provider.kind.iconAssetName)
                             .resizable()
@@ -1428,13 +1374,45 @@ private struct AgentModelPickerView: View {
         return .clear
     }
 
+    private var filteredModels: [ModelInfo] {
+        let normalizedSearchText = modelSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSearchText.isEmpty else {
+            return highlightedProvider?.models ?? []
+        }
+        return (highlightedProvider?.models ?? []).filter {
+            $0.name.localizedCaseInsensitiveContains(normalizedSearchText)
+                || $0.id.localizedCaseInsensitiveContains(normalizedSearchText)
+        }
+    }
+
+    private var modelsByProvider: [(providerID: String, models: [ModelInfo])] {
+        let modelsByProviderID = Dictionary(grouping: filteredModels) { model in
+            model.id.split(separator: "/", maxSplits: 1).first.map(String.init) ?? highlightedAgent.displayName
+        }
+        return modelsByProviderID
+            .map { (providerID: $0.key, models: $0.value.sorted { $0.name < $1.name }) }
+            .sorted { $0.providerID < $1.providerID }
+    }
+
     private var modelList: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("模型")
                 .font(DiscoTheme.Typography.captionEmphasized)
                 .foregroundStyle(.secondary)
 
-            if let highlightedProvider, !highlightedProvider.models.isEmpty {
+            if highlightedProvider?.isLoadingModels == true {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在加载模型")
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(.top, 8)
+            } else if let highlightedProvider, !highlightedProvider.models.isEmpty {
+                TextField("搜索模型", text: $modelSearchText)
+                    .textFieldStyle(.roundedBorder)
+
                 List {
                     PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == nil) {
                         selectModel(nil)
@@ -1444,21 +1422,32 @@ private struct AgentModelPickerView: View {
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                     .listRowBackground(Color.clear)
 
-                    ForEach(highlightedProvider.models) { modelInfo in
-                        PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == modelInfo.id) {
-                            selectModel(modelInfo.id)
-                        } label: {
-                            Text(modelInfo.name)
-                                .lineLimit(1)
+                    ForEach(modelsByProvider, id: \.providerID) { providerModels in
+                        Section(providerModels.providerID) {
+                            ForEach(providerModels.models) { modelInfo in
+                                PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == modelInfo.id) {
+                                    selectModel(modelInfo.id)
+                                } label: {
+                                    Text(modelInfo.name)
+                                        .lineLimit(1)
+                                }
+                                .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                                .listRowBackground(Color.clear)
+                            }
                         }
-                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
-                        .listRowBackground(Color.clear)
+                    }
+
+                    if modelsByProvider.isEmpty {
+                        Text("未找到匹配的模型")
+                            .foregroundStyle(.secondary)
+                            .listRowBackground(Color.clear)
                     }
                 }
                 .listStyle(.inset)
                 .scrollContentBackground(.hidden)
+                .scrollIndicators(.hidden)
             } else {
-                Text("暂无模型")
+                Text(highlightedProvider?.modelLoadFailureDescription ?? "暂无模型")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .padding(.top, 8)

@@ -312,14 +312,34 @@ private struct ProviderRowLabel: View {
                 .font(DiscoTheme.Typography.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+
+                if provider.isLoadingModels {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在加载模型")
+                    }
+                    .font(DiscoTheme.Typography.caption)
+                    .foregroundStyle(.secondary)
+                } else if let modelLoadFailureDescription = provider.modelLoadFailureDescription {
+                    Text(modelLoadFailureDescription)
+                        .font(DiscoTheme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                } else if provider.available, provider.models.isEmpty {
+                    Text("未发现可用模型")
+                        .font(DiscoTheme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Spacer(minLength: 16)
 
-            Image(systemName: "chevron.right")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(isExpanded ? DiscoTheme.Palette.accent : .secondary)
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            if !provider.models.isEmpty, !provider.isLoadingModels {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(isExpanded ? DiscoTheme.Palette.accent : .secondary)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 11)
