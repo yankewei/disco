@@ -4,15 +4,15 @@ import SwiftUI
 enum DiscoTheme {
     enum Palette {
         static let canvas = dynamicColor(
-            light: NSColor(calibratedRed: 0.930, green: 0.925, blue: 0.900, alpha: 1),
+            light: .white,
             dark: NSColor(calibratedRed: 0.105, green: 0.115, blue: 0.165, alpha: 1)
         )
         static let surface = dynamicColor(
-            light: NSColor(calibratedRed: 0.985, green: 0.978, blue: 0.945, alpha: 1),
+            light: .white,
             dark: NSColor(calibratedRed: 0.135, green: 0.145, blue: 0.205, alpha: 1)
         )
         static let sidebar = dynamicColor(
-            light: NSColor(calibratedRed: 0.900, green: 0.895, blue: 0.870, alpha: 1),
+            light: .white,
             dark: NSColor(calibratedRed: 0.125, green: 0.135, blue: 0.185, alpha: 1)
         )
         static let insetSurface = dynamicColor(
