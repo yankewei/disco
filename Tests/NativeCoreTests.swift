@@ -1009,3 +1009,168 @@ final class OpenCodeStartupTests: XCTestCase {
     """#
 }
 
+final class OpenCodeSharedServerTests: XCTestCase {
+    func testConcurrentRunsShareOneServerWithoutMixingEvents() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("provider")
+        try Self.sharedServerScript.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+
+        let backend = OpenCodeBackend(executableURL: executable)
+        defer { backend.shutdown() }
+
+        let first = Task { try await self.runPrompt(backend: backend, directory: directory) }
+        let second = Task { try await self.runPrompt(backend: backend, directory: directory) }
+        let (firstRun, secondRun) = try await (first.value, second.value)
+
+        // 同一目录下的两个会话共用一个常驻服务和一条事件流，回答不能互相串台
+        XCTAssertNotEqual(firstRun.threadID, secondRun.threadID)
+        XCTAssertEqual(firstRun.texts, ["回答 \(firstRun.threadID)"])
+        XCTAssertEqual(secondRun.texts, ["回答 \(secondRun.threadID)"])
+
+        let log = try String(
+            contentsOf: directory.appendingPathComponent("requests.jsonl"),
+            encoding: .utf8
+        )
+        let paths = try log.split(separator: "\n").map {
+            try JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+        }.compactMap { jsonString($0.objectValue?["path"]) }
+        XCTAssertEqual(paths.filter { $0 == "/global/health" }.count, 1)
+        let streams = paths.filter { $0.hasPrefix("/event?directory=") }
+        XCTAssertEqual(streams.count, 2)
+        for stream in streams {
+            XCTAssertEqual(
+                String(stream.dropFirst("/event?directory=".count)).removingPercentEncoding,
+                directory.path
+            )
+        }
+        // 两次 prompt 都在两条事件流建立之后才提交，所以每个 run 都确实收到了
+        // 另一个会话和陌生会话的 part 事件；上面的精确断言才有意义
+        XCTAssertEqual(paths.filter { $0.contains("prompt_async") }.count, 2)
+        let lastStream = paths.lastIndex { $0.hasPrefix("/event") } ?? -1
+        let firstPrompt = paths.firstIndex { $0.contains("prompt_async") } ?? .max
+        XCTAssertLessThan(lastStream, firstPrompt)
+    }
+
+    private func runPrompt(
+        backend: OpenCodeBackend,
+        directory: URL
+    ) async throws -> (threadID: String, texts: [String]) {
+        let collector = EmittedTexts()
+        let cancellation = CancellationToken()
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            cancellation.cancel()
+        }
+        defer { timeout.cancel() }
+        let threadID = try await backend.run(context: BackendRunContext(
+            agentThreadID: nil,
+            modelID: nil,
+            reasoningEffort: nil,
+            sandboxMode: nil,
+            workingDirectory: directory.path,
+            prompt: "开始",
+            mode: .agent,
+            emit: collector.record,
+            cancellation: cancellation,
+            reportAgentThreadID: { _ in },
+            requestUserInput: { _ in nil },
+            requestApproval: { _, _, _ in .denied }
+        ))
+        return (threadID, collector.texts)
+    }
+
+    private final class EmittedTexts {
+        private let lock = NSLock()
+        private var values: [String] = []
+
+        func record(_ event: BackendEvent) {
+            guard case let .item(.text(_, text, _)) = event else { return }
+            lock.withLock { values.append(text) }
+        }
+
+        var texts: [String] {
+            lock.withLock { values }
+        }
+    }
+
+    private static let sharedServerScript = #"""
+    #!/usr/bin/python3
+    import itertools, json, os, queue, sys, time
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse
+    log = os.path.join(os.path.dirname(__file__), "requests.jsonl")
+    def record(value):
+        with open(log, "a") as file:
+            file.write(json.dumps(value) + "\n")
+    sessions = itertools.count(1)
+    subscribers = []
+    def publish(event):
+        # 真实 /event 按目录广播：同目录的每个订阅者都会收到全部会话的事件
+        for received in list(subscribers):
+            received.put(event)
+    def part(session_id, text):
+        return {"type": "message.part.updated", "properties": {
+            "sessionID": session_id,
+            "time": 1,
+            "part": {
+                "id": "prt_" + session_id,
+                "sessionID": session_id,
+                "messageID": "msg_" + session_id,
+                "type": "text",
+                "text": text,
+                "time": {"start": 1, "end": 2},
+            },
+        }}
+    def wait_for_both_subscribers():
+        deadline = time.time() + 5
+        while len(subscribers) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            record({"path": self.path})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream" if parsed.path == "/event" else "application/json")
+            self.end_headers()
+            if parsed.path != "/event":
+                self.wfile.write(b"{}")
+                return
+            self.wfile.write(b'data: {"type":"server.connected","properties":{}}\n\n')
+            self.wfile.flush()
+            received = queue.Queue()
+            subscribers.append(received)
+            try:
+                while True:
+                    self.wfile.write(("data: " + json.dumps(received.get()) + "\n\n").encode())
+                    self.wfile.flush()
+            finally:
+                subscribers.remove(received)
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            record({"path": self.path})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if parsed.path == "/session":
+                self.wfile.write(json.dumps({"id": "ses_%d" % next(sessions)}).encode())
+                return
+            self.wfile.write(b"{}")
+            if not parsed.path.endswith("prompt_async"):
+                return
+            session_id = parsed.path.split("/")[2]
+            wait_for_both_subscribers()
+            publish(part(session_id, "回答 " + session_id))
+            publish(part("ses_intruder", "别的会话的回答"))
+            publish({"type": "session.status", "properties": {"sessionID": session_id, "status": {"type": "idle"}}})
+    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()
+    """#
+}
+

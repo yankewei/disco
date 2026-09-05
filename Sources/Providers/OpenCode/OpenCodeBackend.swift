@@ -425,6 +425,10 @@ final class OpenCodeBackend: AgentBackend {
             let type = jsonString(payload["type"]),
             let properties = jsonObject(payload["properties"])
         else { return false }
+        // The server scopes /event by directory, so only sessions in this
+        // directory share the stream, and every event handled below carries
+        // sessionID at the top level. session.error may omit it: an unattributed
+        // error belongs to the whole directory, not to some other run.
         if let eventSessionID = jsonString(properties["sessionID"]), eventSessionID != sessionID {
             return false
         }
