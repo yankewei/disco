@@ -28,7 +28,7 @@ Sources/
 └── Infrastructure/       环境、SQLite、进程和 JSON-RPC 传输实现
 Resources/                Info.plist 与应用图标
 Tests/                    原生单元测试
-Disco.xcodeproj/          Xcode 工程
+Disco.xcodeproj/          Xcode 工程（XcodeGen 生成，不纳入版本控制）
 project.yml               XcodeGen 工程配置
 ```
 
@@ -45,7 +45,7 @@ xcodebuild -project Disco.xcodeproj -scheme Disco -configuration Debug -sdk maco
 xcodebuild test -project Disco.xcodeproj -scheme Disco -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
 ```
 
-也可以直接用 Xcode 打开 `Disco.xcodeproj`。修改 `project.yml` 后重新运行 XcodeGen。
+工程文件不纳入版本控制，克隆后必须先运行一次 XcodeGen；仓库里只保留 `Package.resolved` 锁定依赖版本。生成之后也可以直接用 Xcode 打开 `Disco.xcodeproj`，修改 `project.yml` 后重新运行 XcodeGen。
 
 ## 数据迁移
 

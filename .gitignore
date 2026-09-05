@@ -6,6 +6,12 @@ DerivedData/
 .reasonix/
 .DS_Store
 
+# XcodeGen 生成物，源头是 project.yml。逐个文件忽略而不是忽略整个目录，
+# 这样 Package.resolved 这个依赖锁定文件仍然可以跟踪。
+Disco.xcodeproj/project.pbxproj
+Disco.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+Disco.xcodeproj/xcshareddata/xcschemes/
+
 # 测试覆盖率产物
 *.profraw
 
