@@ -322,19 +322,22 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertEqual(storedSession.agentThreadID, session.agentThreadID)
         XCTAssertEqual(storedSession.activatedAt, "2026-01-01T00:00:01Z")
 
-        try store.updateSessionModel(
+        try store.updateSessionSettings(
             sessionID: session.id,
-            modelID: "gpt-5",
-            reasoningEffort: .medium
+            reasoningEffort: .medium,
+            sandboxMode: .readOnly
         )
-        XCTAssertEqual(try store.session(id: session.id)?.modelID, "gpt-5")
-        XCTAssertEqual(try store.session(id: session.id)?.reasoningEffort, .medium)
-        try store.updateSessionModel(
+        let updatedSession = try XCTUnwrap(store.session(id: session.id))
+        XCTAssertEqual(updatedSession.modelID, session.modelID)
+        XCTAssertEqual(updatedSession.agentThreadID, session.agentThreadID)
+        XCTAssertEqual(updatedSession.reasoningEffort, .medium)
+        XCTAssertEqual(updatedSession.sandboxMode, .readOnly)
+        try store.updateSessionSettings(
             sessionID: session.id,
-            modelID: nil,
-            reasoningEffort: nil
+            reasoningEffort: nil,
+            sandboxMode: .workspaceWrite
         )
-        XCTAssertNil(try store.session(id: session.id)?.modelID)
+        XCTAssertEqual(try store.session(id: session.id)?.modelID, session.modelID)
         XCTAssertNil(try store.session(id: session.id)?.reasoningEffort)
 
         let firstAgentSelection = LastAgentSelection(
@@ -353,8 +356,35 @@ final class NativeCoreTests: XCTestCase {
         try store.saveLastAgentSelection(latestAgentSelection)
         XCTAssertEqual(try store.lastAgentSelection(), latestAgentSelection)
 
+        store.close()
+
+        let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
+        XCTAssertEqual(try reopenedStore.lastAgentSelection(), latestAgentSelection)
+        let reopenedSession = try XCTUnwrap(reopenedStore.session(id: session.id))
+        XCTAssertEqual(reopenedSession.modelID, session.modelID)
+        XCTAssertEqual(reopenedSession.agentThreadID, session.agentThreadID)
+        XCTAssertNil(reopenedSession.reasoningEffort)
+        XCTAssertEqual(reopenedSession.sandboxMode, .workspaceWrite)
+        reopenedStore.close()
+    }
+
+    func testSQLiteStoreUpdatesEmptySessionProviderAndModel() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let databaseURL = folder.appendingPathComponent("disco.sqlite")
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let store = try SQLiteStore(databaseURL: databaseURL)
+        let project = ProjectInfo(
+            projectID: "project-empty",
+            name: "Disco",
+            projectPath: "/tmp/disco",
+            createdAt: "2026-01-01T00:00:00Z",
+            activatedAt: nil
+        )
+        try store.createProject(project)
         let emptySession = SessionInfo(
-            sessionID: "empty-session-1",
+            sessionID: "empty-session",
             projectID: project.id,
             agent: .codex,
             modelID: "o3",
@@ -362,20 +392,37 @@ final class NativeCoreTests: XCTestCase {
             sandboxMode: .workspaceWrite,
             agentThreadID: nil,
             title: "新对话",
-            createdAt: "2026-01-01T00:00:02Z",
+            createdAt: "2026-01-01T00:00:00Z",
             activatedAt: nil
         )
         try store.createSession(emptySession)
+
+        // 空会话可以切换 Provider，切换后原模型与推理深度应被清空。
         try store.updateSessionAgent(sessionID: emptySession.id, agent: .opencode)
-        let updatedSession = try XCTUnwrap(store.session(id: emptySession.id))
-        XCTAssertEqual(updatedSession.agent, .opencode)
-        XCTAssertNil(updatedSession.modelID)
-        XCTAssertNil(updatedSession.reasoningEffort)
+        let switched = try XCTUnwrap(store.session(id: emptySession.id))
+        XCTAssertEqual(switched.agent, .opencode)
+        XCTAssertNil(switched.modelID)
+        XCTAssertNil(switched.reasoningEffort)
+        XCTAssertEqual(switched.agentThreadID, emptySession.agentThreadID)
 
+        // 空会话也可以重新选择模型与推理深度。
+        try store.updateSessionModel(
+            sessionID: emptySession.id,
+            modelID: "anthropic/claude",
+            reasoningEffort: .medium
+        )
+        let modeled = try XCTUnwrap(store.session(id: emptySession.id))
+        XCTAssertEqual(modeled.agent, .opencode)
+        XCTAssertEqual(modeled.modelID, "anthropic/claude")
+        XCTAssertEqual(modeled.reasoningEffort, .medium)
+
+        // 重新打开后设置仍然保留。
         store.close()
-
         let reopenedStore = try SQLiteStore(databaseURL: databaseURL)
-        XCTAssertEqual(try reopenedStore.lastAgentSelection(), latestAgentSelection)
+        let reopened = try XCTUnwrap(reopenedStore.session(id: emptySession.id))
+        XCTAssertEqual(reopened.agent, .opencode)
+        XCTAssertEqual(reopened.modelID, "anthropic/claude")
+        XCTAssertEqual(reopened.reasoningEffort, .medium)
         reopenedStore.close()
     }
 
@@ -519,3 +566,159 @@ final class NativeCoreTests: XCTestCase {
         return statement
     }
 }
+
+final class PlanModeTests: XCTestCase {
+    func testCodexPlanAndBuildUseNativeModesAndReplyToQuestions() async throws {
+        try await verifyModeSwitch(backendKind: .codex)
+    }
+
+    func testOpenCodePlanAndBuildSelectAgentsAndReplyToQuestions() async throws {
+        try await verifyModeSwitch(backendKind: .opencode)
+    }
+
+    func testCodexSkippedQuestionsReturnEmptyAnswers() async throws {
+        try await verifyModeSwitch(backendKind: .codex, skipsQuestions: true)
+    }
+
+    func testOpenCodeSkippedQuestionsRejectRequest() async throws {
+        try await verifyModeSwitch(backendKind: .opencode, skipsQuestions: true)
+    }
+
+    private func verifyModeSwitch(backendKind: BackendKind, skipsQuestions: Bool = false) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("provider")
+        try Self.providerScript.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let backend: AgentBackend = backendKind == .codex
+            ? CodexBackend(executableURL: executable)
+            : OpenCodeBackend(executableURL: executable)
+        defer { backend.shutdown() }
+        XCTAssertTrue(backend.supportsPlan)
+        for mode in [RunMode.plan, .agent] {
+            let cancellation = CancellationToken()
+            let timeout = Task {
+                try await Task.sleep(nanoseconds: 15_000_000_000)
+                cancellation.cancel()
+            }
+            defer { timeout.cancel() }
+            var questionCount = 0
+            let threadID = try await backend.run(context: BackendRunContext(
+                agentThreadID: mode == .plan ? nil : "thread",
+                modelID: nil,
+                reasoningEffort: .medium,
+                sandboxMode: nil,
+                workingDirectory: directory.path,
+                prompt: "制定计划",
+                mode: mode,
+                emit: { _ in },
+                cancellation: cancellation,
+                reportAgentThreadID: { XCTAssertEqual($0, "thread") },
+                requestUserInput: { questions in
+                    questionCount += 1
+                    XCTAssertEqual(questions.count, 1)
+                    XCTAssertEqual(questions.first?.title, "选择方案")
+                    XCTAssertEqual(questions.first?.options.first?.label, "方案 A")
+                    return skipsQuestions ? nil : [["方案 A"]]
+                },
+                requestApproval: { _, _, _ in .denied }
+            ))
+            XCTAssertEqual(threadID, "thread")
+            XCTAssertEqual(questionCount, 1)
+        }
+        let log = try String(contentsOf: directory.appendingPathComponent("requests.jsonl"), encoding: .utf8)
+        let records = try log.split(separator: "\n").map {
+            try JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+        }.compactMap(\.objectValue)
+        if backendKind == .codex {
+            let initialization = try XCTUnwrap(records.first { jsonString($0["method"]) == "initialize" })
+            XCTAssertEqual(jsonObject(jsonObject(initialization["params"])?["capabilities"])?["experimentalApi"], .boolean(true))
+            let turns = records.filter { jsonString($0["method"]) == "turn/start" }
+            XCTAssertEqual(turns.count, 2)
+            for (index, turn) in turns.enumerated() {
+                let mode = try XCTUnwrap(jsonObject(jsonObject(turn["params"])?["collaborationMode"]))
+                XCTAssertEqual(mode["mode"], .string(index == 0 ? "plan" : "default"))
+                let settings = try XCTUnwrap(jsonObject(mode["settings"]))
+                XCTAssertEqual(settings["model"], .string("resolved-model"))
+                XCTAssertEqual(settings["reasoning_effort"], .string("medium"))
+                XCTAssertEqual(settings["developer_instructions"], .null)
+            }
+            let replies = records.filter { $0["id"] == .string("question") }
+            XCTAssertEqual(replies.count, 2)
+            XCTAssertEqual(jsonObject(jsonObject(jsonObject(replies.first?["result"])?["answers"])?["choice"])?["answers"], .array(skipsQuestions ? [] : [.string("方案 A")]))
+        } else {
+            let prompts = records.filter { jsonString($0["path"])?.contains("prompt_async") == true }
+            XCTAssertEqual(prompts.count, 2)
+            XCTAssertEqual(jsonObject(prompts.first?["body"])?["agent"], .string("plan"))
+            XCTAssertEqual(jsonObject(prompts.last?["body"])?["agent"], .string("build"))
+            let action = skipsQuestions ? "reject" : "reply"
+            let replies = records.filter { jsonString($0["path"])?.contains("question/question/\(action)") == true }
+            XCTAssertEqual(replies.count, 2)
+            if skipsQuestions {
+                XCTAssertEqual(replies.first?["body"], .null)
+            } else {
+                XCTAssertEqual(jsonObject(replies.first?["body"])?["answers"], .array([.array([.string("方案 A")])]))
+            }
+            XCTAssertEqual(jsonString(replies.last?["path"]), "/api/session/thread/question/question/\(action)")
+        }
+    }
+
+    private static let providerScript = #"""
+    #!/usr/bin/python3
+    import json, sys, os, queue
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse
+    log = os.path.join(os.path.dirname(__file__), "requests.jsonl")
+    def record(value):
+        with open(log, "a") as file:
+            file.write(json.dumps(value) + "\n")
+    question = {"id": "choice", "header": "方案", "question": "选择方案", "options": [{"label": "方案 A", "description": "简洁实现"}]}
+    if "serve" not in sys.argv:
+        def send(value):
+            print(json.dumps(value), flush=True)
+        for line in sys.stdin:
+            request = json.loads(line)
+            record(request)
+            method = request.get("method")
+            if method == "initialized":
+                continue
+            if method == "turn/start":
+                send({"id": request["id"], "result": {"turn": {"id": "turn"}}})
+                send({"id": "question", "method": "item/tool/requestUserInput", "params": {"threadId": "thread", "questions": [question]}})
+            elif method is None:
+                send({"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "turn", "status": "completed"}}})
+            else:
+                send({"id": request["id"], "result": {"thread": {"id": "thread"}, "model": "resolved-model"}})
+    else:
+        events = queue.Queue()
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream" if urlparse(self.path).path == "/event" else "application/json")
+                self.end_headers()
+                if urlparse(self.path).path != "/event":
+                    self.wfile.write(b"{}")
+                    return
+                self.wfile.write(b'data: {"type":"server.connected","properties":{}}\n\n')
+                self.wfile.flush()
+                while True:
+                    self.wfile.write(("data: " + json.dumps(events.get()) + "\n\n").encode())
+                    self.wfile.flush()
+            def do_POST(self):
+                path = urlparse(self.path).path
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"null")
+                record({"path": path, "body": body})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"thread"}')
+                if path.endswith("prompt_async"):
+                    events.put({"type": "question.asked" if body["agent"] == "plan" else "question.v2.asked", "properties": {"id": "question", "sessionID": "thread", "questions": [question]}})
+                elif path.endswith(("reply", "reject")):
+                    events.put({"type": "session.idle", "properties": {"sessionID": "thread"}})
+        ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()
+    """#
+}
+

@@ -134,6 +134,17 @@ final class CodexBackend: AgentBackend {
         if let reasoningEffort = context.reasoningEffort {
             turnParams["effort"] = .string(reasoningEffort.rawValue)
         }
+        guard let model = context.modelID ?? jsonString(jsonObject(threadResponse)?["model"]) else {
+            throw CodexBackendError.invalidResponse("Codex 未返回当前模型")
+        }
+        turnParams["collaborationMode"] = .object([
+            "mode": .string(context.mode == .plan ? "plan" : "default"),
+            "settings": .object([
+                "model": .string(model),
+                "reasoning_effort": context.reasoningEffort.map { .string($0.rawValue) } ?? .null,
+                "developer_instructions": .null,
+            ]),
+        ])
         let turnResponse = try await appServer.request(
             method: "turn/start",
             params: turnParams
@@ -227,7 +238,7 @@ final class CodexBackend: AgentBackend {
                     "title": .string("Disco"),
                     "version": .string("0.1.0"),
                 ]),
-                "capabilities": .object(["experimentalApi": .boolean(false)]),
+                "capabilities": .object(["experimentalApi": .boolean(true)]),
             ])
             try appServer.notify(method: "initialized")
             try withStateLock {
@@ -677,6 +688,34 @@ final class CodexBackend: AgentBackend {
         }
 
         switch request.method {
+        case "item/tool/requestUserInput":
+            let questions = jsonArray(params["questions"]).compactMap { value -> UserInputQuestion? in
+                guard let question = jsonObject(value),
+                      let id = jsonString(question["id"]),
+                      let title = jsonString(question["question"])
+                else { return nil }
+                return UserInputQuestion(
+                    id: id,
+                    title: title,
+                    options: jsonArray(question["options"]).compactMap { value in
+                        guard let option = jsonObject(value), let label = jsonString(option["label"]) else { return nil }
+                        return .init(label: label, description: jsonString(option["description"]) ?? "")
+                    },
+                    allowsMultiple: false,
+                    allowsCustom: true,
+                    isSecret: question["isSecret"] == .boolean(true)
+                )
+            }
+            guard !questions.isEmpty, questions.count == jsonArray(params["questions"]).count else {
+                throw CodexBackendError.invalidResponse("Codex 返回了无效的问题")
+            }
+            let answers = await activeRun.context.requestUserInput(questions)
+            var response: [String: JSONValue] = [:]
+            for (index, question) in questions.enumerated() {
+                let answer = answers.flatMap { $0.indices.contains(index) ? $0[index] : nil } ?? []
+                response[question.id] = .object(["answers": .array(answer.map { .string($0) })])
+            }
+            return .object(["answers": .object(response)])
         case "item/commandExecution/requestApproval":
             return try await commandApproval(activeRun, params: params, legacy: false)
         case "execCommandApproval":

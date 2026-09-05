@@ -10,6 +10,7 @@ final class AgentHost {
     private var executableURLs: [BackendKind: URL]
     private let stateLock = NSLock()
     private var activeRuns: [String: ActiveRun] = [:]
+    private var pendingUserInputs: [String: PendingUserInput] = [:]
     private var pendingApprovals: [String: PendingApproval] = [:]
     private var deletingProjectIDs: Set<String> = []
     private var deletingSessionIDs: Set<String> = []
@@ -74,6 +75,34 @@ final class AgentHost {
         try store.saveLastAgentSelection(selection)
     }
 
+    func updateSessionSettings(
+        sessionID: String,
+        reasoningEffort: ReasoningEffort?,
+        sandboxMode: SandboxMode?
+    ) throws {
+        guard try store.session(id: sessionID) != nil else {
+            throw AgentHostError.sessionNotFound
+        }
+        try store.updateSessionSettings(
+            sessionID: sessionID,
+            reasoningEffort: reasoningEffort,
+            sandboxMode: sandboxMode
+        )
+    }
+
+    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
+        guard let session = try store.session(id: sessionID) else {
+            throw AgentHostError.sessionNotFound
+        }
+        guard session.agentThreadID == nil else {
+            throw AgentHostError.sessionHasAgentConversation
+        }
+        guard backend(for: agent) != nil else {
+            throw AgentHostError.providerUnavailable(agent.displayName)
+        }
+        try store.updateSessionAgent(sessionID: sessionID, agent: agent)
+    }
+
     func updateSessionModel(
         sessionID: String,
         modelID: String?,
@@ -90,19 +119,6 @@ final class AgentHost {
             modelID: modelID,
             reasoningEffort: reasoningEffort
         )
-    }
-
-    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
-        guard let session = try store.session(id: sessionID) else {
-            throw AgentHostError.sessionNotFound
-        }
-        guard session.agentThreadID == nil else {
-            throw AgentHostError.sessionHasAgentConversation
-        }
-        guard backend(for: agent) != nil else {
-            throw AgentHostError.providerUnavailable(agent.displayName)
-        }
-        try store.updateSessionAgent(sessionID: sessionID, agent: agent)
     }
 
     func createSession(
@@ -359,6 +375,10 @@ final class AgentHost {
                         return
                     }
                 },
+                requestUserInput: { [weak self] questions in
+                    guard let self else { return nil }
+                    return await waitForUserInput(sessionID: sessionID, runID: runID, questions: questions)
+                },
                 requestApproval: { [weak self] toolName, title, input in
                     guard let self else { return .denied }
                     return await waitForApproval(
@@ -395,7 +415,7 @@ final class AgentHost {
     func cancel(sessionID: String) {
         let activeRun = withStateLock { activeRuns[sessionID] }
         activeRun?.cancellation.cancel()
-        clearApprovals(sessionID: sessionID, runID: activeRun?.runID)
+        clearPendingInteractions(sessionID: sessionID, runID: activeRun?.runID)
     }
 
     func approve(approvalID: String, decision: ApprovalDecision) {
@@ -431,6 +451,10 @@ final class AgentHost {
         }
         for approval in approvals.values {
             approval.continuation.resume(returning: .denied)
+        }
+        let inputIDs = withStateLock { Array(pendingUserInputs.keys) }
+        for id in inputIDs {
+            answerUserInput(id: id, answers: nil)
         }
         let backendList = withStateLock { Array(backends.values) }
         for backend in backendList {
@@ -477,7 +501,45 @@ final class AgentHost {
         }
     }
 
-    private func clearApprovals(sessionID: String, runID: String?) {
+    func answerUserInput(id: String, answers: [[String]]?) {
+        let pending = withStateLock { pendingUserInputs.removeValue(forKey: id) }
+        guard let pending else { return }
+        pending.continuation.resume(returning: answers)
+        eventHandler(.userInputResolved(id: id))
+    }
+
+    private func waitForUserInput(
+        sessionID: String,
+        runID: String,
+        questions: [UserInputQuestion]
+    ) async -> [[String]]? {
+        let request = UserInputRequest(id: UUID().uuidString, sessionID: sessionID, runID: runID, questions: questions)
+        return await withCheckedContinuation { continuation in
+            let activeRun = withStateLock { () -> ActiveRun? in
+                guard !isShuttingDown, let run = activeRuns[sessionID], run.runID == runID else { return nil }
+                pendingUserInputs[request.id] = PendingUserInput(request: request, continuation: continuation)
+                return run
+            }
+            guard let activeRun else {
+                continuation.resume(returning: nil)
+                return
+            }
+            eventHandler(.userInputRequested(request))
+            if activeRun.cancellation.isCancelled {
+                answerUserInput(id: request.id, answers: nil)
+            }
+        }
+    }
+
+    private func clearPendingInteractions(sessionID: String, runID: String?) {
+        let inputIDs = withStateLock {
+            pendingUserInputs.filter {
+                $0.value.request.sessionID == sessionID && (runID == nil || $0.value.request.runID == runID)
+            }.map(\.key)
+        }
+        for id in inputIDs {
+            answerUserInput(id: id, answers: nil)
+        }
         let approvals = withStateLock {
             let approvals = pendingApprovals.filter { $0.value.sessionID == sessionID && (runID == nil || $0.value.runID == runID) }
             for approvalID in approvals.keys {
@@ -522,7 +584,7 @@ final class AgentHost {
             self.shutdownWaiters.removeAll()
             return waiters
         }
-        clearApprovals(sessionID: sessionID, runID: runID)
+        clearPendingInteractions(sessionID: sessionID, runID: runID)
         for waiter in shutdownWaiters {
             waiter.resume()
         }
@@ -567,7 +629,7 @@ final class AgentHost {
             detail: "未找到 \(backendKind.displayName) 命令",
             version: nil,
             executablePath: nil,
-            supportsPlan: backendKind == .codex,
+            supportsPlan: true,
             isLoadingModels: false,
             models: [],
             modelLoadFailureDescription: nil
@@ -588,6 +650,11 @@ private final class ActiveRun {
         self.runID = runID
         self.cancellation = cancellation
     }
+}
+
+private struct PendingUserInput {
+    let request: UserInputRequest
+    let continuation: CheckedContinuation<[[String]]?, Never>
 }
 
 private struct PendingApproval {

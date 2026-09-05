@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class ManagedProcess {
@@ -52,18 +53,32 @@ final class ManagedProcess {
 
 func lineStream(from fileHandle: FileHandle) -> AsyncThrowingStream<String, Error> {
     AsyncThrowingStream { continuation in
-        let readerTask = Task {
+        // Pipe reads must not block Swift's cooperative executor or Foundation's shared async reader.
+        DispatchQueue.global(qos: .userInitiated).async {
+            var buffer = Data()
+            var bytes = [UInt8](repeating: 0, count: 4096)
             do {
-                for try await line in fileHandle.bytes.lines {
-                    continuation.yield(line)
+                while true {
+                    let count = Darwin.read(fileHandle.fileDescriptor, &bytes, bytes.count)
+                    if count == 0 { break }
+                    if count < 0 {
+                        if errno == EINTR { continue }
+                        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                    }
+                    buffer.append(contentsOf: bytes[..<count])
+                    while let newline = buffer.firstIndex(of: 0x0A) {
+                        let line = String(decoding: buffer[..<newline], as: UTF8.self)
+                        buffer.removeSubrange(...newline)
+                        if case .terminated = continuation.yield(line) { return }
+                    }
+                }
+                if !buffer.isEmpty {
+                    continuation.yield(String(decoding: buffer, as: UTF8.self))
                 }
                 continuation.finish()
             } catch {
                 continuation.finish(throwing: error)
             }
-        }
-        continuation.onTermination = { _ in
-            readerTask.cancel()
         }
     }
 }

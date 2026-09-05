@@ -30,6 +30,8 @@ enum AgentEvent {
         output: String?,
         error: String?
     )
+    case userInputRequested(UserInputRequest)
+    case userInputResolved(id: String)
     case approvalRequested(
         sessionID: String,
         runID: String,
@@ -100,6 +102,7 @@ struct BackendRunContext {
     let emit: (BackendEvent) -> Void
     let cancellation: CancellationToken
     let reportAgentThreadID: (String) -> Void
+    let requestUserInput: ([UserInputQuestion]) async -> [[String]]?
     let requestApproval: (
         _ toolName: String,
         _ title: String?,
@@ -118,4 +121,25 @@ protocol AgentBackend: AnyObject {
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage]
     func run(context: BackendRunContext) async throws -> String
     func shutdown()
+}
+
+struct UserInputQuestion: Identifiable {
+    let id: String
+    let title: String
+    let options: [Option]
+    let allowsMultiple: Bool
+    let allowsCustom: Bool
+    let isSecret: Bool
+
+    struct Option {
+        let label: String
+        let description: String
+    }
+}
+
+struct UserInputRequest: Identifiable {
+    let id: String
+    let sessionID: String
+    let runID: String
+    let questions: [UserInputQuestion]
 }

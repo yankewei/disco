@@ -317,7 +317,11 @@ private struct ConversationView: View {
                     VStack(spacing: 0) {
                         messageList(viewportWidth: geometry.size.width)
                         VStack(spacing: 0) {
+                            UserInputList()
                             ApprovalList()
+                            if model.canBeginImplementation {
+                                PlanHandoffBar()
+                            }
                             ComposerView(availableHeight: geometry.size.height)
                         }
                         .frame(maxWidth: chatColumnMaximumWidth)
@@ -617,6 +621,146 @@ private struct DiscoMarkdownParagraphStyle: StructuredText.ParagraphStyle {
     }
 }
 
+private struct UserInputList: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        ForEach(model.userInputRequests.filter { $0.sessionID == model.selectedSessionID }) { request in
+            UserInputCard(request: request)
+                .padding(.top, 12)
+        }
+    }
+}
+
+private struct UserInputCard: View {
+    @EnvironmentObject private var model: AppModel
+    let request: UserInputRequest
+    @State private var questionIndex = 0
+    @State private var answers: [[String]] = []
+    @State private var selectedLabels: Set<String> = []
+    @State private var customAnswer = ""
+
+    var body: some View {
+        if request.questions.indices.contains(questionIndex) {
+            let question = request.questions[questionIndex]
+            VStack(alignment: .leading, spacing: 10) {
+                Text(question.title)
+                    .font(DiscoTheme.Typography.bodyEmphasized)
+                    .textSelection(.enabled)
+                if request.questions.count > 1 {
+                    Text("问题 \(questionIndex + 1) / \(request.questions.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if question.allowsMultiple {
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                        Toggle(isOn: Binding(
+                            get: { selectedLabels.contains(option.label) },
+                            set: { selected in
+                                var labels = selectedLabels
+                                if selected { labels.insert(option.label) } else { labels.remove(option.label) }
+                                selectedLabels = labels
+                                customAnswer = ""
+                            }
+                        )) {
+                            Text(option.label)
+                            if !option.description.isEmpty {
+                                Text(option.description).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                } else if !question.options.isEmpty {
+                    Picker("选择回答", selection: Binding<String?>(
+                        get: { selectedLabels.first },
+                        set: { label in
+                            selectedLabels = Set(label.map { [$0] } ?? [])
+                            customAnswer = ""
+                        }
+                    )) {
+                        ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(option.label)
+                                if !option.description.isEmpty {
+                                    Text(option.description).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .tag(Optional(option.label))
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
+                }
+                if question.allowsCustom || question.options.isEmpty {
+                    if question.isSecret {
+                        SecureField("输入回答", text: $customAnswer)
+                    } else {
+                        TextField("输入回答", text: $customAnswer)
+                    }
+                }
+                HStack {
+                    Button("跳过") { model.answerUserInput(request, answers: nil) }
+                    Spacer()
+                    Button(questionIndex + 1 == request.questions.count ? "提交" : "下一题") {
+                        let custom = customAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let answer = custom.isEmpty
+                            ? question.options.map(\.label).filter { selectedLabels.contains($0) }
+                            : [custom]
+                        let updatedAnswers = answers + [answer]
+                        if questionIndex + 1 == request.questions.count {
+                            model.answerUserInput(request, answers: updatedAnswers)
+                        } else {
+                            answers = updatedAnswers
+                            questionIndex += 1
+                            selectedLabels = []
+                            customAnswer = ""
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedLabels.isEmpty && customAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onChange(of: customAnswer) { _, value in
+                if !value.isEmpty { selectedLabels = [] }
+            }
+            .padding(14)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+}
+
+private struct PlanHandoffBar: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "list.bullet.clipboard")
+                .foregroundStyle(DiscoTheme.Palette.accent)
+            Text("计划已生成，下一步开始实现")
+                .font(DiscoTheme.Typography.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("开始实现") {
+                model.beginImplementation()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, chatColumnContentPadding)
+        .padding(.vertical, 10)
+        .background(
+            DiscoTheme.Palette.surface,
+            in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
+                .strokeBorder(DiscoTheme.Palette.accent.opacity(0.35), lineWidth: 1)
+        }
+        .padding(.top, 10)
+        .help("切换到 Build 模式，按上面的计划开始实现")
+    }
+}
+
 private struct ApprovalList: View {
     @EnvironmentObject private var model: AppModel
 
@@ -766,8 +910,8 @@ private struct ComposerView: View {
         }
         .buttonStyle(.plain)
         .onHover { isModelControlHovered = $0 }
-        .disabled(isRunning)
-        .help("切换 Agent 和模型")
+        .disabled(isRunning || !model.canChooseProviderAndModel)
+        .help(model.canChooseProviderAndModel ? "切换 Agent 和模型" : "已有对话，不能切换模型")
         .background {
             ModelPickerPanelAnchor { anchorView in
                 modelPickerPanel.setAnchorView(anchorView)
@@ -849,6 +993,7 @@ private struct ComposerView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
             .background(model.planMode ? Color.clear : DiscoTheme.Palette.accent, in: Capsule())
+            .accessibilityValue(model.planMode ? "" : "已选择")
             .disabled(isRunning)
 
             Button("Plan") {
@@ -860,6 +1005,7 @@ private struct ComposerView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
             .background(model.planMode ? DiscoTheme.Palette.accent : Color.clear, in: Capsule())
+            .accessibilityValue(model.planMode ? "已选择" : "")
             .disabled(isRunning || !supportsPlan)
         }
         .padding(2)

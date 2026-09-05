@@ -17,6 +17,8 @@ final class AppModel: ObservableObject {
     @Published var selectedSandboxMode = defaultSandboxMode
     @Published var planMode = false
     @Published var runningSessionIDs: Set<String> = []
+    @Published private(set) var planCompletionSessionID: String?
+    @Published var userInputRequests: [UserInputRequest] = []
     @Published var approvalRequests: [ApprovalRequest] = []
     @Published var workspaceError: String?
     @Published var isLoading = false
@@ -32,6 +34,7 @@ final class AppModel: ObservableObject {
         modelID: nil,
         reasoningEffort: nil
     )
+    private var runModeBySession: [String: RunMode] = [:]
     private var isShuttingDown = false
 
     var selectedProject: ProjectInfo? {
@@ -49,6 +52,20 @@ final class AppModel: ObservableObject {
 
     var availableProviders: [ProviderInfo] {
         providers.filter(\.available)
+    }
+
+    /// 会话尚未开始 Agent 对话（空会话）时仍可调整 Provider / 模型；
+    /// 一旦已有对话记录，Provider / 模型就锁定为会话级选择，需新建会话再改。
+    var canChooseProviderAndModel: Bool {
+        guard let session = selectedSession else { return true }
+        return session.agentThreadID == nil && messages.isEmpty
+    }
+
+    /// 最近一次运行是成功的 Plan 且用户尚未接管时，可一键切到 Build 开始实现。
+    var canBeginImplementation: Bool {
+        guard let planCompletionSessionID, planCompletionSessionID == selectedSessionID else { return false }
+        guard !isRunning else { return false }
+        return draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     init() {
@@ -148,6 +165,7 @@ final class AppModel: ObservableObject {
         selectedProjectID = project.id
         selectedSessionID = nil
         messages = []
+        planCompletionSessionID = nil
         if let host {
             try? host.activateProject(projectID: project.id)
         }
@@ -260,6 +278,9 @@ final class AppModel: ObservableObject {
             try host.deleteProject(projectID: project.id)
             projects.removeAll { $0.id == project.id }
             sessionsByProject.removeValue(forKey: project.id)
+            if let pendingSessionID = planCompletionSessionID, sessionIDs.contains(pendingSessionID) {
+                planCompletionSessionID = nil
+            }
             approvalRequests.removeAll { sessionIDs.contains($0.sessionID) }
             for sessionID in sessionIDs {
                 activeTimelineBuilders.removeValue(forKey: sessionID)
@@ -285,6 +306,9 @@ final class AppModel: ObservableObject {
         do {
             try host.deleteSession(sessionID: session.id)
             sessionsByProject[session.projectID]?.removeAll { $0.id == session.id }
+            if planCompletionSessionID == session.id {
+                planCompletionSessionID = nil
+            }
             approvalRequests.removeAll { $0.sessionID == session.id }
             activeTimelineBuilders.removeValue(forKey: session.id)
             streamingRenderTasks.removeValue(forKey: session.id)?.cancel()
@@ -309,25 +333,20 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换 Provider"
             return
         }
-        if let session = selectedSession, session.agent != agent {
-            if session.agentThreadID == nil && messages.isEmpty {
-                guard let host else { return }
-                do {
-                    try host.updateSessionAgent(sessionID: session.id, agent: agent)
-                    if var sessions = sessionsByProject[session.projectID],
-                       let index = sessions.firstIndex(where: { $0.id == session.id })
-                    {
-                        sessions[index].agent = agent
-                        sessions[index].modelID = nil
-                        sessions[index].reasoningEffort = nil
-                        sessionsByProject[session.projectID] = sessions
-                    }
-                } catch {
-                    workspaceError = error.localizedDescription
-                    return
+        if let session = selectedSession {
+            guard canChooseProviderAndModel else { return }
+            guard session.agent != agent else { return }
+            guard let host else { return }
+            do {
+                try host.updateSessionAgent(sessionID: session.id, agent: agent)
+                reflectSession(id: session.id, in: session.projectID) { updated in
+                    updated.agent = agent
+                    updated.modelID = nil
+                    updated.reasoningEffort = nil
                 }
-            } else {
-                startNewSessionSelection()
+            } catch {
+                workspaceError = error.localizedDescription
+                return
             }
         }
         selectedAgent = agent
@@ -343,28 +362,23 @@ final class AppModel: ObservableObject {
             return
         }
         let nextReasoningEffort = modelID == selectedModelID ? selectedReasoningEffort : nil
-        if let session = selectedSession, session.modelID != modelID {
-            if session.agentThreadID == nil {
-                guard let host else { return }
-                do {
-                    try host.updateSessionModel(
-                        sessionID: session.id,
-                        modelID: modelID,
-                        reasoningEffort: nextReasoningEffort
-                    )
-                    if var sessions = sessionsByProject[session.projectID],
-                       let index = sessions.firstIndex(where: { $0.id == session.id })
-                    {
-                        sessions[index].modelID = modelID
-                        sessions[index].reasoningEffort = nextReasoningEffort
-                        sessionsByProject[session.projectID] = sessions
-                    }
-                } catch {
-                    workspaceError = error.localizedDescription
-                    return
+        if let session = selectedSession {
+            guard canChooseProviderAndModel else { return }
+            guard session.modelID != modelID else { return }
+            guard let host else { return }
+            do {
+                try host.updateSessionModel(
+                    sessionID: session.id,
+                    modelID: modelID,
+                    reasoningEffort: nextReasoningEffort
+                )
+                reflectSession(id: session.id, in: session.projectID) { updated in
+                    updated.modelID = modelID
+                    updated.reasoningEffort = nextReasoningEffort
                 }
-            } else {
-                startNewSessionSelection()
+            } catch {
+                workspaceError = error.localizedDescription
+                return
             }
         }
         selectedModelID = modelID
@@ -379,8 +393,21 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换推理深度"
             return
         }
-        if selectedSession != nil, selectedSession?.reasoningEffort != reasoningEffort {
-            startNewSessionSelection()
+        if let session = selectedSession {
+            guard let host else { return }
+            do {
+                try host.updateSessionSettings(
+                    sessionID: session.id,
+                    reasoningEffort: reasoningEffort,
+                    sandboxMode: session.sandboxMode
+                )
+                reflectSession(id: session.id, in: session.projectID) { updated in
+                    updated.reasoningEffort = reasoningEffort
+                }
+            } catch {
+                workspaceError = error.localizedDescription
+                return
+            }
         }
         selectedReasoningEffort = reasoningEffort
         lastAgentSelection.reasoningEffort = reasoningEffort
@@ -392,9 +419,21 @@ final class AppModel: ObservableObject {
             workspaceError = "运行期间不能切换权限"
             return
         }
-        let currentSandboxMode = selectedSession?.sandboxMode ?? defaultSandboxMode
-        if selectedSession != nil, currentSandboxMode != sandboxMode {
-            startNewSessionSelection()
+        if let session = selectedSession {
+            guard let host else { return }
+            do {
+                try host.updateSessionSettings(
+                    sessionID: session.id,
+                    reasoningEffort: session.reasoningEffort,
+                    sandboxMode: sandboxMode
+                )
+                reflectSession(id: session.id, in: session.projectID) { updated in
+                    updated.sandboxMode = sandboxMode
+                }
+            } catch {
+                workspaceError = error.localizedDescription
+                return
+            }
         }
         selectedSandboxMode = sandboxMode
     }
@@ -422,6 +461,11 @@ final class AppModel: ObservableObject {
     func cancelRun() {
         guard let selectedSessionID else { return }
         host?.cancel(sessionID: selectedSessionID)
+    }
+
+    func answerUserInput(_ request: UserInputRequest, answers: [[String]]?) {
+        userInputRequests.removeAll { $0.id == request.id }
+        host?.answerUserInput(id: request.id, answers: answers)
     }
 
     func approve(_ request: ApprovalRequest, decision: ApprovalDecision) {
@@ -459,6 +503,7 @@ final class AppModel: ObservableObject {
         selectedSessionID = nil
         messages = []
         planMode = false
+        planCompletionSessionID = nil
     }
 
     private var isRunning: Bool {
@@ -499,6 +544,10 @@ final class AppModel: ObservableObject {
         streamingRenderTasks.removeValue(forKey: session.id)?.cancel()
 
         let runMode: RunMode = planMode ? .plan : .agent
+        runModeBySession[session.id] = runMode
+        if planCompletionSessionID == session.id {
+            planCompletionSessionID = nil
+        }
         Task {
             await host.prompt(
                 sessionID: session.id,
@@ -508,12 +557,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Plan 运行完成后的“开始实现”：切到 Build 并向同一会话发送一条实现提示。
+    func beginImplementation() {
+        guard canBeginImplementation, let session = selectedSession, let host else { return }
+        planCompletionSessionID = nil
+        planMode = false
+        send(text: "请按照上面的计划开始实现。", to: session, using: host)
+    }
+
+    /// 会话配置变更后同步侧边栏缓存（不可在 SwiftUI 状态更新里直接改旧对象/旧集合）。
+    private func reflectSession(
+        id sessionID: String,
+        in projectID: String,
+        _ update: (inout SessionInfo) -> Void
+    ) {
+        guard var sessions = sessionsByProject[projectID],
+              let index = sessions.firstIndex(where: { $0.id == sessionID })
+        else { return }
+        update(&sessions[index])
+        sessionsByProject[projectID] = sessions
+    }
+
     fileprivate func handle(event: AgentEvent) {
         switch event {
         case let .runStarted(sessionID, _):
             runningSessionIDs.insert(sessionID)
             activeTimelineBuilders[sessionID] = TimelineBuilder()
             streamingRenderTasks.removeValue(forKey: sessionID)?.cancel()
+            if planCompletionSessionID == sessionID {
+                planCompletionSessionID = nil
+            }
         case let .sessionAgentThreadIDUpdated(sessionID, agentThreadID):
             updateSessionAgentThreadID(sessionID: sessionID, agentThreadID: agentThreadID)
         case let .text(sessionID, _, text, itemID):
@@ -533,6 +606,10 @@ final class AppModel: ObservableObject {
                 .tool(id: id, title: title, state: state, input: input, output: output, error: error),
                 sessionID: sessionID
             )
+        case let .userInputRequested(request):
+            userInputRequests.append(request)
+        case let .userInputResolved(id):
+            userInputRequests.removeAll { $0.id == id }
         case let .approvalRequested(sessionID, runID, approvalID, toolName, title, input):
             approvalRequests.append(
                 ApprovalRequest(
@@ -548,6 +625,12 @@ final class AppModel: ObservableObject {
             approvalRequests.removeAll { $0.id == approvalID }
         case let .runFinished(sessionID, _, status, sessionTitle, error):
             runningSessionIDs.remove(sessionID)
+            if status == .completed, runModeBySession[sessionID] == .plan,
+               !userInputRequests.contains(where: { $0.sessionID == sessionID })
+            {
+                planCompletionSessionID = sessionID
+            }
+            runModeBySession.removeValue(forKey: sessionID)
             streamingRenderTasks.removeValue(forKey: sessionID)?.cancel()
             if let selectedSessionID, selectedSessionID == sessionID {
                 if let sessionTitle {

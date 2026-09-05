@@ -255,6 +255,37 @@ final class SQLiteStore {
         try step(statement)
     }
 
+    func updateSessionSettings(
+        sessionID: String,
+        reasoningEffort: ReasoningEffort?,
+        sandboxMode: SandboxMode?
+    ) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare(
+            "UPDATE sessions SET reasoning_effort = ?, sandbox_mode = ? WHERE session_id = ?"
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(reasoningEffort?.rawValue, at: 1, in: statement)
+        try bind(sandboxMode?.rawValue, at: 2, in: statement)
+        try bind(sessionID, at: 3, in: statement)
+        try step(statement)
+    }
+
+    /// 仅允许在会话尚未开始 Agent 对话（agent_thread_id 为空）时调整其 Provider，
+    /// 换 Provider 会清空原模型与推理深度，避免跨 Provider 的模型残留。
+    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
+        databaseLock.lock()
+        defer { databaseLock.unlock() }
+        let statement = try prepare(
+            "UPDATE sessions SET agent = ?, model_id = NULL, reasoning_effort = NULL WHERE session_id = ?"
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(agent.rawValue, at: 1, in: statement)
+        try bind(sessionID, at: 2, in: statement)
+        try step(statement)
+    }
+
     func updateSessionModel(
         sessionID: String,
         modelID: String?,
@@ -269,18 +300,6 @@ final class SQLiteStore {
         try bind(modelID, at: 1, in: statement)
         try bind(reasoningEffort?.rawValue, at: 2, in: statement)
         try bind(sessionID, at: 3, in: statement)
-        try step(statement)
-    }
-
-    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
-        databaseLock.lock()
-        defer { databaseLock.unlock() }
-        let statement = try prepare(
-            "UPDATE sessions SET agent = ?, model_id = NULL, reasoning_effort = NULL WHERE session_id = ?"
-        )
-        defer { sqlite3_finalize(statement) }
-        try bind(agent.rawValue, at: 1, in: statement)
-        try bind(sessionID, at: 2, in: statement)
         try step(statement)
     }
 

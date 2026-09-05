@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 final class OpenCodeBackend: AgentBackend {
-    let supportsPlan = false
+    let supportsPlan = true
 
     private let executableURL: URL
     private let session: URLSession
@@ -143,6 +143,7 @@ final class OpenCodeBackend: AgentBackend {
         do {
             let modelSelection = parseModelSelection(context.modelID)
             var promptBody: [String: JSONValue] = [
+                "agent": .string(context.mode == .plan ? "plan" : "build"),
                 "parts": .array([
                     .object([
                         "type": .string("text"),
@@ -490,7 +491,37 @@ final class OpenCodeBackend: AgentBackend {
                 cancellation: cancellation
             )
         case "question.asked", "question.v2.asked":
-            throw OpenCodeBackendError.requestFailed("OpenCode 请求了暂不支持的交互式问题")
+            guard let requestID = jsonString(properties["id"]) else { return false }
+            let questions = jsonArray(properties["questions"]).enumerated().compactMap { index, value -> UserInputQuestion? in
+                guard let question = jsonObject(value), let title = jsonString(question["question"]) else { return nil }
+                return UserInputQuestion(
+                    id: String(index),
+                    title: title,
+                    options: jsonArray(question["options"]).compactMap { value in
+                        guard let option = jsonObject(value), let label = jsonString(option["label"]) else { return nil }
+                        return .init(label: label, description: jsonString(option["description"]) ?? "")
+                    },
+                    allowsMultiple: question["multiple"] == .boolean(true),
+                    allowsCustom: question["custom"] != .boolean(false),
+                    isSecret: false
+                )
+            }
+            guard !questions.isEmpty, questions.count == jsonArray(properties["questions"]).count else {
+                throw OpenCodeBackendError.invalidResponse("OpenCode 返回了无效的问题")
+            }
+            let answers = await context.requestUserInput(questions)
+            guard !cancellation.isCancelled else { return false }
+            let action = answers == nil ? "reject" : "reply"
+            let path = type == "question.v2.asked"
+                ? "/api/session/\(sessionID)/question/\(requestID)/\(action)"
+                : directoryPath("/question/\(requestID)/\(action)", directory: workingDirectory)
+            _ = try await requestJSON(
+                baseURL: baseURL,
+                path: path,
+                method: "POST",
+                body: answers.map { .object(["answers": .array($0.map { .array($0.map { .string($0) }) })]) },
+                cancellation: cancellation
+            )
         case "session.error":
             throw OpenCodeBackendError.backend(formatError(properties["error"]))
         case "session.idle":
