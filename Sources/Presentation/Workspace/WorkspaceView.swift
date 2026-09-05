@@ -10,6 +10,9 @@ private let chatColumnMaximumWidth: CGFloat = 720
 
 struct WorkspaceView: View {
     @EnvironmentObject private var model: AppModel
+    // 用户手动展开的项目集合。为保证“当前聚焦的会话始终可见”，
+    // 选中的 project 会被自动加入（见下方 onChange），避免启动/切换后
+    // 内容已展示、侧边栏却仍折叠导致焦点会话不可见、不高亮。
     @State private var expandedProjectIDs: Set<String> = []
 
     var body: some View {
@@ -39,6 +42,13 @@ struct WorkspaceView: View {
         }
         .task {
             await model.refresh()
+        }
+        // 选中项目变化（启动恢复 / 点击项目 / 切换会话所属项目）时自动展开，
+        // 让当前会话所在的项目始终展开、会话行可见并被高亮。
+        .onChange(of: model.selectedProjectID) { _, projectID in
+            if let projectID {
+                expandedProjectIDs.insert(projectID)
+            }
         }
     }
 }
@@ -247,6 +257,11 @@ private struct SidebarView: View {
     }
 
     private func toggleProject(_ project: ProjectInfo) {
+        // 正在展示该项目的会话时不允许折叠：否则会再次出现“内容已展示、
+        // 侧边栏却折叠且无高亮”的脱节状态（启动时正是这个问题）。
+        if expandedProjectIDs.contains(project.id), model.selectedProjectID == project.id {
+            return
+        }
         if expandedProjectIDs.contains(project.id) {
             expandedProjectIDs.remove(project.id)
         } else {
@@ -896,7 +911,7 @@ private struct ComposerView: View {
                 agentLogo
                 Text(selectedModelName)
                     .lineLimit(1)
-                    .font(DiscoTheme.Typography.bodyEmphasized)
+                    .font(DiscoTheme.Typography.control)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
