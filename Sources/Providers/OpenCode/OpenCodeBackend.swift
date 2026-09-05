@@ -13,6 +13,8 @@ final class OpenCodeBackend: AgentBackend {
     init(executableURL: URL, session: URLSession = .shared) {
         self.executableURL = executableURL
         self.session = session
+        // Clean up servers orphaned by a previous crash or force-quit.
+        ProviderProcessRegistry.shared.reapOrphanedProcesses(executablePath: executableURL.path)
     }
 
     func listModels() async -> ModelListResult {

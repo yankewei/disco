@@ -14,6 +14,8 @@ final class CodexBackend: AgentBackend {
     init(executableURL: URL) {
         self.executableURL = executableURL
         appServer = CodexAppServer(executableURL: executableURL)
+        // Clean up app-servers orphaned by a previous crash or force-quit.
+        ProviderProcessRegistry.shared.reapOrphanedProcesses(executablePath: executableURL.path)
     }
 
     func listModels() async -> ModelListResult {

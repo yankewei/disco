@@ -248,6 +248,181 @@ final class NativeCoreTests: XCTestCase {
         XCTAssertTrue(didClose)
     }
 
+    func testProcessIdentityReportsNoStartTimeForMissingProcess() {
+        XCTAssertNil(ProcessIdentity.startTime(of: Int32.max))
+    }
+
+    func testManagedProcessTracksItsProcessInTheRegistry() throws {
+        try withTemporaryRegistry { registry, registryPath in
+            let process = ManagedProcess(
+                executableURL: URL(fileURLWithPath: "/bin/sleep"),
+                arguments: ["60"],
+                workingDirectory: nil,
+                registry: registry
+            )
+            try process.launch()
+            defer { process.forceTerminate() }
+            XCTAssertTrue(recordedPIDs(in: registryPath).contains(process.process.processIdentifier))
+
+            process.terminate()
+            waitForExit([process.process])
+            waitForRecordsToDisappear([process.process.processIdentifier], in: registryPath)
+            XCTAssertTrue(recordedPIDs(in: registryPath).isEmpty)
+        }
+    }
+
+    func testProviderProcessRegistryKeepsProcessesOwnedByALiveInstance() throws {
+        try withTemporaryRegistry { registry, _ in
+            let process = try launchedSleep()
+            defer { if process.isRunning { process.terminate() } }
+            registry.register(pid: process.processIdentifier, executablePath: "/bin/sleep")
+
+            registry.reapOrphanedProcesses(executablePath: "/bin/echo")
+            XCTAssertTrue(process.isRunning)
+
+            // 属主（当前进程）仍然存活，不能当作上一轮的孤儿回收
+            registry.reapOrphanedProcesses(executablePath: "/bin/sleep")
+            XCTAssertTrue(process.isRunning)
+        }
+    }
+
+    func testProviderProcessRegistryReapsEveryOrphanOfADeadOwner() throws {
+        try withTemporaryRegistry { registry, registryPath in
+            let deadOwner = try exitedProcessIdentity()
+            let processes = [try launchedSleep(), try launchedSleep()]
+            defer { processes.forEach { if $0.isRunning { $0.terminate() } } }
+            let pids = processes.map(\.processIdentifier)
+            for process in processes {
+                registry.register(
+                    pid: process.processIdentifier,
+                    executablePath: "/bin/sleep",
+                    ownerPID: deadOwner.pid,
+                    ownerStartTime: deadOwner.startTime
+                )
+            }
+            XCTAssertEqual(Set(recordedPIDs(in: registryPath)), Set(pids))
+
+            registry.reapOrphanedProcesses(executablePath: "/bin/sleep")
+            waitForExit(processes)
+            XCTAssertTrue(processes.allSatisfy { !$0.isRunning })
+            XCTAssertTrue(recordedPIDs(in: registryPath).isEmpty)
+        }
+    }
+
+    func testProviderProcessRegistryReapsOrphanLaunchedThroughASymlink() throws {
+        try withTemporaryRegistry { registry, registryPath in
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let link = directory.appendingPathComponent("sleeper")
+            try FileManager.default.createSymbolicLink(
+                at: link,
+                withDestinationURL: URL(fileURLWithPath: "/bin/sleep")
+            )
+
+            let deadOwner = try exitedProcessIdentity()
+            let process = try launchedSleep(executableURL: link)
+            defer { if process.isRunning { process.terminate() } }
+            registry.register(
+                pid: process.processIdentifier,
+                executablePath: link.path,
+                ownerPID: deadOwner.pid,
+                ownerStartTime: deadOwner.startTime
+            )
+
+            registry.reapOrphanedProcesses(executablePath: link.path)
+            waitForExit([process])
+            XCTAssertFalse(process.isRunning)
+            XCTAssertTrue(recordedPIDs(in: registryPath).isEmpty)
+        }
+    }
+
+    func testProviderProcessRegistryPrunesRecordsOfExitedProcesses() throws {
+        try withTemporaryRegistry { registry, registryPath in
+            let process = try launchedSleep(arguments: ["0.2"])
+            registry.register(pid: process.processIdentifier, executablePath: "/bin/sleep")
+            XCTAssertEqual(recordedPIDs(in: registryPath), [process.processIdentifier])
+            process.waitUntilExit()
+            waitForPIDToDisappear(process.processIdentifier)
+
+            registry.reapOrphanedProcesses(executablePath: "/bin/echo")
+            XCTAssertTrue(recordedPIDs(in: registryPath).isEmpty)
+        }
+    }
+
+    private func withTemporaryRegistry(
+        _ body: (ProviderProcessRegistry, String) throws -> Void
+    ) throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        let registryPath = directory.appendingPathComponent("provider-processes.json").path
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try body(
+            ProviderProcessRegistry(storageURL: URL(fileURLWithPath: registryPath)),
+            registryPath
+        )
+    }
+
+    private func launchedSleep(
+        executableURL: URL = URL(fileURLWithPath: "/bin/sleep"),
+        arguments: [String] = ["60"]
+    ) throws -> Process {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+
+    private func exitedProcessIdentity() throws -> (pid: Int32, startTime: Double) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/echo")
+        process.arguments = []
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        let pid = process.processIdentifier
+        let startTime = try XCTUnwrap(ProcessIdentity.startTime(of: pid))
+        process.waitUntilExit()
+        waitForPIDToDisappear(pid)
+        return (pid, startTime)
+    }
+
+    private func waitForExit(_ processes: [Process]) {
+        let deadline = Date().addingTimeInterval(5)
+        while processes.contains(where: \.isRunning), Date() < deadline {
+            usleep(100_000)
+        }
+    }
+
+    // An exited process lingers in the process table as a zombie and keeps
+    // reporting its original start time until it is reaped.
+    private func waitForPIDToDisappear(_ pid: Int32) {
+        let deadline = Date().addingTimeInterval(5)
+        while ProcessIdentity.startTime(of: pid) != nil, Date() < deadline {
+            usleep(20_000)
+        }
+    }
+
+    private func waitForRecordsToDisappear(_ pids: [Int32], in registryPath: String) {
+        let deadline = Date().addingTimeInterval(5)
+        while recordedPIDs(in: registryPath).contains(where: pids.contains), Date() < deadline {
+            usleep(20_000)
+        }
+    }
+
+    private func recordedPIDs(in registryPath: String) -> [Int32] {
+        guard
+            let data = try? Data(contentsOf: URL(fileURLWithPath: registryPath)),
+            let records = try? JSONDecoder().decode(JSONValue.self, from: data)
+        else { return [] }
+        return (records.arrayValue ?? []).compactMap { record in
+            guard let pid = jsonNumber(jsonObject(record)?["pid"]) else { return nil }
+            return Int32(pid)
+        }
+    }
+
     func testCancellationTokenInvokesLatestHandlerWhenCancelled() {
         let token = CancellationToken()
         var invocationCount = 0
