@@ -425,11 +425,21 @@ final class OpenCodeBackend: AgentBackend {
             let type = jsonString(payload["type"]),
             let properties = jsonObject(payload["properties"])
         else { return false }
-        // The server scopes /event by directory, so only sessions in this
-        // directory share the stream, and every event handled below carries
-        // sessionID at the top level. session.error may omit it: an unattributed
-        // error belongs to the whole directory, not to some other run.
-        if let eventSessionID = jsonString(properties["sessionID"]), eventSessionID != sessionID {
+        // Older message events only carry sessionID inside info or part;
+        // newer servers also include it at the top level. Filter before any
+        // event can mutate this run's state or report another session's error.
+        let eventSessionID: String?
+        switch type {
+        case "message.updated":
+            eventSessionID = jsonString(properties["sessionID"])
+                ?? jsonString(jsonObject(properties["info"])?["sessionID"])
+        case "message.part.updated":
+            eventSessionID = jsonString(properties["sessionID"])
+                ?? jsonString(jsonObject(properties["part"])?["sessionID"])
+        default:
+            eventSessionID = jsonString(properties["sessionID"])
+        }
+        if let eventSessionID, eventSessionID != sessionID {
             return false
         }
 

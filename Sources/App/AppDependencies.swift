@@ -1,18 +1,24 @@
 import Foundation
 
 struct AgentBackendConfiguration {
-    let backends: [BackendKind: AgentBackend]
-    let executableURLs: [BackendKind: URL]
+    let backends: [AgentID: AgentBackend]
+    let executableURLs: [AgentID: URL]
 
-    init(executableURLs: [BackendKind: URL]) {
+    init(executableURLs: [AgentID: URL], localAgents: [LocalAgentConfiguration] = []) {
         self.executableURLs = executableURLs
-        var backends: [BackendKind: AgentBackend] = [:]
+        var backends: [AgentID: AgentBackend] = [:]
 
         if let executableURL = executableURLs[.codex] {
             backends[.codex] = CodexBackend(executableURL: executableURL)
         }
         if let executableURL = executableURLs[.opencode] {
             backends[.opencode] = OpenCodeBackend(executableURL: executableURL)
+        }
+        for agent in localAgents {
+            let kind = AgentID.acp(id: agent.id)
+            if let executableURL = executableURLs[kind] {
+                backends[kind] = ACPBackend(executableURL: executableURL, arguments: agent.arguments)
+            }
         }
         self.backends = backends
     }
@@ -25,8 +31,8 @@ struct AgentBackendConfiguration {
 
     static func discoverExecutableURLs(
         environment: [String: String] = ExecutableLocator.environmentIncludingLoginShell()
-    ) -> [BackendKind: URL] {
-        var executableURLs: [BackendKind: URL] = [:]
+    ) -> [AgentID: URL] {
+        var executableURLs: [AgentID: URL] = [:]
         if let executableURL = ExecutableLocator.locate("codex", environment: environment) {
             executableURLs[.codex] = executableURL
         }
@@ -45,9 +51,14 @@ struct AppDependencies {
     static func live(eventHandler: @escaping AgentHost.EventHandler) throws -> AppDependencies {
         let environment = try AppEnvironment.live()
         let store = try SQLiteStore(databaseURL: environment.databaseURL)
-        let backendConfiguration = AgentBackendConfiguration.discover(
+        let localAgents = try LocalAgentConfigurationStore().load()
+        var executableURLs = AgentBackendConfiguration.discoverExecutableURLs(
             environment: ProcessInfo.processInfo.environment
         )
+        for agent in localAgents {
+            executableURLs[.acp(id: agent.id)] = ExecutableLocator.locate(agent.command)
+        }
+        let backendConfiguration = AgentBackendConfiguration(executableURLs: executableURLs, localAgents: localAgents)
 
         return AppDependencies(
             databaseURL: environment.databaseURL,
@@ -57,6 +68,8 @@ struct AppDependencies {
                 eventHandler: eventHandler,
                 backends: backendConfiguration.backends,
                 executableURLs: backendConfiguration.executableURLs,
+                localAgents: localAgents,
+                localAgentProvider: { try LocalAgentConfigurationStore().load() },
                 executableURLProvider: {
                     await Task.detached(priority: .utility) {
                         AgentBackendConfiguration.discoverExecutableURLs()

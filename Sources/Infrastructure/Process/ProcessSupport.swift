@@ -186,27 +186,22 @@ final class ProviderProcessRegistry {
     /// graceful shutdown, and drops records that no longer describe a live
     /// process. Processes owned by a running instance are left alone.
     func reapOrphanedProcesses(executablePath: String) {
-        let orphans: [ProviderProcessRecord] = lock.withLock {
-            var orphans: [ProviderProcessRecord] = []
-            let records = readRecords()
-            let survivors = records.filter { record in
-                guard Self.isAlive(record) else { return false }
+        var orphans: [ProviderProcessRecord] = []
+        modifyRecords { records in
+            records.removeAll { record in
+                guard Self.isAlive(record) else { return true }
                 guard record.executablePath == executablePath, !Self.isOwnerAlive(record) else {
-                    return true
+                    return false
                 }
                 orphans.append(record)
-                return false
+                return true
             }
-            if survivors.count != records.count {
-                writeRecords(survivors)
-            }
-            return orphans
         }
         guard !orphans.isEmpty else { return }
         for orphan in orphans {
             kill(orphan.pid, SIGTERM)
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) { [orphans] in
             for orphan in orphans where ProviderProcessRegistry.isAlive(orphan) {
                 kill(orphan.pid, SIGKILL)
             }
@@ -224,6 +219,24 @@ final class ProviderProcessRegistry {
 
     private func modifyRecords(_ mutation: (inout [ProviderProcessRecord]) -> Void) {
         lock.withLock {
+            guard let storageURL else { return }
+            do {
+                try FileManager.default.createDirectory(
+                    at: storageURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                return
+            }
+            // Atomic JSON writes replace the inode, so lock a separate stable
+            // file. Never unlink it: every instance must lock the same inode.
+            let descriptor = open(storageURL.appendingPathExtension("lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+            while flock(descriptor, LOCK_EX) != 0 {
+                guard errno == EINTR else { return }
+            }
+            defer { flock(descriptor, LOCK_UN) }
             var records = readRecords()
             mutation(&records)
             writeRecords(records)
@@ -241,10 +254,6 @@ final class ProviderProcessRegistry {
 
     private func writeRecords(_ records: [ProviderProcessRecord]) {
         guard let storageURL else { return }
-        try? FileManager.default.createDirectory(
-            at: storageURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
         guard let data = try? JSONEncoder().encode(records) else { return }
         try? data.write(to: storageURL, options: .atomic)
     }

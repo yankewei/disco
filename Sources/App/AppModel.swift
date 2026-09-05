@@ -7,11 +7,12 @@ final class AppModel: ObservableObject {
     @Published var projects: [ProjectInfo] = []
     @Published var sessionsByProject: [String: [SessionInfo]] = [:]
     @Published var providers: [ProviderInfo] = []
+    @Published var localAgents: [LocalAgentConfiguration] = []
     @Published var selectedProjectID: String?
     @Published var selectedSessionID: String?
     @Published var messages: [ConversationMessage] = []
     @Published var draft = ""
-    @Published var selectedAgent: BackendKind = .codex
+    @Published var selectedAgent: AgentID = .codex
     @Published var selectedModelID: String?
     @Published var selectedReasoningEffort: ReasoningEffort?
     @Published var selectedSandboxMode = defaultSandboxMode
@@ -100,6 +101,7 @@ final class AppModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
+            localAgents = try LocalAgentConfigurationStore().load()
             // Load local projects and sessions first so the sidebar renders
             // without waiting for provider processes to be discovered or booted.
             let projectList = try host.listProjects()
@@ -113,7 +115,7 @@ final class AppModel: ObservableObject {
             // Provider discovery, model enumeration and version probing are slow
             // (they spawn login shells and provider processes); do them only
             // after the local data is already on screen.
-            await host.refreshBackends()
+            try await host.refreshBackends()
             providers = host.providers()
             await withTaskGroup(of: ProviderInfo.self) { group in
                 for provider in providers where provider.available {
@@ -174,6 +176,22 @@ final class AppModel: ObservableObject {
             selectSession(session)
         } else {
             applyLastAgentSelection()
+        }
+    }
+
+    func saveLocalAgents(_ agents: [LocalAgentConfiguration]) async -> Bool {
+        guard runningSessionIDs.isEmpty else {
+            workspaceError = "请等待当前任务结束后再修改 Agent 配置。"
+            return false
+        }
+        do {
+            try LocalAgentConfigurationStore().save(agents)
+            localAgents = agents
+            await refresh()
+            return true
+        } catch {
+            workspaceError = "保存 Agent 配置失败：\(error.localizedDescription)"
+            return false
         }
     }
 
@@ -328,7 +346,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func updateAgent(_ agent: BackendKind) {
+    func updateAgent(_ agent: AgentID) {
         guard !isRunning else {
             workspaceError = "运行期间不能切换 Provider"
             return
@@ -352,6 +370,9 @@ final class AppModel: ObservableObject {
         selectedAgent = agent
         selectedModelID = nil
         selectedReasoningEffort = nil
+        if selectedProvider?.supportsPlan != true {
+            planMode = false
+        }
         lastAgentSelection = LastAgentSelection(agent: agent, modelID: nil, reasoningEffort: nil)
         saveLastAgentSelection()
     }

@@ -182,7 +182,7 @@ final class SQLiteStore {
             try throwIfStepFailed(statement)
             return nil
         }
-        guard let agent = BackendKind(rawValue: text(statement, column: 0)) else {
+        guard let agent = AgentID(rawValue: text(statement, column: 0)) else {
             return nil
         }
         return LastAgentSelection(
@@ -274,7 +274,7 @@ final class SQLiteStore {
 
     /// 仅允许在会话尚未开始 Agent 对话（agent_thread_id 为空）时调整其 Provider，
     /// 换 Provider 会清空原模型与推理深度，避免跨 Provider 的模型残留。
-    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
+    func updateSessionAgent(sessionID: String, agent: AgentID) throws {
         databaseLock.lock()
         defer { databaseLock.unlock() }
         let statement = try prepare(
@@ -527,7 +527,7 @@ final class SQLiteStore {
 
     private func session(from statement: OpaquePointer) -> SessionInfo? {
         guard
-            let agent = BackendKind(rawValue: text(statement, column: 2))
+            let agent = AgentID(rawValue: text(statement, column: 2))
         else {
             return nil
         }

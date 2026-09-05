@@ -288,7 +288,7 @@ private struct SessionRow: View {
             HStack(spacing: 8) {
                 Color.clear
                     .frame(width: 10, height: 1)
-                Image(session.agent.iconAssetName)
+                session.agent.iconImage
                     .resizable()
                     .scaledToFit()
                     .frame(width: 16, height: 16)
@@ -1050,7 +1050,7 @@ private struct ComposerView: View {
                 HStack(spacing: 8) {
                     agentModelControl
                     reasoningMenu
-                    sandboxMenu
+                    if !model.selectedAgent.isACP { sandboxMenu }
                     modeSwitcher
 
                     Spacer(minLength: 0)
@@ -1131,7 +1131,7 @@ private struct ComposerView: View {
     @ViewBuilder
     private var agentLogo: some View {
         if let provider = model.selectedProvider {
-            Image(provider.kind.iconAssetName)
+            provider.kind.iconImage
                 .resizable()
                 .scaledToFit()
                 .frame(width: 18, height: 18)
@@ -1897,11 +1897,11 @@ private final class AgentModelPickerPanel: NSPanel {
 private struct AgentModelPickerView: View {
     @EnvironmentObject private var model: AppModel
     let onDismiss: () -> Void
-    @State private var highlightedAgent: BackendKind
-    @State private var hoveredAgent: BackendKind?
+    @State private var highlightedAgent: AgentID
+    @State private var hoveredAgent: AgentID?
     @State private var modelSearchText = ""
 
-    init(initialAgent: BackendKind, onDismiss: @escaping () -> Void) {
+    init(initialAgent: AgentID, onDismiss: @escaping () -> Void) {
         self.onDismiss = onDismiss
         _highlightedAgent = State(initialValue: initialAgent)
     }
@@ -1936,7 +1936,7 @@ private struct AgentModelPickerView: View {
                         highlightedAgent = provider.kind
                         modelSearchText = ""
                     } label: {
-                        Image(provider.kind.iconAssetName)
+                        provider.kind.iconImage
                             .resizable()
                             .scaledToFit()
                             .frame(width: 24, height: 24)
@@ -1948,8 +1948,8 @@ private struct AgentModelPickerView: View {
                         agentBackground(for: provider.kind),
                         in: RoundedRectangle(cornerRadius: DiscoTheme.Metrics.rowCornerRadius, style: .continuous)
                     )
-                    .help(provider.kind.displayName)
-                    .accessibilityLabel(provider.kind.displayName)
+                    .help(provider.displayName)
+                    .accessibilityLabel(provider.displayName)
                     .onHover { isHovering in
                         if isHovering {
                             hoveredAgent = provider.kind
@@ -1968,7 +1968,7 @@ private struct AgentModelPickerView: View {
         .background(DiscoTheme.Palette.sidebar)
     }
 
-    private func agentBackground(for agent: BackendKind) -> Color {
+    private func agentBackground(for agent: AgentID) -> Color {
         if highlightedAgent == agent {
             return DiscoTheme.Palette.selectionStrong
         }
@@ -2051,7 +2051,14 @@ private struct AgentModelPickerView: View {
                 .scrollContentBackground(.hidden)
                 .scrollIndicators(.hidden)
             } else {
-                Text(highlightedProvider?.modelLoadFailureDescription ?? "暂无模型")
+                if highlightedProvider != nil {
+                    PickerRow(selected: model.selectedAgent == highlightedAgent && model.selectedModelID == nil) {
+                        selectModel(nil)
+                    } label: {
+                        Text("Agent 默认模型")
+                    }
+                }
+                Text(highlightedProvider?.modelLoadFailureDescription ?? (highlightedAgent.isACP ? "模型由 Agent 的本地配置决定" : "暂无模型"))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .padding(.top, 8)

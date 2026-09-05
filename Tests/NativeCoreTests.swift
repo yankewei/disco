@@ -271,6 +271,58 @@ final class NativeCoreTests: XCTestCase {
         }
     }
 
+    func testProviderProcessRegistryWaitsForAnotherProcessBeforeUpdatingRecords() throws {
+        try withTemporaryRegistry { registry, registryPath in
+            let processes = [try launchedSleep(), try launchedSleep()]
+            defer { processes.forEach { if $0.isRunning { $0.terminate() } } }
+            let firstPID = processes[0].processIdentifier
+            let secondPID = processes[1].processIdentifier
+            registry.register(pid: firstPID, executablePath: "/bin/sleep")
+
+            let writer = Process()
+            let readyPipe = Pipe()
+            let releasePipe = Pipe()
+            writer.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            writer.arguments = ["-c", #"""
+            import fcntl, os, sys
+            path = sys.argv[1]
+            with open(path + ".lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                with open(path, "rb") as source:
+                    records = source.read()
+                sys.stdout.write("R")
+                sys.stdout.flush()
+                sys.stdin.read(1)
+                with open(path + ".tmp", "wb") as target:
+                    target.write(records)
+                os.replace(path + ".tmp", path)
+            """#, registryPath]
+            writer.standardOutput = readyPipe
+            writer.standardInput = releasePipe
+            try writer.run()
+            defer { if writer.isRunning { writer.terminate() } }
+            XCTAssertEqual(try readyPipe.fileHandleForReading.read(upToCount: 1), Data("R".utf8))
+
+            let registrationStarted = DispatchSemaphore(value: 0)
+            let registrationFinished = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                registrationStarted.signal()
+                registry.register(pid: secondPID, executablePath: "/bin/sleep")
+                registrationFinished.signal()
+            }
+            XCTAssertEqual(registrationStarted.wait(timeout: .now() + 5), .success)
+            let earlyCompletion = registrationFinished.wait(timeout: .now() + 0.2)
+            XCTAssertEqual(earlyCompletion, .timedOut, "另一个进程持锁时不能更新记录")
+            try releasePipe.fileHandleForWriting.write(contentsOf: Data("R".utf8))
+            writer.waitUntilExit()
+            if earlyCompletion == .timedOut {
+                XCTAssertEqual(registrationFinished.wait(timeout: .now() + 5), .success)
+            }
+            XCTAssertEqual(writer.terminationStatus, 0)
+            XCTAssertEqual(Set(recordedPIDs(in: registryPath)), Set([firstPID, secondPID]))
+        }
+    }
+
     func testProviderProcessRegistryKeepsProcessesOwnedByALiveInstance() throws {
         try withTemporaryRegistry { registry, _ in
             let process = try launchedSleep()
@@ -799,7 +851,7 @@ final class PlanModeTests: XCTestCase {
         try await verifyModeSwitch(backendKind: .opencode, skipsQuestions: true)
     }
 
-    private func verifyModeSwitch(backendKind: BackendKind, skipsQuestions: Bool = false) async throws {
+    private func verifyModeSwitch(backendKind: AgentID, skipsQuestions: Bool = false) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1010,13 +1062,25 @@ final class OpenCodeStartupTests: XCTestCase {
 }
 
 final class OpenCodeSharedServerTests: XCTestCase {
-    func testConcurrentRunsShareOneServerWithoutMixingEvents() async throws {
+    func testConcurrentRunsWithTopLevelSessionIDsDoNotMixEvents() async throws {
+        try await assertConcurrentRunsDoNotMixEvents(includesTopLevelSessionID: true)
+    }
+
+    func testConcurrentRunsWithNestedSessionIDsDoNotMixEvents() async throws {
+        try await assertConcurrentRunsDoNotMixEvents(includesTopLevelSessionID: false)
+    }
+
+    private func assertConcurrentRunsDoNotMixEvents(includesTopLevelSessionID: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let executable = directory.appendingPathComponent("provider")
-        try Self.sharedServerScript.write(to: executable, atomically: true, encoding: .utf8)
+        let script = Self.sharedServerScript.replacingOccurrences(
+            of: "INCLUDE_TOP_LEVEL_SESSION_ID",
+            with: includesTopLevelSessionID ? "True" : "False"
+        )
+        try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
@@ -1029,7 +1093,7 @@ final class OpenCodeSharedServerTests: XCTestCase {
         let second = Task { try await self.runPrompt(backend: backend, directory: directory) }
         let (firstRun, secondRun) = try await (first.value, second.value)
 
-        // 同一目录下的两个会话共用一个常驻服务和一条事件流，回答不能互相串台
+        // 同目录的两个会话共用服务，各自订阅广播事件，回答不能串台
         XCTAssertNotEqual(firstRun.threadID, secondRun.threadID)
         XCTAssertEqual(firstRun.texts, ["回答 \(firstRun.threadID)"])
         XCTAssertEqual(secondRun.texts, ["回答 \(secondRun.threadID)"])
@@ -1050,12 +1114,8 @@ final class OpenCodeSharedServerTests: XCTestCase {
                 directory.path
             )
         }
-        // 两次 prompt 都在两条事件流建立之后才提交，所以每个 run 都确实收到了
-        // 另一个会话和陌生会话的 part 事件；上面的精确断言才有意义
+        // 服务端等待两个订阅者就绪后才广播，确保两个会话都能收到干扰事件。
         XCTAssertEqual(paths.filter { $0.contains("prompt_async") }.count, 2)
-        let lastStream = paths.lastIndex { $0.hasPrefix("/event") } ?? -1
-        let firstPrompt = paths.firstIndex { $0.contains("prompt_async") } ?? .max
-        XCTAssertLessThan(lastStream, firstPrompt)
     }
 
     private func runPrompt(
@@ -1117,8 +1177,7 @@ final class OpenCodeSharedServerTests: XCTestCase {
             received.put(event)
     def part(session_id, text):
         return {"type": "message.part.updated", "properties": {
-            "sessionID": session_id,
-            "time": 1,
+            **({"sessionID": session_id, "time": 1} if INCLUDE_TOP_LEVEL_SESSION_ID else {}),
             "part": {
                 "id": "prt_" + session_id,
                 "sessionID": session_id,
@@ -1167,8 +1226,15 @@ final class OpenCodeSharedServerTests: XCTestCase {
                 return
             session_id = parsed.path.split("/")[2]
             wait_for_both_subscribers()
-            publish(part(session_id, "回答 " + session_id))
+            publish({"type": "message.updated", "properties": {
+                **({"sessionID": "ses_intruder"} if INCLUDE_TOP_LEVEL_SESSION_ID else {}),
+                "info": {
+                    "id": "msg_intruder", "sessionID": "ses_intruder", "role": "assistant",
+                    "error": {"name": "UnknownError", "data": {"message": "别的会话的错误"}},
+                },
+            }})
             publish(part("ses_intruder", "别的会话的回答"))
+            publish(part(session_id, "回答 " + session_id))
             publish({"type": "session.status", "properties": {"sessionID": session_id, "status": {"type": "idle"}}})
     ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()
     """#

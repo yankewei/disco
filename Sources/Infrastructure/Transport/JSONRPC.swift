@@ -17,6 +17,9 @@ enum JSONRPCIdentifier: Hashable {
         guard let value else { return nil }
         switch value {
         case let .number(number):
+            guard number.isFinite, number.rounded() == number,
+                  number >= Double(Int.min), number < Double(Int.max)
+            else { return nil }
             self = .number(Int(number))
         case let .string(string):
             self = .string(string)
@@ -70,12 +73,13 @@ final class JSONRPCConnection {
         guard let output = managedProcess.standardOutput else {
             throw ProcessSupportError.outputClosed
         }
-        withStateLock {
+        try withStateLock {
+            guard !isClosed else { throw ProcessSupportError.outputClosed }
             self.serverRequestHandler = serverRequestHandler
             self.notificationHandler = notificationHandler
             self.closeHandler = closeHandler
+            try managedProcess.launch()
         }
-        try managedProcess.launch()
         let task = Task { [weak self] in
             do {
                 for try await line in lineStream(from: output) {
@@ -88,11 +92,11 @@ final class JSONRPCConnection {
             }
         }
         withStateLock {
-            readerTask = task
+            if isClosed { task.cancel() } else { readerTask = task }
         }
     }
 
-    func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
+    func request(method: String, params: JSONValue? = nil, timeout: TimeInterval = 30) async throws -> JSONValue {
         let identifier = withStateLock { () -> JSONRPCIdentifier in
             let identifier = JSONRPCIdentifier.number(nextRequestID)
             nextRequestID += 1
@@ -107,7 +111,7 @@ final class JSONRPCConnection {
                 )
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: 30_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 throw ProcessSupportError.requestTimedOut(method)
             }
             defer { group.cancelAll() }
@@ -133,7 +137,9 @@ final class JSONRPCConnection {
         method: String,
         params: JSONValue?
     ) async throws -> JSONValue {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
             let accepted = withStateLock {
                 guard !isClosed else { return false }
                 pendingRequests[identifier] = continuation
@@ -158,6 +164,9 @@ final class JSONRPCConnection {
                 }
                 pendingRequest?.resume(throwing: error)
             }
+            }
+        } onCancel: {
+            self.close(with: CancellationError())
         }
     }
 
@@ -247,7 +256,7 @@ final class JSONRPCConnection {
                             "jsonrpc": .string("2.0"),
                             "id": requestID.jsonValue,
                             "error": .object([
-                                "code": .number(-32000),
+                                "code": .number(Double((error as? JSONRPCError)?.code ?? -32000)),
                                 "message": .string(error.localizedDescription),
                             ]),
                         ]
@@ -288,11 +297,11 @@ final class JSONRPCConnection {
         guard let input = managedProcess.standardInput else {
             throw ProcessSupportError.outputClosed
         }
+        writeLock.lock()
+        defer { writeLock.unlock() }
         let data = try jsonEncoder.encode(JSONValue.object(object))
         var line = data
         line.append(0x0A)
-        writeLock.lock()
-        defer { writeLock.unlock() }
         try input.write(contentsOf: line)
     }
 

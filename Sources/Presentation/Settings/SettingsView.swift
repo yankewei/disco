@@ -143,17 +143,27 @@ private struct ProviderSettingsView: View {
     @EnvironmentObject private var model: AppModel
     let lastScanAt: Date?
     let onRefresh: () -> Void
+    @State private var showsAgentConfiguration = false
 
     var body: some View {
         SettingsPage {
+            HStack {
+                Spacer()
+                Button("配置 ACP Agent…") { showsAgentConfiguration = true }
+                    .disabled(!model.runningSessionIDs.isEmpty)
+                    .help("添加或修改本地 ACP Agent 启动命令")
+            }
             ProviderDirectoryCard(
                 providers: model.providers,
                 lastScanAt: lastScanAt,
                 onRefresh: onRefresh,
                 onUnavailableProviderTap: { provider in
-                    model.workspaceError = "请安装 \(provider.kind.displayName) CLI，并确保命令在 PATH 中，然后点击“刷新”。"
+                    model.workspaceError = "请安装 \(provider.displayName) CLI，并确保命令在 PATH 中，然后点击“刷新”。"
                 }
             )
+        }
+        .sheet(isPresented: $showsAgentConfiguration) {
+            LocalAgentConfigurationView(agents: model.localAgents)
         }
     }
 }
@@ -288,7 +298,7 @@ private struct ProviderRowLabel: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(provider.kind.displayName)
+                    Text(provider.displayName)
                         .font(DiscoTheme.Typography.bodyEmphasized)
                         .foregroundStyle(provider.available ? .primary : .secondary)
                     if let version = versionLabel {
@@ -326,7 +336,7 @@ private struct ProviderRowLabel: View {
                         .font(DiscoTheme.Typography.caption)
                         .foregroundStyle(.secondary)
                 } else if provider.available, provider.models.isEmpty {
-                    Text("未发现可用模型")
+                    Text(provider.kind.isACP ? "使用 Agent 默认模型" : "未发现可用模型")
                         .font(DiscoTheme.Typography.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -364,7 +374,7 @@ private struct ProviderIcon: View {
     let provider: ProviderInfo
 
     var body: some View {
-        Image(provider.kind.iconAssetName)
+        provider.kind.iconImage
             .resizable()
             .scaledToFit()
             .frame(width: 28, height: 28)
@@ -533,6 +543,7 @@ private struct SettingsPage<Content: View>: View {
             .padding(.top, 20)
             .padding(.bottom, 28)
         }
+        .scrollIndicators(.hidden)
         .background(DiscoTheme.Palette.canvas)
     }
 }

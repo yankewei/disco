@@ -50,7 +50,7 @@ enum AgentEvent {
     )
 }
 
-final class CancellationToken {
+final class CancellationToken: @unchecked Sendable {
     private let stateLock = NSLock()
     private var cancelled = false
     private var cancellationHandler: (() -> Void)?

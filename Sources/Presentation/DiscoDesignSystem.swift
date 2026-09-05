@@ -59,3 +59,10 @@ enum DiscoTheme {
         static let composerCornerRadius: CGFloat = 16
     }
 }
+
+
+extension AgentID {
+    var iconImage: Image {
+        isACP ? Image(systemName: "terminal") : Image(iconAssetName)
+    }
+}

@@ -5,9 +5,11 @@ final class AgentHost {
 
     private let store: SQLiteStore
     private let eventHandler: EventHandler
-    private let executableURLProvider: () async -> [BackendKind: URL]
-    private var backends: [BackendKind: AgentBackend]
-    private var executableURLs: [BackendKind: URL]
+    private let executableURLProvider: () async -> [AgentID: URL]
+    private var backends: [AgentID: AgentBackend]
+    private var executableURLs: [AgentID: URL]
+    private var localAgents: [LocalAgentConfiguration]
+    private let localAgentProvider: () throws -> [LocalAgentConfiguration]
     private let stateLock = NSLock()
     private var activeRuns: [String: ActiveRun] = [:]
     private var pendingUserInputs: [String: PendingUserInput] = [:]
@@ -20,14 +22,18 @@ final class AgentHost {
     init(
         store: SQLiteStore,
         eventHandler: @escaping EventHandler,
-        backends: [BackendKind: AgentBackend],
-        executableURLs: [BackendKind: URL],
-        executableURLProvider: @escaping () async -> [BackendKind: URL]
+        backends: [AgentID: AgentBackend],
+        executableURLs: [AgentID: URL],
+        localAgents: [LocalAgentConfiguration] = [],
+        localAgentProvider: @escaping () throws -> [LocalAgentConfiguration] = { [] },
+        executableURLProvider: @escaping () async -> [AgentID: URL]
     ) {
         self.store = store
         self.eventHandler = eventHandler
         self.backends = backends
         self.executableURLs = executableURLs
+        self.localAgents = localAgents
+        self.localAgentProvider = localAgentProvider
         self.executableURLProvider = executableURLProvider
     }
 
@@ -90,7 +96,7 @@ final class AgentHost {
         )
     }
 
-    func updateSessionAgent(sessionID: String, agent: BackendKind) throws {
+    func updateSessionAgent(sessionID: String, agent: AgentID) throws {
         guard let session = try store.session(id: sessionID) else {
             throw AgentHostError.sessionNotFound
         }
@@ -123,7 +129,7 @@ final class AgentHost {
 
     func createSession(
         projectID: String,
-        agent: BackendKind,
+        agent: AgentID,
         modelID: String?,
         reasoningEffort: ReasoningEffort?,
         sandboxMode: SandboxMode?
@@ -210,17 +216,29 @@ final class AgentHost {
         )
     }
 
-    func refreshBackends() async {
+    func refreshBackends() async throws {
         guard withStateLock({ !isShuttingDown && activeRuns.isEmpty }) else { return }
+        let nextLocalAgents = try localAgentProvider()
+        var nextExecutableURLs = await executableURLProvider()
+        let localExecutableURLs = await Task.detached(priority: .utility) {
+            let environment = ExecutableLocator.environmentIncludingLoginShell()
+            return Dictionary(uniqueKeysWithValues: nextLocalAgents.compactMap { agent -> (AgentID, URL)? in
+                guard let url = ExecutableLocator.locate(agent.command, environment: environment) else { return nil }
+                return (.acp(id: agent.id), url)
+            })
+        }.value
+        nextExecutableURLs.merge(localExecutableURLs) { _, new in new }
         let configuration = AgentBackendConfiguration(
-            executableURLs: await executableURLProvider()
+            executableURLs: nextExecutableURLs,
+            localAgents: nextLocalAgents
         )
         let previousBackends = withStateLock { () -> [AgentBackend] in
             guard !isShuttingDown, activeRuns.isEmpty else { return [] }
-            guard executableURLs != configuration.executableURLs else { return [] }
+            guard executableURLs != configuration.executableURLs || localAgents != nextLocalAgents else { return [] }
             let previousBackends = Array(backends.values)
             backends = configuration.backends
             executableURLs = configuration.executableURLs
+            localAgents = nextLocalAgents
             return previousBackends
         }
         for backend in previousBackends {
@@ -229,8 +247,8 @@ final class AgentHost {
     }
 
     func providers() -> [ProviderInfo] {
-        let (backends, executableURLs) = withStateLock { (self.backends, self.executableURLs) }
-        return BackendKind.allCases.map { backendKind in
+        let (backends, executableURLs, localAgents) = withStateLock { (self.backends, self.executableURLs, self.localAgents) }
+        return (AgentID.builtInAgents + localAgents.map { .acp(id: $0.id) }).map { backendKind in
             guard let backend = backends[backendKind] else {
                 return unavailableProviderInfo(for: backendKind)
             }
@@ -243,12 +261,13 @@ final class AgentHost {
                 supportsPlan: backend.supportsPlan,
                 isLoadingModels: true,
                 models: [],
-                modelLoadFailureDescription: nil
+                modelLoadFailureDescription: nil,
+                configuredName: localAgents.first { .acp(id: $0.id) == backendKind }?.name
             )
         }
     }
 
-    func refreshProvider(_ backendKind: BackendKind) async -> ProviderInfo {
+    func refreshProvider(_ backendKind: AgentID) async -> ProviderInfo {
         let (backend, executableURL) = withStateLock {
             (backends[backendKind], executableURLs[backendKind])
         }
@@ -258,7 +277,7 @@ final class AgentHost {
 
         async let modelListResult = backend.listModels()
         let version: String?
-        if let executableURL {
+        if let executableURL, !backendKind.isACP {
             version = await Task.detached(priority: .utility) {
                 ExecutableMetadataLocator.version(for: executableURL)
             }.value
@@ -275,7 +294,8 @@ final class AgentHost {
             supportsPlan: backend.supportsPlan,
             isLoadingModels: false,
             models: resolvedModelListResult.models,
-            modelLoadFailureDescription: resolvedModelListResult.failureDescription
+            modelLoadFailureDescription: resolvedModelListResult.failureDescription,
+            configuredName: withStateLock { localAgents.first { .acp(id: $0.id) == backendKind }?.name }
         )
     }
 
@@ -618,11 +638,11 @@ final class AgentHost {
         return try operation()
     }
 
-    private func backend(for kind: BackendKind) -> AgentBackend? {
+    private func backend(for kind: AgentID) -> AgentBackend? {
         withStateLock { backends[kind] }
     }
 
-    private func unavailableProviderInfo(for backendKind: BackendKind) -> ProviderInfo {
+    private func unavailableProviderInfo(for backendKind: AgentID) -> ProviderInfo {
         ProviderInfo(
             kind: backendKind,
             available: false,
@@ -632,7 +652,8 @@ final class AgentHost {
             supportsPlan: true,
             isLoadingModels: false,
             models: [],
-            modelLoadFailureDescription: nil
+            modelLoadFailureDescription: nil,
+            configuredName: withStateLock { localAgents.first { .acp(id: $0.id) == backendKind }?.name }
         )
     }
 

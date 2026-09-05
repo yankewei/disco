@@ -2,9 +2,43 @@ import Foundation
 
 // MARK: - Shared domain values
 
-enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
-    case codex
-    case opencode
+struct AgentID: RawRepresentable, Codable, Identifiable, Hashable, Sendable {
+    let rawValue: String
+
+    static let codex = AgentID(uncheckedValue: "codex")
+    static let opencode = AgentID(uncheckedValue: "opencode")
+    static let builtInAgents: [AgentID] = [.codex, .opencode]
+
+    init?(rawValue: String) {
+        guard rawValue == "codex" || rawValue == "opencode"
+            || (rawValue.hasPrefix("acp:") && rawValue.count > 4)
+        else { return nil }
+        self.rawValue = rawValue
+    }
+
+    private init(uncheckedValue: String) {
+        rawValue = uncheckedValue
+    }
+
+    static func acp(id: String) -> AgentID {
+        AgentID(uncheckedValue: "acp:" + id)
+    }
+
+    var isACP: Bool { rawValue.hasPrefix("acp:") }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        guard let kind = AgentID(rawValue: value) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "未知 Agent：\(value)")
+        }
+        self = kind
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 
     var id: String {
         rawValue
@@ -16,6 +50,8 @@ enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
             "Codex"
         case .opencode:
             "OpenCode"
+        default:
+            String(rawValue.dropFirst(4))
         }
     }
 
@@ -25,6 +61,8 @@ enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
             "CodexIcon"
         case .opencode:
             "OpenCodeIcon"
+        default:
+            ""
         }
     }
 
@@ -34,6 +72,8 @@ enum BackendKind: String, CaseIterable, Codable, Identifiable, Sendable {
             "OpenAI Codex CLI"
         case .opencode:
             "OpenCode CLI"
+        default:
+            "ACP Agent"
         }
     }
 }
@@ -105,7 +145,7 @@ struct SessionInfo: Codable, Identifiable, Hashable {
 
     let sessionID: String
     let projectID: String
-    var agent: BackendKind
+    var agent: AgentID
     var modelID: String?
     var reasoningEffort: ReasoningEffort?
     var sandboxMode: SandboxMode?
@@ -116,7 +156,7 @@ struct SessionInfo: Codable, Identifiable, Hashable {
 }
 
 struct LastAgentSelection: Codable, Hashable {
-    var agent: BackendKind
+    var agent: AgentID
     var modelID: String?
     var reasoningEffort: ReasoningEffort?
 }
@@ -128,7 +168,7 @@ struct ModelInfo: Codable, Identifiable, Hashable {
 }
 
 struct ProviderInfo: Identifiable, Hashable {
-    let kind: BackendKind
+    let kind: AgentID
     let available: Bool
     let detail: String
     let version: String?
@@ -137,8 +177,11 @@ struct ProviderInfo: Identifiable, Hashable {
     let isLoadingModels: Bool
     var models: [ModelInfo]
     let modelLoadFailureDescription: String?
+    var configuredName: String? = nil
 
-    var id: BackendKind {
+    var displayName: String { configuredName ?? kind.displayName }
+
+    var id: AgentID {
         kind
     }
 }
