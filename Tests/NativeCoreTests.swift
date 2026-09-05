@@ -876,6 +876,8 @@ final class PlanModeTests: XCTestCase {
                 XCTAssertEqual(jsonObject(replies.first?["body"])?["answers"], .array([.array([.string("方案 A")])]))
             }
             XCTAssertEqual(jsonString(replies.last?["path"]), "/api/session/thread/question/question/\(action)")
+            // 两次 run 复用同一个常驻服务：模拟服务进程只被启动一次
+            XCTAssertEqual(records.filter { jsonString($0["path"]) == "/global/health" }.count, 1)
         }
     }
 
@@ -907,20 +909,34 @@ final class PlanModeTests: XCTestCase {
                 send({"id": request["id"], "result": {"thread": {"id": "thread"}, "model": "resolved-model"}})
     else:
         events = queue.Queue()
+        subscribers = []
+        def publish(event):
+            # 真实 opencode 的 /event 是广播语义：每个订阅者都收到全量事件
+            for queue_ in list(subscribers):
+                queue_.put(event)
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream" if urlparse(self.path).path == "/event" else "application/json")
                 self.end_headers()
+                if urlparse(self.path).path == "/global/health":
+                    record({"path": "/global/health"})
+                    self.wfile.write(b"{}")
+                    return
                 if urlparse(self.path).path != "/event":
                     self.wfile.write(b"{}")
                     return
                 self.wfile.write(b'data: {"type":"server.connected","properties":{}}\n\n')
                 self.wfile.flush()
-                while True:
-                    self.wfile.write(("data: " + json.dumps(events.get()) + "\n\n").encode())
-                    self.wfile.flush()
+                received = queue.Queue()
+                subscribers.append(received)
+                try:
+                    while True:
+                        self.wfile.write(("data: " + json.dumps(received.get()) + "\n\n").encode())
+                        self.wfile.flush()
+                finally:
+                    subscribers.remove(received)
             def do_POST(self):
                 path = urlparse(self.path).path
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"null")
@@ -930,10 +946,66 @@ final class PlanModeTests: XCTestCase {
                 self.end_headers()
                 self.wfile.write(b'{"id":"thread"}')
                 if path.endswith("prompt_async"):
-                    events.put({"type": "question.asked" if body["agent"] == "plan" else "question.v2.asked", "properties": {"id": "question", "sessionID": "thread", "questions": [question]}})
+                    publish({"type": "question.asked" if body["agent"] == "plan" else "question.v2.asked", "properties": {"id": "question", "sessionID": "thread", "questions": [question]}})
                 elif path.endswith(("reply", "reject")):
-                    events.put({"type": "session.idle", "properties": {"sessionID": "thread"}})
+                    publish({"type": "session.idle", "properties": {"sessionID": "thread"}})
         ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()
+    """#
+}
+
+final class OpenCodeStartupTests: XCTestCase {
+    func testRunCancelledWhileServerStartsStopsWaiting() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("provider")
+        try Self.neverReadyScript.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+
+        let backend = OpenCodeBackend(executableURL: executable)
+        defer { backend.shutdown() }
+        let cancellation = CancellationToken()
+        Task {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            cancellation.cancel()
+        }
+
+        // 服务一直不就绪时，取消必须立刻生效，而不是等满 30 秒启动超时
+        let startedAt = Date()
+        do {
+            _ = try await backend.run(context: BackendRunContext(
+                agentThreadID: nil,
+                modelID: nil,
+                reasoningEffort: nil,
+                sandboxMode: nil,
+                workingDirectory: directory.path,
+                prompt: "开始",
+                mode: .agent,
+                emit: { _ in },
+                cancellation: cancellation,
+                reportAgentThreadID: { _ in },
+                requestUserInput: { _ in nil },
+                requestApproval: { _, _, _ in .denied }
+            ))
+            XCTFail("取消之后不应该正常结束")
+        } catch OpenCodeBackendError.cancelled {
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 5)
+        }
+    }
+
+    private static let neverReadyScript = #"""
+    #!/usr/bin/python3
+    import sys, time
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            time.sleep(30)
+    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()
     """#
 }
 

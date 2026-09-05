@@ -7,27 +7,36 @@ final class OpenCodeBackend: AgentBackend {
     private let executableURL: URL
     private let session: URLSession
     private let stateLock = NSLock()
-    private var activeServers: [String: RunningOpenCodeServer] = [:]
+    private var sharedServer: RunningOpenCodeServer?
+    private var startTask: Task<RunningOpenCodeServer, Error>?
     private var isShuttingDown = false
 
-    init(executableURL: URL, session: URLSession = .shared) {
+    init(executableURL: URL, session: URLSession = OpenCodeBackend.makeLoopbackSession()) {
         self.executableURL = executableURL
         self.session = session
         // Clean up servers orphaned by a previous crash or force-quit.
         ProviderProcessRegistry.shared.reapOrphanedProcesses(executablePath: executableURL.path)
     }
 
+    /// OpenCode is reached over loopback HTTP; never route it through system
+    /// proxies, which may be slow or down and would break the readiness probe.
+    /// Several runs may stream events concurrently over one shared server.
+    private static func makeLoopbackSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [:]
+        configuration.httpMaximumConnectionsPerHost = 16
+        return URLSession(configuration: configuration)
+    }
+
     func listModels() async -> ModelListResult {
-        let cancellation = CancellationToken()
         do {
-            let server = try await startServer(cancellation: cancellation, workingDirectory: nil)
-            defer { stop(server) }
+            let server = try await acquireServer()
             let response = try await requestJSON(
                 baseURL: server.baseURL,
                 path: "/config/providers",
                 method: "GET",
                 body: nil,
-                cancellation: cancellation
+                cancellation: CancellationToken()
             )
             return ModelListResult(
                 models: parseOpenCodeModels(response),
@@ -42,9 +51,7 @@ final class OpenCodeBackend: AgentBackend {
     }
 
     func loadMessages(agentThreadID: String, workingDirectory: String) async throws -> [ConversationMessage] {
-        let cancellation = CancellationToken()
-        let server = try await startServer(cancellation: cancellation, workingDirectory: workingDirectory)
-        defer { stop(server) }
+        let server = try await acquireServer()
         let response = try await requestJSON(
             baseURL: server.baseURL,
             path: directoryPath(
@@ -53,38 +60,15 @@ final class OpenCodeBackend: AgentBackend {
             ),
             method: "GET",
             body: nil,
-            cancellation: cancellation
+            cancellation: CancellationToken()
         )
         return parseOpenCodeMessages(response)
     }
 
     func run(context: BackendRunContext) async throws -> String {
         let cancellation = context.cancellation
-        let server = try await startServer(
-            cancellation: cancellation,
-            workingDirectory: context.workingDirectory
-        )
-        let activeServerKey = context.agentThreadID ?? UUID().uuidString
-        let accepted = withStateLock {
-            guard !isShuttingDown else { return false }
-            activeServers[activeServerKey] = server
-            return true
-        }
-        guard accepted else {
-            stop(server)
-            throw OpenCodeBackendError.shuttingDown
-        }
-        defer {
-            stop(server)
-            _ = withStateLock {
-                activeServers.removeValue(forKey: activeServerKey)
-            }
-        }
-
-        if context.cancellation.isCancelled {
-            cancellation.cancel()
-            throw OpenCodeBackendError.cancelled
-        }
+        guard !cancellation.isCancelled else { throw OpenCodeBackendError.cancelled }
+        let server = try await acquireServer(cancellation: cancellation)
 
         var sessionID = context.agentThreadID
         if sessionID == nil {
@@ -124,10 +108,9 @@ final class OpenCodeBackend: AgentBackend {
                 eventStreamState: eventStreamState
             )
         }
-        context.cancellation.onCancel = { [weak self, weak server] in
+        cancellation.onCancel = { [weak self] in
             eventTask.cancel()
-            server?.process.terminate()
-            guard let self, let server else { return }
+            guard let self else { return }
             Task {
                 _ = try? await self.requestJSON(
                     baseURL: server.baseURL,
@@ -141,7 +124,7 @@ final class OpenCodeBackend: AgentBackend {
                 )
             }
         }
-        defer { context.cancellation.onCancel = nil }
+        defer { cancellation.onCancel = nil }
         do {
             let modelSelection = parseModelSelection(context.modelID)
             var promptBody: [String: JSONValue] = [
@@ -174,7 +157,7 @@ final class OpenCodeBackend: AgentBackend {
                 cancellation: cancellation
             )
             try await eventTask.value
-            if context.cancellation.isCancelled {
+            if cancellation.isCancelled {
                 throw OpenCodeBackendError.cancelled
             }
             return sessionID
@@ -186,29 +169,101 @@ final class OpenCodeBackend: AgentBackend {
     }
 
     func shutdown() {
-        let servers = withStateLock {
+        let (server, task) = withStateLock {
             isShuttingDown = true
-            let servers = Array(activeServers.values)
-            activeServers.removeAll()
-            return servers
+            let server = sharedServer
+            sharedServer = nil
+            let task = startTask
+            startTask = nil
+            return (server, task)
         }
-        for server in servers {
+        task?.cancel()
+        if let server {
             stop(server)
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    private func acquireServer(
+        cancellation: CancellationToken? = nil
+    ) async throws -> RunningOpenCodeServer {
+        switch beginLaunch() {
+        case .shuttingDown:
+            throw OpenCodeBackendError.shuttingDown
+        case let .ready(server):
+            return server
+        case let .launching(task):
+            let server = try await waitForLaunch(task, cancellation: cancellation)
+            guard !withStateLock({ isShuttingDown }) else {
+                stop(server)
+                throw OpenCodeBackendError.shuttingDown
+            }
+            return server
         }
     }
 
-    private func startServer(
-        cancellation: CancellationToken,
-        workingDirectory: String?
+    private enum LaunchState {
+        case ready(RunningOpenCodeServer)
+        case launching(Task<RunningOpenCodeServer, Error>)
+        case shuttingDown
+    }
+
+    /// Deciding whether to reuse, join or start the launch has to be atomic: two
+    /// callers racing here would each end up with a server and leak one.
+    private func beginLaunch() -> LaunchState {
+        withStateLock {
+            if isShuttingDown {
+                return .shuttingDown
+            }
+            if let sharedServer, sharedServer.process.process.isRunning {
+                return .ready(sharedServer)
+            }
+            sharedServer = nil
+            if let startTask {
+                return .launching(startTask)
+            }
+            let task = Task { [weak self] in
+                guard let self else { throw OpenCodeBackendError.shuttingDown }
+                return try await self.launchServer()
+            }
+            startTask = task
+            return .launching(task)
+        }
+    }
+
+    /// The launch is shared, so a cancelled caller stops waiting instead of
+    /// cancelling it for every other run.
+    private func waitForLaunch(
+        _ task: Task<RunningOpenCodeServer, Error>,
+        cancellation: CancellationToken?
     ) async throws -> RunningOpenCodeServer {
+        while withStateLock({ startTask != nil }) {
+            if let cancellation, cancellation.isCancelled {
+                throw OpenCodeBackendError.cancelled
+            }
+            do {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            } catch {
+                throw OpenCodeBackendError.cancelled
+            }
+        }
         guard !withStateLock({ isShuttingDown }) else {
             throw OpenCodeBackendError.shuttingDown
         }
+        return try await task.value
+    }
+
+    private func launchServer() async throws -> RunningOpenCodeServer {
+        defer {
+            withStateLock { startTask = nil }
+        }
+        // The server is shared across all sessions and projects; requests scope
+        // themselves with the ?directory= query parameter instead.
         let port = try findFreePort()
         let process = ManagedProcess(
             executableURL: executableURL,
             arguments: ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
-            workingDirectory: workingDirectory,
+            workingDirectory: nil,
             environment: await providerEnvironment(for: executableURL),
             captureStandardOutput: false,
             captureStandardError: false
@@ -218,28 +273,31 @@ final class OpenCodeBackend: AgentBackend {
             baseURL: URL(string: "http://127.0.0.1:\(port)")!,
             process: process
         )
-        guard !withStateLock({ isShuttingDown }) else {
-            stop(server)
-            throw OpenCodeBackendError.shuttingDown
-        }
         do {
-            try await waitForServerReady(server: server, cancellation: cancellation)
-            return server
+            // The launch is shared: it must not be cancelled by a single
+            // caller's cancellation token.
+            try await waitForServerReady(server: server)
         } catch {
             stop(server)
             throw error
         }
+        // Publishing has to be atomic with the shutdown check: a server stored
+        // after shutdown() cleared the state would never be stopped.
+        let published = withStateLock { () -> Bool in
+            guard !isShuttingDown else { return false }
+            sharedServer = server
+            return true
+        }
+        guard published else {
+            stop(server)
+            throw OpenCodeBackendError.shuttingDown
+        }
+        return server
     }
 
-    private func waitForServerReady(
-        server: RunningOpenCodeServer,
-        cancellation: CancellationToken
-    ) async throws {
-        let deadline = Date().addingTimeInterval(10)
+    private func waitForServerReady(server: RunningOpenCodeServer) async throws {
+        let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
-            if cancellation.isCancelled {
-                throw OpenCodeBackendError.cancelled
-            }
             if !server.process.process.isRunning {
                 throw OpenCodeBackendError.requestFailed("OpenCode 服务已退出")
             }
@@ -249,15 +307,13 @@ final class OpenCodeBackend: AgentBackend {
                     path: "/global/health",
                     method: "GET",
                     body: nil,
-                    cancellation: cancellation
+                    cancellation: CancellationToken()
                 )
                 if (response as? HTTPURLResponse)?.statusCode == 200 {
                     return
                 }
             } catch {
-                if cancellation.isCancelled {
-                    throw OpenCodeBackendError.cancelled
-                }
+                // Retry until the deadline.
             }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -301,7 +357,7 @@ final class OpenCodeBackend: AgentBackend {
         var dataLines: [String] = []
         var lineBuffer = Data()
         for try await byte in bytes {
-            if cancellation.isCancelled || context.cancellation.isCancelled {
+            if cancellation.isCancelled {
                 throw OpenCodeBackendError.cancelled
             }
             if byte == 0x0A {
@@ -350,7 +406,7 @@ final class OpenCodeBackend: AgentBackend {
                 eventStreamState: eventStreamState
             )
         }
-        if !cancellation.isCancelled, !context.cancellation.isCancelled {
+        if !cancellation.isCancelled {
             throw OpenCodeBackendError.requestFailed("OpenCode 事件流意外结束")
         }
     }
@@ -767,7 +823,7 @@ final class OpenCodeBackend: AgentBackend {
                 "tool": properties["tool"] ?? properties["source"] ?? .null,
             ]
         )
-        if cancellation.isCancelled || context.cancellation.isCancelled {
+        if cancellation.isCancelled {
             return
         }
         let replyPath = versionTwo
@@ -829,7 +885,7 @@ final class OpenCodeBackend: AgentBackend {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = path == "/global/health" ? 0.5 : 30
+        request.timeoutInterval = path == "/global/health" ? 1 : 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let body {
             request.httpBody = try JSONEncoder().encode(body)
