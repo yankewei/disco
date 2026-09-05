@@ -1,6 +1,6 @@
 name: Disco
 options:
-  bundleIdPrefix: ai.disco
+  bundleIdPrefix: com.yankewei
   deploymentTarget:
     macOS: "15.0"
   createIntermediateGroups: true
@@ -25,7 +25,7 @@ targets:
         product: Textual
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.disco.desktop
+        PRODUCT_BUNDLE_IDENTIFIER: com.yankewei.disco
         PRODUCT_NAME: Disco
         INFOPLIST_FILE: Resources/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -42,5 +42,5 @@ targets:
       - target: Disco
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.disco.desktop.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.yankewei.disco.tests
         GENERATE_INFOPLIST_FILE: YES

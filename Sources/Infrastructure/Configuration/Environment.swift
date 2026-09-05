@@ -36,9 +36,6 @@ enum DatabaseLocator {
             applicationSupportURL
                 .appendingPathComponent("disco-electron", isDirectory: true)
                 .appendingPathComponent("disco.sqlite"),
-            applicationSupportURL
-                .appendingPathComponent("ai.disco.desktop", isDirectory: true)
-                .appendingPathComponent("disco.sqlite"),
         ]
         for legacyURL in legacyURLs where fileManager.fileExists(atPath: legacyURL.path) {
             try copyDatabase(from: legacyURL, to: nativeURL, fileManager: fileManager)
