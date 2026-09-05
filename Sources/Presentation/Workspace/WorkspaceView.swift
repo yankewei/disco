@@ -410,7 +410,7 @@ private struct MessageView: View {
         } else if message.isPlan {
             planMessage
         } else {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
                 if let status = message.status {
                     HStack {
                         Spacer()
@@ -689,22 +689,13 @@ private struct TimelineActivityRow: View {
             Button {
                 isExpanded.toggle()
             } label: {
-                HStack(spacing: 10) {
-                    HStack(spacing: 5) {
-                        ForEach(activities.prefix(6)) { activity in
-                            Image(systemName: activity.kind == .reasoning ? "brain" : "wrench")
-                                .foregroundStyle(activity.hasFailed ? Color.red : Color.secondary)
-                                .frame(width: 18)
-                                .help(activity.title)
-                        }
-                        if activities.count > 6 {
-                            Text("+\(activities.count - 6)")
-                                .font(DiscoTheme.Typography.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
+                HStack(spacing: 6) {
+                    Image(systemName: isReasoningGroup ? "brain" : "wrench")
+                        .font(.system(size: 12))
+                        .foregroundStyle(hasFailed ? Color.red : Color.secondary)
+                        .frame(width: 14)
                     Text(headerTitle)
-                        .font(DiscoTheme.Typography.body)
+                        .font(DiscoTheme.Typography.activity)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 8)
@@ -723,7 +714,7 @@ private struct TimelineActivityRow: View {
                         .frame(width: 12)
                 }
                 .padding(.horizontal, 6)
-                .padding(.vertical, 7)
+                .padding(.vertical, 4)
                 .contentShape(Rectangle())
                 .background(isHovered ? DiscoTheme.Palette.insetSurface : .clear,
                             in: RoundedRectangle(cornerRadius: 6))
@@ -734,12 +725,12 @@ private struct TimelineActivityRow: View {
             .accessibilityValue((isRunning ? "运行中，" : "") + (isExpanded ? "已展开" : "已折叠"))
 
             if isExpanded {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(activities) { activity in
-                        VStack(alignment: .leading, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 6) {
                             if activities.count > 1 && activity.kind == .tool {
                                 Text(activity.title)
-                                    .font(DiscoTheme.Typography.body)
+                                    .font(DiscoTheme.Typography.activity)
                                     .foregroundStyle(activity.hasFailed ? Color.red : Color.primary)
                             }
                             if let input = activity.input, !input.isEmpty {
@@ -757,9 +748,9 @@ private struct TimelineActivityRow: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 Text(output)
-                                    .font(activity.kind == .reasoning ? DiscoTheme.Typography.body : DiscoTheme.Typography.code)
+                                    .font(activity.kind == .reasoning ? DiscoTheme.Typography.activity : DiscoTheme.Typography.code)
                                     .foregroundStyle(activity.kind == .reasoning ? Color.secondary : Color.primary)
-                                    .lineSpacing(activity.kind == .reasoning ? DiscoTheme.Typography.messageLineSpacing : 0)
+                                    .lineSpacing(activity.kind == .reasoning ? 3 : 0)
                                     .textSelection(.enabled)
                             }
                             if let error = activity.error, !error.isEmpty {
@@ -775,14 +766,14 @@ private struct TimelineActivityRow: View {
                 }
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 19)
+                .padding(.leading, 12)
                 .padding(.vertical, 8)
                 .overlay(alignment: .leading) {
                     Rectangle()
                         .fill(DiscoTheme.Palette.border)
                         .frame(width: 1)
                 }
-                .padding(.leading, 15)
+                .padding(.leading, 13)
             } else if hasFailed {
                 Text(failureSummary)
                     .font(DiscoTheme.Typography.caption)

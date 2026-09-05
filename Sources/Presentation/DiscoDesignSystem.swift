@@ -48,6 +48,7 @@ enum DiscoTheme {
         static let control = Font.system(size: 12, weight: .medium)
         static let caption = Font.system(size: 11)
         static let captionEmphasized = Font.system(size: 11, weight: .semibold)
+        static let activity = Font.system(size: 12)
         static let code = Font.system(size: 12, design: .monospaced)
     }
 
