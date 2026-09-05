@@ -419,15 +419,14 @@ private struct MessageView: View {
                             .foregroundStyle(status == .failed ? .red : .secondary)
                     }
                 }
-                let visibleTimeline = (message.timeline ?? []).filter { item in
-                    if case .codexEvent = item {
-                        return false
-                    }
-                    return true
-                }
-                if !visibleTimeline.isEmpty {
-                    ForEach(visibleTimeline) { item in
-                        MessageItemView(item: item, isStreaming: isStreaming)
+                let groups = MessageTimelineGroup.group(message.timeline ?? [])
+                if !groups.isEmpty {
+                    ForEach(groups) { group in
+                        if !group.activities.isEmpty {
+                            TimelineActivityRow(activities: group.activities)
+                        } else if let item = group.item {
+                            MessageItemView(item: item, isStreaming: isStreaming)
+                        }
                     }
                 } else if !message.text.isEmpty {
                     MarkdownText(text: message.text, isTextSelectionEnabled: !isStreaming)
@@ -498,50 +497,10 @@ private struct MessageItemView: View {
             switch item {
             case let .text(_, text, _):
                 MarkdownText(text: text, isTextSelectionEnabled: !isStreaming)
-            case let .reasoning(_, text, state):
-                DisclosureGroup("分析过程 · \(stateLabel(state))") {
-                    Text(text)
-                        .font(DiscoTheme.Typography.body)
-                        .lineSpacing(DiscoTheme.Typography.messageLineSpacing)
-                        .tracking(DiscoTheme.Typography.messageTracking)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .padding(.top, 4)
+            case .reasoning, .toolCall, .commandExecution, .fileChange, .mcpToolCall, .webSearch:
+                if let call = TimelineActivityDetails(item: item) {
+                    TimelineActivityRow(activities: [call])
                 }
-            case let .toolCall(_, name, input, output, error, state):
-                ToolCard(
-                    title: name,
-                    state: toolStateLabel(state),
-                    input: input?.prettyPrinted(),
-                    output: output,
-                    error: error
-                )
-            case let .commandExecution(_, command, output, _, exitCode, _, terminalInput, state):
-                ToolCard(
-                    title: command.isEmpty ? "命令执行" : command,
-                    state: stateLabel(state),
-                    input: terminalInput,
-                    output: output,
-                    error: exitCode.map { $0 == 0 ? nil : "退出码：\($0)" } ?? nil
-                )
-            case let .fileChange(_, changes, patchOutput, state):
-                ToolCard(
-                    title: "文件变更（\(changes.count)）",
-                    state: stateLabel(state),
-                    input: changes.map(\.path).joined(separator: "\n"),
-                    output: patchOutput,
-                    error: nil
-                )
-            case let .mcpToolCall(_, server, tool, arguments, result, error, progress, state):
-                ToolCard(
-                    title: "MCP · \(server) / \(tool)",
-                    state: stateLabel(state),
-                    input: arguments.prettyPrinted(),
-                    output: [progress ?? [], result.map { [$0.prettyPrinted()] } ?? []].flatMap { $0 }.joined(separator: "\n"),
-                    error: error
-                )
-            case let .webSearch(_, query, state):
-                ToolCard(title: "网页搜索", state: stateLabel(state), input: query, output: nil, error: nil)
             case let .todoList(_, items, state):
                 VStack(alignment: .leading, spacing: 6) {
                     Label("计划 · \(stateLabel(state))", systemImage: "checklist")
@@ -564,7 +523,11 @@ private struct MessageItemView: View {
                     .padding(10)
                     .background(DiscoTheme.Palette.warningSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             case let .error(_, message, state):
-                ToolCard(title: "错误", state: stateLabel(state), input: nil, output: nil, error: message)
+                TimelineActivityRow(activities: [TimelineActivityDetails(
+                    id: item.id, title: "错误",
+                    isRunning: state == .started || state == .updated,
+                    hasFailed: true, input: nil, output: nil, error: message
+                )])
             case .codexEvent:
                 EmptyView()
             }
@@ -581,59 +544,264 @@ private struct MessageItemView: View {
         }
     }
 
-    private func toolStateLabel(_ state: ToolCallStatus) -> String {
-        switch state {
-        case .started: "运行中"
-        case .completed: "完成"
-        case .failed: "失败"
-        }
-    }
 }
 
-private struct ToolCard: View {
+enum TimelineActivityKind {
+    case tool
+    case reasoning
+}
+
+struct TimelineActivityDetails: Identifiable {
+    let id: String
     let title: String
-    let state: String
+    let isRunning: Bool
+    let hasFailed: Bool
     let input: String?
     let output: String?
     let error: String?
+    var kind: TimelineActivityKind = .tool
+}
+
+extension TimelineActivityDetails {
+    init?(item: MessageItem) {
+        let title: String
+        let input: String?
+        let output: String?
+        let error: String?
+        let isRunning: Bool
+        let hasFailed: Bool
+        var kind: TimelineActivityKind = .tool
+        switch item {
+        case let .reasoning(_, text, state):
+            title = "思考过程"
+            input = nil
+            output = text
+            error = nil
+            isRunning = state == .started || state == .updated
+            hasFailed = state == .failed
+            kind = .reasoning
+        case let .toolCall(_, name, arguments, result, failure, state):
+            title = name
+            input = arguments?.prettyPrinted()
+            output = result
+            error = failure
+            isRunning = state == .started
+            hasFailed = state == .failed
+        case let .commandExecution(_, command, result, _, exitCode, _, terminalInput, state):
+            title = command.isEmpty ? "命令执行" : command
+            input = terminalInput
+            output = result
+            error = exitCode.flatMap { $0 == 0 ? nil : "退出码：\($0)" }
+            isRunning = state == .started || state == .updated
+            hasFailed = state == .failed || (exitCode ?? 0) != 0
+        case let .fileChange(_, changes, patchOutput, state):
+            title = "文件变更（\(changes.count)）"
+            input = changes.map(\.path).joined(separator: "\n")
+            output = patchOutput
+            error = nil
+            isRunning = state == .started || state == .updated
+            hasFailed = state == .failed
+        case let .mcpToolCall(_, server, tool, arguments, result, failure, progress, state):
+            title = "MCP · \(server) / \(tool)"
+            var outputLines = progress ?? []
+            if let result {
+                outputLines.append(result.prettyPrinted())
+            }
+            input = arguments.prettyPrinted()
+            output = outputLines.joined(separator: "\n")
+            error = failure
+            isRunning = state == .started || state == .updated
+            hasFailed = state == .failed
+        case let .webSearch(_, query, state):
+            title = "网页搜索"
+            input = query
+            output = nil
+            error = nil
+            isRunning = state == .started || state == .updated
+            hasFailed = state == .failed
+        default:
+            return nil
+        }
+        self.init(
+            id: item.id,
+            title: title,
+            isRunning: isRunning,
+            hasFailed: hasFailed,
+            input: input,
+            output: output,
+            error: error,
+            kind: kind
+        )
+    }
+}
+
+struct MessageTimelineGroup: Identifiable {
+    let id: String
+    var activities: [TimelineActivityDetails]
+    let item: MessageItem?
+
+    static func group(_ timeline: [MessageItem]) -> [MessageTimelineGroup] {
+        var groups: [MessageTimelineGroup] = []
+        for item in timeline {
+            if case .codexEvent = item { continue }
+            if let activity = TimelineActivityDetails(item: item) {
+                if let last = groups.last, last.activities.first?.kind == activity.kind {
+                    groups[groups.count - 1].activities.append(activity)
+                } else {
+                    groups.append(MessageTimelineGroup(id: item.id, activities: [activity], item: nil))
+                }
+            } else {
+                groups.append(MessageTimelineGroup(id: item.id, activities: [], item: item))
+            }
+        }
+        return groups
+    }
+}
+
+private struct TimelineActivityRow: View {
+    let activities: [TimelineActivityDetails]
+
+    private var isRunning: Bool { activities.contains { $0.isRunning } }
+    private var hasFailed: Bool { activities.contains { $0.hasFailed || $0.error != nil } }
+    private var isReasoningGroup: Bool { activities.first?.kind == .reasoning }
+
+    private var headerTitle: String {
+        if let single = activities.first, activities.count == 1 {
+            return single.title
+        }
+        return isReasoningGroup ? "思考过程" : "\(activities.count) 个工具调用"
+    }
+
+    private var failureSummary: String {
+        if let failed = activities.first(where: { $0.hasFailed || $0.error != nil }),
+           let error = failed.error, !error.isEmpty
+        {
+            return error
+        }
+        return isReasoningGroup ? "思考已中断" : "工具执行失败"
+    }
+
+    @State private var isExpanded = false
+    @State private var isHovered = false
 
     var body: some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                if let input, !input.isEmpty {
-                    Text(input)
-                        .font(DiscoTheme.Typography.code)
-                        .textSelection(.enabled)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                isExpanded.toggle()
+            } label: {
+                HStack(spacing: 10) {
+                    HStack(spacing: 5) {
+                        ForEach(activities.prefix(6)) { activity in
+                            Image(systemName: activity.kind == .reasoning ? "brain" : "wrench")
+                                .foregroundStyle(activity.hasFailed ? Color.red : Color.secondary)
+                                .frame(width: 18)
+                                .help(activity.title)
+                        }
+                        if activities.count > 6 {
+                            Text("+\(activities.count - 6)")
+                                .font(DiscoTheme.Typography.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(headerTitle)
+                        .font(DiscoTheme.Typography.body)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    if isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityHidden(true)
+                    } else if hasFailed {
+                        Image(systemName: "exclamationmark.circle")
+                            .foregroundStyle(.red)
+                            .accessibilityLabel("失败")
+                    }
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
                 }
-                if let output, !output.isEmpty {
-                    Divider()
-                    Text(output)
-                        .font(DiscoTheme.Typography.code)
-                        .textSelection(.enabled)
-                }
-                if let error {
-                    Text(error)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+                .background(isHovered ? DiscoTheme.Palette.insetSurface : .clear,
+                            in: RoundedRectangle(cornerRadius: 6))
             }
-            .padding(.top, 6)
-        } label: {
-            HStack {
-                Image(systemName: "terminal")
-                Text(title)
+            .buttonStyle(.plain)
+            .onHover { isHovered = $0 }
+            .help(isExpanded ? "收起详情" : "展开详情")
+            .accessibilityValue((isRunning ? "运行中，" : "") + (isExpanded ? "已展开" : "已折叠"))
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(activities) { activity in
+                        VStack(alignment: .leading, spacing: 8) {
+                            if activities.count > 1 && activity.kind == .tool {
+                                Text(activity.title)
+                                    .font(DiscoTheme.Typography.body)
+                                    .foregroundStyle(activity.hasFailed ? Color.red : Color.primary)
+                            }
+                            if let input = activity.input, !input.isEmpty {
+                                Text("参数")
+                                    .font(DiscoTheme.Typography.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(input)
+                                    .font(DiscoTheme.Typography.code)
+                                    .textSelection(.enabled)
+                            }
+                            if let output = activity.output, !output.isEmpty {
+                                if activity.kind == .tool {
+                                    Text("输出")
+                                        .font(DiscoTheme.Typography.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text(output)
+                                    .font(activity.kind == .reasoning ? DiscoTheme.Typography.body : DiscoTheme.Typography.code)
+                                    .foregroundStyle(activity.kind == .reasoning ? Color.secondary : Color.primary)
+                                    .lineSpacing(activity.kind == .reasoning ? DiscoTheme.Typography.messageLineSpacing : 0)
+                                    .textSelection(.enabled)
+                            }
+                            if let error = activity.error, !error.isEmpty {
+                                Text(error)
+                                    .foregroundStyle(.red)
+                                    .textSelection(.enabled)
+                            } else if (activity.input?.isEmpty ?? true) && (activity.output?.isEmpty ?? true) {
+                                Text(placeholderText(for: activity))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 19)
+                .padding(.vertical, 8)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(DiscoTheme.Palette.border)
+                        .frame(width: 1)
+                }
+                .padding(.leading, 15)
+            } else if hasFailed {
+                Text(failureSummary)
+                    .font(DiscoTheme.Typography.caption)
+                    .foregroundStyle(.red)
                     .lineLimit(1)
-                Spacer()
-                Text(state)
-                    .foregroundStyle(.secondary)
+                    .padding(.leading, 34)
+                    .padding(.bottom, 4)
             }
         }
-        .padding(12)
-        .background(DiscoTheme.Palette.insetSurface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(DiscoTheme.Palette.border, lineWidth: 1)
+        .onChange(of: isRunning, initial: true) { _, running in
+            isExpanded = running
         }
+    }
+
+    private func placeholderText(for activity: TimelineActivityDetails) -> String {
+        if !activity.isRunning {
+            return "无详细内容"
+        }
+        return activity.kind == .reasoning ? "思考中…" : "等待工具输出…"
     }
 }
 
@@ -1139,22 +1307,33 @@ private struct ComposerView: View {
 private struct MessageListDocument: View {
     @ObservedObject var model: AppModel
     @ObservedObject var metrics: MessageListMetrics
+    let contentHeightChanged: (CGFloat) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            ForEach(model.messages) { message in
-                MessageView(
-                    message: message,
-                    isStreaming: model.selectedSessionID.map { sessionID in
-                        model.runningSessionIDs.contains(sessionID)
-                            && message.id == "active-\(sessionID)"
-                    } ?? false
-                )
+        // Keep content top-aligned inside the current hosting bounds, even during
+        // the layout pass before the document adopts its newly measured height.
+        GeometryReader { _ in
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach(model.messages) { message in
+                    MessageView(
+                        message: message,
+                        isStreaming: model.selectedSessionID.map { sessionID in
+                            model.runningSessionIDs.contains(sessionID)
+                                && message.id == "active-\(sessionID)"
+                        } ?? false
+                    )
+                }
+            }
+            .frame(width: max(1, metrics.columnWidth - chatColumnContentPadding * 2))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, chatColumnContentPadding)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { geometry in
+                geometry.size.height
+            } action: { height in
+                contentHeightChanged(height)
             }
         }
-        .frame(width: max(1, metrics.columnWidth - chatColumnContentPadding * 2))
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, chatColumnContentPadding)
     }
 }
 
@@ -1162,11 +1341,8 @@ private final class MessageListMetrics: ObservableObject {
     @Published var columnWidth: CGFloat = chatColumnMaximumWidth
 }
 
-// The message list scroll view is AppKit-owned instead of a SwiftUI ScrollView:
-// SwiftUI owns the NSScrollView behind its ScrollView and keeps re-forcing a
-// legacy, always-visible scroll bar, with no public API for an overlay scroller
-// that only shows while scrolling. Owning the NSScrollView here lets us set the
-// overlay + autohide scrollers once; the SwiftUI content is hosted as its document.
+// AppKit owns the scroll view so scrolling remains native while its scrollers
+// stay hidden. SwiftUI reports the document's natural height after layout.
 @MainActor
 private struct MessageListScrollView: NSViewRepresentable {
     typealias Coordinator = MessageListScrollCoordinator
@@ -1195,6 +1371,7 @@ private final class MessageListScrollCoordinator: NSObject {
     private var hosting: NSHostingView<MessageListDocument>?
     private var messagesCancellable: AnyCancellable?
     private var reconcileWorkItem: DispatchWorkItem?
+    private var measuredContentHeight: CGFloat = 0
     private var lastMessageCount = -1
     private var lastConversationStartID: String?
     private var didAutoScrollToBottom = false
@@ -1210,7 +1387,7 @@ private final class MessageListScrollCoordinator: NSObject {
         let scrollView = MessageListNSScrollView(frame: .zero)
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
+        scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.scrollerStyle = .overlay
@@ -1219,7 +1396,11 @@ private final class MessageListScrollCoordinator: NSObject {
 
         let documentView = MessageListDocumentView(frame: .zero)
         let hosting = NSHostingView(
-            rootView: MessageListDocument(model: model, metrics: metrics)
+            rootView: MessageListDocument(model: model, metrics: metrics) { [weak self] height in
+                guard let self, abs(height - self.measuredContentHeight) > 0.5 else { return }
+                self.measuredContentHeight = height
+                self.scheduleReconcile(scrollToBottom: false)
+            }
         )
         hosting.autoresizingMask = [.width, .height]
         hosting.frame = documentView.bounds
@@ -1265,34 +1446,43 @@ private final class MessageListScrollCoordinator: NSObject {
     }
 
     private func scheduleReconcile(scrollToBottom: Bool) {
-        reconcileWorkItem?.cancel()
         if scrollToBottom {
             didAutoScrollToBottom = false
         }
+        guard reconcileWorkItem == nil else { return }
         let workItem = DispatchWorkItem { [weak self] in
+            self?.reconcileWorkItem = nil
             self?.reconcile()
         }
         reconcileWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: workItem)
+        DispatchQueue.main.async(execute: workItem)
     }
 
     private func reconcile() {
         guard let scrollView, let documentView, let hosting else { return }
+        let previousScrollY = scrollView.contentView.bounds.origin.y
         hosting.layoutSubtreeIfNeeded()
-
-        // The document tracks the clip width (so the overlay scroller sits at the
-        // conversation's right edge and the column stays centered) and its height
-        // matches the SwiftUI content's fitting height.
-        let clipWidth = max(scrollView.contentSize.width, 1)
         let clipHeight = max(scrollView.contentSize.height, 1)
-        let contentHeight = max(hosting.fittingSize.height, 1)
-        documentView.setFrameSize(NSSize(width: clipWidth, height: contentHeight))
+        let contentHeight = max(measuredContentHeight, 1)
+        let documentSize = NSSize(width: max(scrollView.contentSize.width, 1), height: contentHeight)
+        if documentView.frame.size != documentSize {
+            documentView.setFrameSize(documentSize)
+            hosting.layoutSubtreeIfNeeded()
+        }
 
+        guard measuredContentHeight > 0 else { return }
+        let maxScrollY = max(0, contentHeight - clipHeight)
         if !didAutoScrollToBottom {
-            let maxScrollY = max(0, contentHeight - clipHeight)
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: maxScrollY))
             scrollView.reflectScrolledClipView(scrollView.contentView)
             didAutoScrollToBottom = true
+        } else {
+            let currentY = scrollView.contentView.bounds.origin.y
+            let clampedY = min(max(previousScrollY, 0), maxScrollY)
+            if abs(currentY - clampedY) > 0.5 {
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: clampedY))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
         }
     }
 }

@@ -4,6 +4,45 @@ import SQLite3
 import XCTest
 
 final class NativeCoreTests: XCTestCase {
+    func testTimelineGroupsOnlyAdjacentToolsAndKeepsStableIdentity() {
+        let first = MessageItem.toolCall(id: "read", name: "读取", input: nil, output: nil, error: nil, state: .completed)
+        let second = MessageItem.webSearch(id: "search", query: "Swift", state: .started)
+        let text = MessageItem.text(id: "text", text: "继续", state: .completed)
+        let reasoning = MessageItem.reasoning(id: "reasoning", text: "分析", state: .completed)
+        let groups = MessageTimelineGroup.group([first, second, text, first, reasoning, second])
+        XCTAssertEqual(groups.map(\.id), ["read", "text", "read", "reasoning", "search"])
+        XCTAssertEqual(groups.map { $0.activities.count }, [2, 0, 1, 1, 1])
+        XCTAssertEqual(groups[0].activities.map(\.id), ["read", "search"])
+        XCTAssertEqual(groups[0].id, MessageTimelineGroup.group([first])[0].id)
+        XCTAssertTrue(groups[0].activities.contains { $0.isRunning })
+    }
+
+    func testGroupedToolDetailsPreserveFailureAndOutput() {
+        let failed = MessageItem.toolCall(id: "failed", name: "读取", input: .string("file"), output: "partial", error: "文件不存在", state: .failed)
+        let completed = MessageItem.webSearch(id: "done", query: "Swift", state: .completed)
+        let groups = MessageTimelineGroup.group([failed, completed])
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertFalse(groups[0].activities.contains { $0.isRunning })
+        XCTAssertTrue(groups[0].activities[0].hasFailed)
+        XCTAssertEqual(groups[0].activities[0].output, "partial")
+        XCTAssertEqual(groups[0].activities[0].error, "文件不存在")
+    }
+
+    func testReasoningGroupsStaySeparateFromToolsAndTrackCompletion() {
+        let first = MessageItem.reasoning(id: "thinking-1", text: "检查结构", state: .completed)
+        let second = MessageItem.reasoning(id: "thinking-2", text: "分析实现", state: .updated)
+        let tool = MessageItem.webSearch(id: "search", query: "Swift", state: .completed)
+        let groups = MessageTimelineGroup.group([first, second, tool])
+        XCTAssertEqual(groups.map { $0.activities.count }, [2, 1])
+        XCTAssertEqual(groups[0].activities.map(\.kind), [.reasoning, .reasoning])
+        XCTAssertEqual(groups[0].activities[1].output, "分析实现")
+        XCTAssertTrue(groups[0].activities.contains { $0.isRunning })
+        let completed = MessageItem.reasoning(id: "thinking-2", text: "分析实现", state: .completed)
+        let finishedGroups = MessageTimelineGroup.group([first, completed, tool])
+        XCTAssertEqual(groups[0].id, finishedGroups[0].id)
+        XCTAssertFalse(finishedGroups[0].activities.contains { $0.isRunning })
+    }
+
     func testConversationMessageRoundTripKeepsTimeline() throws {
         let message = ConversationMessage(
             id: "message-1",
