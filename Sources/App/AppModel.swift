@@ -513,6 +513,7 @@ final class AppModel: ObservableObject {
 
     private func send(text: String, to session: SessionInfo, using host: AgentHost) {
         draft = ""
+        let runMode: RunMode = planMode ? .plan : .agent
         let userMessage = ConversationMessage(
             id: UUID().uuidString,
             role: .user,
@@ -523,7 +524,8 @@ final class AppModel: ObservableObject {
             timeline: nil,
             status: nil,
             error: nil,
-            createdAt: .timestamp()
+            createdAt: .timestamp(),
+            isPlan: false
         )
         messages.append(userMessage)
         let activeAssistantMessage = ConversationMessage(
@@ -536,14 +538,14 @@ final class AppModel: ObservableObject {
             timeline: [],
             status: nil,
             error: nil,
-            createdAt: .timestamp()
+            createdAt: .timestamp(),
+            isPlan: runMode == .plan
         )
         messages.append(activeAssistantMessage)
         runningSessionIDs.insert(session.id)
         activeTimelineBuilders[session.id] = TimelineBuilder()
         streamingRenderTasks.removeValue(forKey: session.id)?.cancel()
 
-        let runMode: RunMode = planMode ? .plan : .agent
         runModeBySession[session.id] = runMode
         if planCompletionSessionID == session.id {
             planCompletionSessionID = nil
@@ -625,7 +627,8 @@ final class AppModel: ObservableObject {
             approvalRequests.removeAll { $0.id == approvalID }
         case let .runFinished(sessionID, _, status, sessionTitle, error):
             runningSessionIDs.remove(sessionID)
-            if status == .completed, runModeBySession[sessionID] == .plan,
+            let runMode = runModeBySession[sessionID]
+            if status == .completed, runMode == .plan,
                !userInputRequests.contains(where: { $0.sessionID == sessionID })
             {
                 planCompletionSessionID = sessionID
@@ -639,17 +642,22 @@ final class AppModel: ObservableObject {
                 if let builder = activeTimelineBuilders[sessionID] {
                     var finalizedBuilder = builder
                     finalizedBuilder = finalizedBuilder.finalized(status: status)
+                    let isPlan = runMode == .plan
+                    let planText = isPlan
+                        ? (lastTextPartText(in: finalizedBuilder.timeline) ?? finalizedBuilder.assistantText)
+                        : finalizedBuilder.assistantText
                     let finalizedMessage = ConversationMessage(
                         id: UUID().uuidString,
                         role: .assistant,
-                        text: finalizedBuilder.assistantText,
+                        text: planText,
                         reasoning: finalizedBuilder.reasoning.isEmpty ? nil : finalizedBuilder.reasoning,
                         toolCalls: finalizedBuilder.toolCalls.isEmpty ? nil : finalizedBuilder.toolCalls,
                         items: finalizedBuilder.items.isEmpty ? nil : finalizedBuilder.items,
                         timeline: finalizedBuilder.timeline,
                         status: status,
                         error: error,
-                        createdAt: .timestamp()
+                        createdAt: .timestamp(),
+                        isPlan: isPlan
                     )
                     let activeMessageID = "active-\(sessionID)"
                     if let activeMessageIndex = messages.lastIndex(where: { $0.id == activeMessageID }) {
@@ -693,7 +701,8 @@ final class AppModel: ObservableObject {
             timeline: builder.timeline,
             status: nil,
             error: nil,
-            createdAt: .timestamp()
+            createdAt: .timestamp(),
+            isPlan: false
         )
         if let lastIndex = messages.lastIndex(where: { $0.role == .assistant && $0.id.hasPrefix("active-") }) {
             messages[lastIndex] = renderedMessage

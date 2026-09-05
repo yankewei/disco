@@ -35,7 +35,8 @@ final class NativeCoreTests: XCTestCase {
             ],
             status: nil,
             error: nil,
-            createdAt: "2026-01-01T00:00:00Z"
+            createdAt: "2026-01-01T00:00:00Z",
+            isPlan: false
         )
         let data = try JSONEncoder().encode(message)
         let decoded = try JSONDecoder().decode(ConversationMessage.self, from: data)

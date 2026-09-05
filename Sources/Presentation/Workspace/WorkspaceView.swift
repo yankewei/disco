@@ -407,6 +407,8 @@ private struct MessageView: View {
                     .frame(maxWidth: 620, alignment: .trailing)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
+        } else if message.isPlan {
+            planMessage
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 if let status = message.status {
@@ -442,6 +444,39 @@ private struct MessageView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // Plan 模式的产物以独立的计划卡片展示，只呈现计划文本与运行状态，
+    // 隐藏推理、工具等过程性内容，让计划本身成为焦点。
+    private var planMessage: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("计划", systemImage: "checklist")
+                .font(DiscoTheme.Typography.bodyEmphasized)
+                .foregroundStyle(DiscoTheme.Palette.accent)
+            if !message.text.isEmpty {
+                MarkdownText(text: message.text, isTextSelectionEnabled: !isStreaming)
+            }
+            if isStreaming {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.top, 2)
+            }
+            if let error = message.error {
+                Text(error)
+                    .foregroundStyle(.red)
+                    .font(DiscoTheme.Typography.body)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(
+            DiscoTheme.Palette.insetSurface,
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(DiscoTheme.Palette.accent.opacity(0.35), lineWidth: 1)
         }
     }
 

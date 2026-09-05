@@ -1013,7 +1013,8 @@ private func parseCodexMessages(_ turns: [JSONValue]) -> [ConversationMessage] {
                     timeline: nil,
                     status: nil,
                     error: nil,
-                    createdAt: createdAt
+                    createdAt: createdAt,
+                    isPlan: false
                 )
             )
         }
@@ -1029,7 +1030,8 @@ private func parseCodexMessages(_ turns: [JSONValue]) -> [ConversationMessage] {
                     timeline: timeline.isEmpty ? nil : timeline,
                     status: nil,
                     error: nil,
-                    createdAt: completedAt
+                    createdAt: completedAt,
+                    isPlan: false
                 )
             )
         }

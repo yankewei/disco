@@ -1103,10 +1103,14 @@ func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
             }
         }
 
-        let text = timeline.compactMap { item in
-            guard case let .text(_, partText, _) = item else { return nil }
+        let isPlan = jsonString(info["mode"]) == "plan"
+        let aggregatedText = timeline.compactMap { item in
+            guard case let .text(_, partText, _) = item, !partText.isEmpty else { return nil }
             return partText
         }.joined()
+        let text = isPlan
+            ? (lastTextPartText(in: timeline) ?? fallbackText)
+            : (aggregatedText.isEmpty ? fallbackText : aggregatedText)
         let reasoning = timeline.compactMap { item in
             guard case let .reasoning(_, partText, _) = item else { return nil }
             return partText
@@ -1115,14 +1119,15 @@ func parseOpenCodeMessages(_ value: JSONValue?) -> [ConversationMessage] {
         return ConversationMessage(
             id: messageID,
             role: role,
-            text: text.isEmpty ? fallbackText : text,
+            text: text,
             reasoning: reasoning.isEmpty ? nil : reasoning,
             toolCalls: nil,
             items: timeline.isEmpty ? nil : timeline,
             timeline: timeline.isEmpty ? nil : timeline,
             status: errorValue == nil ? nil : .failed,
             error: errorValue.map(formatError),
-            createdAt: createdAt
+            createdAt: createdAt,
+            isPlan: isPlan
         )
     }
 }

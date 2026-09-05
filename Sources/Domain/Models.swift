@@ -538,11 +538,61 @@ struct ConversationMessage: Codable, Identifiable, Hashable {
     var status: RunStatus?
     var error: String?
     let createdAt: String
+    /// 该消息是 Plan 模式的产物（OpenCode 的 `info.mode == "plan"` 或本机记录的计划模式运行），
+    /// 用于在界面中渲染为独立的计划卡片。
+    var isPlan: Bool
+}
+
+extension ConversationMessage {
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, reasoning, toolCalls, items, timeline, status, error, createdAt, isPlan
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        role = try container.decode(MessageRole.self, forKey: .role)
+        text = try container.decode(String.self, forKey: .text)
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
+        toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls)
+        items = try container.decodeIfPresent([MessageItem].self, forKey: .items)
+        timeline = try container.decodeIfPresent([MessageItem].self, forKey: .timeline)
+        status = try container.decodeIfPresent(RunStatus.self, forKey: .status)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        isPlan = try container.decodeIfPresent(Bool.self, forKey: .isPlan) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(role, forKey: .role)
+        try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
+        try container.encodeIfPresent(items, forKey: .items)
+        try container.encodeIfPresent(timeline, forKey: .timeline)
+        try container.encodeIfPresent(status, forKey: .status)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(isPlan, forKey: .isPlan)
+    }
 }
 
 enum MessageRole: String, Codable {
     case user
     case assistant
+}
+
+/// Plan 模式的产物取消息中最后一段非空 text part 作为计划正文：
+/// plan agent 的中间分析也是 text part，只有结尾的 text 才是完整计划。
+func lastTextPartText(in timeline: [MessageItem]) -> String? {
+    for item in timeline.reversed() {
+        if case let .text(_, text, _) = item, !text.isEmpty {
+            return text
+        }
+    }
+    return nil
 }
 
 extension String {
